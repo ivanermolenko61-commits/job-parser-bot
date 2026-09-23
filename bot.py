@@ -1,17 +1,29 @@
-"""Telegram-бот: мониторинг вакансий Junior/стажёр по Python."""
+"""Telegram-бот: мониторинг вакансий Junior/стажёр по разработке."""
 import asyncio
 import logging
 import os
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
-from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 from config import CHECK_INTERVAL_MINUTES
-from database import init_db, stats
+from database import (
+    cleanup_old,
+    get_recent_vacancies,
+    init_db,
+    reset_db,
+    stats,
+)
 from parser_manager import fetch_new_vacancies, mark_vacancies_sent
 
 load_dotenv()
@@ -31,7 +43,48 @@ scheduler = AsyncIOScheduler()
 subscribed = True
 
 
-# ---------- Middleware: доступ только для владельца ----------
+# ---------- Клавиатура ----------
+
+def main_reply_kb():
+    """Reply-клавиатура внизу экрана."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Список"), KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="🔍 Проверить сейчас")],
+            [KeyboardButton(text="⏸ Пауза"), KeyboardButton(text="▶️ Возобновить")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# ---------- Форматирование даты ----------
+
+def _human_date(iso_str: str) -> str:
+    """Преобразует ISO-дату в '23.09 в 14:27'."""
+    if not iso_str:
+        return ""
+
+    cleaned = iso_str.replace("+03:00", "").replace("Z", "").strip()
+
+    formats = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(cleaned[:19], fmt)
+            return dt.strftime("%d.%m в %H:%M")
+        except ValueError:
+            continue
+
+    return iso_str
+
+
+# ---------- Middleware ----------
 
 class WhitelistMiddleware(BaseMiddleware):
     def __init__(self, allowed_user_id: int):
@@ -103,15 +156,12 @@ async def cmd_start(message: Message):
 
     await message.answer(
         f"👋 Привет!\n\n"
-        f"Слежу за новыми вакансиями <b>Junior/стажёр</b> по <b>Python/backend</b>.\n"
+        f"Слежу за новыми вакансиями <b>Junior/стажёр</b> по разработке.\n"
         f"Удалёнка в приоритете, но беру и офисные.\n\n"
         f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n\n"
-        f"<b>Команды:</b>\n"
-        f"/status — статистика\n"
-        f"/check — проверить сейчас\n"
-        f"/stop — приостановить\n"
-        f"/start — возобновить",
+        f"Пользуйся кнопками внизу 👇",
         parse_mode="HTML",
+        reply_markup=main_reply_kb(),
     )
 
     await check_vacancies()
@@ -121,7 +171,10 @@ async def cmd_start(message: Message):
 async def cmd_stop(message: Message):
     global subscribed
     subscribed = False
-    await message.answer("⏸ Уведомления приостановлены. /start — возобновить.")
+    await message.answer(
+        "⏸ Уведомления приостановлены.\n\nНажмите «▶️ Возобновить» или /start.",
+        reply_markup=main_reply_kb(),
+    )
 
 
 @dp.message(Command("status"))
@@ -137,20 +190,111 @@ async def cmd_status(message: Message):
         lines.append(f"\n🕒 Последняя: {s['last_found']}")
     lines.append(f"\n⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} мин")
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())
+
+
+@dp.message(Command("list"))
+async def cmd_list(message: Message):
+    """Показывает последние 20 вакансий из базы (от свежих к старым)."""
+    vacancies = get_recent_vacancies(limit=20)
+
+    if not vacancies:
+        await message.answer(
+            "📭 В базе пока пусто.\n\nНажмите «🔍 Проверить сейчас», чтобы загрузить вакансии.",
+            reply_markup=main_reply_kb(),
+        )
+        return
+
+    lines = [f"📋 <b>Последние {len(vacancies)} вакансий</b> (свежие сверху):\n"]
+
+    for v in vacancies:
+        published = v.get("published_at") or ""
+        found = v.get("found_at", "")[:16]
+
+        if published:
+            time_str = f"🕒 Опубликовано: {_human_date(published)}"
+        else:
+            time_str = f"🕒 Найдено: {_human_date(found)}"
+
+        lines.append(
+            f"{time_str}\n"
+            f"• <b>{v['title']}</b>\n"
+            f"  {v['company']}\n"
+            f"  <a href='{v['url']}'>Открыть вакансию</a>\n"
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())
 
 
 @dp.message(Command("check"))
 async def cmd_check(message: Message):
     await message.answer("🔍 Проверяю вакансии…")
     await check_vacancies()
-    await message.answer("✅ Проверка завершена.")
+    await message.answer("✅ Проверка завершена.", reply_markup=main_reply_kb())
+
+
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message):
+    """Очищает базу и заново загружает вакансии с правильными датами."""
+    deleted = reset_db()
+    logging.info(f"[BOT] База очищена: удалено {deleted} записей")
+
+    await message.answer(
+        f"🗑 База очищена (удалено {deleted} записей).\n\n"
+        f"Загружаю вакансии заново…",
+        reply_markup=main_reply_kb(),
+    )
+
+    await check_vacancies()
+    await message.answer(
+        "✅ Готово. Проверьте /list — теперь с реальными датами публикации.",
+        reply_markup=main_reply_kb(),
+    )
+
+
+# ---------- Reply-кнопки ----------
+
+@dp.message(F.text == "📋 Список")
+async def btn_list(message: Message):
+    await cmd_list(message)
+
+
+@dp.message(F.text == "📊 Статус")
+async def btn_status(message: Message):
+    await cmd_status(message)
+
+
+@dp.message(F.text == "🔍 Проверить сейчас")
+async def btn_check(message: Message):
+    await cmd_check(message)
+
+
+@dp.message(F.text == "⏸ Пауза")
+async def btn_pause(message: Message):
+    await cmd_stop(message)
+
+
+@dp.message(F.text == "▶️ Возобновить")
+async def btn_resume(message: Message):
+    await cmd_start(message)
 
 
 # ---------- Точка входа ----------
 
 async def main():
     init_db()
+
+    deleted = cleanup_old(days=30)
+    logging.info(f"Очистка БД: удалено {deleted} записей старше 30 дней")
+
+    scheduler.add_job(
+        lambda: logging.info(
+            f"Очистка БД: удалено {cleanup_old(days=30)} записей"
+        ),
+        "cron",
+        hour=3,
+        minute=0,
+    )
 
     scheduler.add_job(
         check_vacancies,
@@ -165,6 +309,7 @@ async def main():
         await bot.send_message(
             chat_id=MY_CHAT_ID,
             text="🤖 Бот запущен. Слежу за новыми вакансиями.",
+            reply_markup=main_reply_kb(),
         )
     except Exception:
         logging.exception("Не удалось отправить приветствие")

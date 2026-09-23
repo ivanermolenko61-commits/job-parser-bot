@@ -39,7 +39,6 @@ def fetch_new_vacancies() -> list[Vacancy]:
             f"новых {source_new}"
         )
 
-    # Удалённые сначала
     new_vacancies.sort(key=lambda v: (not v.is_remote, v.title))
     return new_vacancies
 
@@ -52,5 +51,6 @@ def mark_vacancies_sent(vacancies: list[Vacancy]) -> None:
             title=v.title,
             company=v.company,
             url=v.url,
+            published_at=v.published_at,
         )
     logging.info(f"[MANAGER] Помечено как отправлено: {len(vacancies)}")

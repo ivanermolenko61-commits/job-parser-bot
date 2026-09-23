@@ -28,29 +28,20 @@ class HabrParser(BaseParser):
     ]
 
     EXCLUDE_WORDS = [
-        # Менеджмент и продукт
         "менеджер", "manager", "product", "продукт",
         "проектами", "проектов", "project manager",
-        # Аналитика, дизайн, research
         "аналитик", "analyst",
         "дизайнер", "designer",
         "исследователь", "researcher", "research", "ресерчер",
-        # QA и тестирование
         "qa", "тестировщик", "тестирован", "testing", "test engineer",
-        # Инфраструктура
         "devops", "sre", "administrator", "администратор",
-        # Поддержка и сопровождение
         "техподдержка", "поддержки", "сопровождени", "support",
-        # Маркетинг, HR, продажи
         "маркетолог", "marketing", "hr ", "рекрутер", "recruiter",
         "sales", "продаж",
-        # Юридические, документарные, прочие не-tech
         "бухгалтер", "юрист", "юрисконсульт", "логист",
         "документами", "документооборот", "делопроизвод",
-        # Data Science и тренерство
         "data scientist", "дата-сайентист", "data science",
         "тренер", "coach",
-        # Специфика CVM/CMO и подобное
         "cvm", "cmo",
     ]
 
@@ -124,6 +115,24 @@ class HabrParser(BaseParser):
             return "не указана"
         return salary.strip()
 
+    def _parse_published_date(self, card) -> str:
+        """Извлекает дату публикации вакансии.
+
+        Хабр Карьера отдаёт либо ISO-дату в атрибуте datetime тега <time>,
+        либо текст вроде 'сегодня', '5 часов назад', '3 дня назад'.
+        """
+        date_tag = card.select_one(".vacancy-card__date")
+        if not date_tag:
+            return ""
+
+        # Пробуем найти <time datetime="...">
+        time_el = date_tag.find("time")
+        if time_el and time_el.get("datetime"):
+            return time_el["datetime"]
+
+        # Иначе — берём текст тега
+        return date_tag.get_text(strip=True)
+
     def _parse_meta(self, card) -> tuple[str, str, bool]:
         meta_tag = card.select_one(".vacancy-card__meta")
         if not meta_tag:
@@ -178,6 +187,8 @@ class HabrParser(BaseParser):
                     logging.debug(f"[HABR] Пропуск (зарплата): {title} — {salary}")
                     continue
 
+                published_at = self._parse_published_date(card)
+
                 url = "https://career.habr.com" + title_link.get("href", "")
 
                 company_tag = card.select_one(".vacancy-card__company")
@@ -203,6 +214,7 @@ class HabrParser(BaseParser):
                     location=location_display,
                     salary=salary,
                     is_remote=is_remote,
+                    published_at=published_at,
                 ))
             except Exception as e:
                 logging.debug(f"[HABR] Ошибка парсинга карточки: {e}")

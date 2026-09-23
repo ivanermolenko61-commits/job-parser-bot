@@ -14,6 +14,7 @@ class Vacancy:
     location: str = ""
     salary: str = ""
     is_remote: bool = False
+    published_at: str = ""   # ← новое поле: дата публикации с сайта
 
     def format_message(self) -> str:
         """Форматирует вакансию для отправки в Telegram (HTML)."""
@@ -24,6 +25,8 @@ class Vacancy:
             lines.append(f"📍 Локация: {self.location}")
         if self.salary:
             lines.append(f"💰 Зарплата: {self.salary}")
+        if self.published_at:
+            lines.append(f"🕒 Опубликовано: {self.published_at}")
         lines.append(f"🔗 <a href='{self.url}'>Открыть вакансию</a>")
         return "\n".join(lines)
 
