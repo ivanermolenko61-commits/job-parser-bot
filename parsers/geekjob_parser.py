@@ -1,8 +1,12 @@
 """Парсер вакансий с GeekJob (geekjob.ru).
 
 Сайт — SPA на Vue.js. Требует Playwright для рендеринга JS.
-Запускается в отдельном потоке через asyncio.to_thread,
-чтобы не блокировать event loop бота.
+Запускается в отдельном потоке через asyncio.to_thread.
+
+Оптимизация памяти:
+  • Блокировка картинок/шрифтов/медиа (экономия RAM и трафика).
+  • Одна страница переиспользуется между запросами.
+  • Аргументы Chromium для Docker (--disable-dev-shm-usage и т.д.).
 """
 import logging
 import re
@@ -16,7 +20,6 @@ from config import QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
 
 
-# Перевод меток GeekJob на русский
 LABEL_TRANSLATIONS = {
     "remote": "удалённо",
     "office": "офис",
@@ -74,6 +77,17 @@ class GeekJobParser(BaseParser):
     )
     ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
 
+    # Аргументы Chromium: важны для работы в Docker с ограниченной памятью
+    CHROMIUM_ARGS = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",     # использовать диск вместо /dev/shm
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--disable-background-networking",
+        "--disable-sync",
+    ]
+
     def __init__(self, headless: bool = True):
         self.headless = headless
 
@@ -93,13 +107,25 @@ class GeekJobParser(BaseParser):
         return " ".join(s.split()).strip()
 
     def _translate_labels(self, labels: list[str]) -> list[str]:
-        """Переводит английские метки на русский."""
         result = []
         for label in labels:
             low = label.lower()
             translated = LABEL_TRANSLATIONS.get(low, label)
             result.append(translated)
         return result
+
+    def _route_handler(self, route) -> None:
+        """Блокирует загрузку тяжёлых ресурсов — экономит RAM и трафик."""
+        try:
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
 
     def _parse_card(self, card) -> Vacancy | None:
         try:
@@ -117,13 +143,11 @@ class GeekJobParser(BaseParser):
             if not self._is_relevant(title):
                 return None
 
-            # Уровень из заголовка
             m = self.LEVEL_PATTERN.search(title)
             level = m.group(1) if m else ""
             if level.lower() not in self.ALLOWED_LEVELS:
                 return None
 
-            # Компания
             company_tag = card.select_one(".company-name")
             if company_tag:
                 a = company_tag.find("a")
@@ -131,7 +155,6 @@ class GeekJobParser(BaseParser):
             else:
                 company = "Не указана"
 
-            # Метки — переводим на русский
             raw_labels = []
             for sel in (".remote-label", ".relocate-label", ".parttime-label", ".inhouse-label"):
                 el = card.select_one(sel)
@@ -142,7 +165,6 @@ class GeekJobParser(BaseParser):
             location = " · ".join(labels) if labels else "—"
             is_remote = "удалённо" in labels
 
-            # Дата публикации
             dt_tag = card.select_one(".datetime-info")
             published_at = self._clean(dt_tag.get_text()) if dt_tag else ""
 
@@ -155,8 +177,8 @@ class GeekJobParser(BaseParser):
                 location=location,
                 salary="не указана",
                 is_remote=is_remote,
-                published_at=published_at,  # ← дата публикации, не опыт
-                experience="",              # у GeekJob нет данных об опыте
+                published_at=published_at,
+                experience="",
             )
         except Exception as e:
             logging.debug(f"[GEEKJOB] Ошибка парсинга карточки: {e}")
@@ -181,17 +203,22 @@ class GeekJobParser(BaseParser):
         all_vacancies = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=self.CHROMIUM_ARGS,
+            )
+            page = None
             try:
                 page = browser.new_page()
                 page.set_default_timeout(30000)
+                page.route("**/*", self._route_handler)
 
                 for query in QUERIES:
                     logging.info(f"[GEEKJOB] Запрос: '{query}'")
                     url = f"{self.BASE_URL}?qs={quote(query)}"
 
                     try:
-                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     except PlaywrightTimeoutError:
                         logging.warning(f"[GEEKJOB] Таймаут для '{query}'")
                         continue
@@ -214,7 +241,15 @@ class GeekJobParser(BaseParser):
                     time.sleep(REQUEST_DELAY)
 
             finally:
-                browser.close()
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         logging.info(f"[GEEKJOB] Итого собрано: {len(all_vacancies)}")
         return all_vacancies
@@ -222,7 +257,7 @@ class GeekJobParser(BaseParser):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = GeekJobParser(headless=True)  # headless — без окна браузера
+    parser = GeekJobParser(headless=True)
     vacancies = parser.fetch()
 
     print(f"\nВсего собрано: {len(vacancies)}\n")

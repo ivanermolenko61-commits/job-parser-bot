@@ -6,6 +6,11 @@ Playwright для рендеринга JS.
 Публичный API hh.ru закрыт с декабря 2025 — поэтому парсим HTML.
 Количество откликов анонимно не видно, поэтому поле applications_count
 остаётся пустым.
+
+Оптимизация памяти:
+  • Блокировка картинок/шрифтов/медиа.
+  • Одна страница переиспользуется.
+  • Аргументы Chromium для Docker.
 """
 import logging
 import re
@@ -48,9 +53,8 @@ class HHParser(BaseParser):
         "тренер", "coach",
         "cvm", "cmo",
         "безопасност", "security", "appsec", "infosec",
-        # Не-разработка
         "методолог", "seo", "igaming", "гейминг",
-        "wordpress", "битрикс", "bitrix",  # cms-разработка, не наш стек
+        "wordpress", "битрикс", "bitrix",
     ]
 
     INCLUDE_IT_WORDS = [
@@ -64,7 +68,6 @@ class HHParser(BaseParser):
         "ios", "android",
     ]
 
-    # Нероссийские города — отсеиваем
     GEO_BLACKLIST = [
         "ташкент", "алматы", "астана", "нур-султан",
         "тбилиси", "баку", "ереван", "бишкек", "минск", "брест",
@@ -82,6 +85,17 @@ class HHParser(BaseParser):
         re.IGNORECASE,
     )
     ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
+
+    # Аргументы Chromium для Docker
+    CHROMIUM_ARGS = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--disable-background-networking",
+        "--disable-sync",
+    ]
 
     def __init__(self, headless: bool = True, max_pages: int = 2):
         self.headless = headless
@@ -108,9 +122,21 @@ class HHParser(BaseParser):
             return ""
         return " ".join(s.split()).strip()
 
+    def _route_handler(self, route) -> None:
+        """Блокирует загрузку тяжёлых ресурсов."""
+        try:
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
     def _parse_card(self, card) -> Vacancy | None:
         try:
-            # Заголовок + ссылка
             title_link = card.select_one('[data-qa="serp-item__title"]')
             if not title_link:
                 return None
@@ -136,33 +162,27 @@ class HHParser(BaseParser):
             if level.lower() not in self.ALLOWED_LEVELS:
                 return None
 
-            # Компания
             company_tag = card.select_one('[data-qa="vacancy-serp__vacancy-employer-text"]')
             company = self._clean(company_tag.get_text()) if company_tag else "Не указана"
 
-            # Локация
             location_tag = card.select_one('[data-qa="vacancy-serp__vacancy-address"]')
             location = self._clean(location_tag.get_text()) if location_tag else ""
 
-            # Гео-фильтр
             if not self._is_russian_location(location):
                 logging.debug(f"[HH] Пропуск (гео {location}): {title}")
                 return None
 
-            # Зарплата
             salary_tag = card.select_one('[data-qa="vacancy-serp__compensation"]')
             salary = self._clean(salary_tag.get_text()) if salary_tag else "не указана"
             if not salary:
                 salary = "не указана"
 
-            # Удалёнка
             is_remote = card.select_one('[data-qa="vacancy-label-work-schedule-remote"]') is not None
             if is_remote and location:
                 location = f"{location} · удалённо"
             elif is_remote:
                 location = "удалённо"
 
-            # Дата
             published_at = ""
             date_tag = card.select_one('[data-qa="vacancy-serp-item-activity"]')
             if date_tag:
@@ -205,13 +225,18 @@ class HHParser(BaseParser):
         all_vacancies = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=self.CHROMIUM_ARGS,
+            )
+            page = None
             try:
                 page = browser.new_page()
                 page.set_default_timeout(30000)
                 page.set_extra_http_headers({
                     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
                 })
+                page.route("**/*", self._route_handler)
 
                 for query in QUERIES:
                     logging.info(f"[HH] Запрос: '{query}'")
@@ -260,7 +285,15 @@ class HHParser(BaseParser):
                     time.sleep(REQUEST_DELAY)
 
             finally:
-                browser.close()
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         logging.info(f"[HH] Итого собрано: {len(all_vacancies)}")
         return all_vacancies

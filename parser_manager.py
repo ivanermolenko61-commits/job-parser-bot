@@ -1,4 +1,5 @@
 """Менеджер парсеров: запускает все источники, возвращает только новые вакансии."""
+import gc
 import logging
 
 from database import is_duplicate, is_sent, mark_sent
@@ -26,10 +27,12 @@ def fetch_new_vacancies() -> list[Vacancy]:
       1. По (source, vacancy_id) — точный дубль с того же сайта.
       2. По (title, company) — один и тот же работодатель разместил
          вакансию на нескольких площадках. Берём только первую.
+
+    После каждого парсера вызывается gc.collect() — освобождает память,
+    которую держал Playwright (Chromium — тяжёлый процесс ~250 МБ).
     """
     parsers = get_all_parsers()
     new_vacancies = []
-    # Локальный кэш для пары (title, company), чтобы не дёргать БД на каждом
     seen_pairs: set[tuple[str, str]] = set()
 
     for parser in parsers:
@@ -38,7 +41,14 @@ def fetch_new_vacancies() -> list[Vacancy]:
             vacancies = parser.fetch()
         except Exception as e:
             logging.exception(f"[MANAGER] Ошибка в парсере {parser.source_name}: {e}")
-            continue
+            vacancies = []
+
+        # Освобождаем память после парсера (особенно важно для Playwright)
+        collected = gc.collect()
+        logging.info(
+            f"[MANAGER] gc.collect() после {parser.source_name}: "
+            f"освобождено объектов — {collected}"
+        )
 
         source_new = 0
         for v in vacancies:
