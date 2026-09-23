@@ -99,7 +99,7 @@ class DreamJobParser(BaseParser):
 
     VACANCY_HREF_PATTERN = re.compile(r"/employers/\d+/vakansii/(\d+)")
 
-    def __init__(self, max_pages: int = 2):
+    def __init__(self, max_pages: int = 5):
         self.max_pages = max_pages
         self.headers = {
             "User-Agent": (
