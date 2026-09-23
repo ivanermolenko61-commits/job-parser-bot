@@ -3,6 +3,7 @@ import logging
 
 from database import is_sent, mark_sent
 from parsers.base import Vacancy
+from parsers.dreamjob_parser import DreamJobParser
 from parsers.habr_parser import HabrParser
 
 
@@ -10,7 +11,7 @@ def get_all_parsers() -> list:
     """Список активных парсеров."""
     return [
         HabrParser(),
-        # DreamJobParser(),  # ← добавим позже
+        DreamJobParser(),
     ]
 
 
