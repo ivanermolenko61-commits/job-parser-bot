@@ -3,10 +3,11 @@
 Сайт — SPA на Vue.js. Требует Playwright для рендеринга JS.
 Запускается в отдельном потоке через asyncio.to_thread.
 
-Оптимизация памяти:
-  • Блокировка картинок/шрифтов/медиа (экономия RAM и трафика).
+Оптимизация памяти (важно: лимит контейнера — 1 ГБ RAM):
+  • Блокировка картинок/шрифтов/медиа/трекеров.
   • Одна страница переиспользуется между запросами.
-  • Аргументы Chromium для Docker (--disable-dev-shm-usage и т.д.).
+  • Аргументы Chromium для Docker + ограничение V8 heap и процессов.
+  • Короткий список запросов (PLAYWRIGHT_QUERIES).
 """
 import logging
 import re
@@ -16,7 +17,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from config import QUERIES, REQUEST_DELAY
+from config import PLAYWRIGHT_QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
 
 
@@ -77,16 +78,31 @@ class GeekJobParser(BaseParser):
     )
     ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
 
-    # Аргументы Chromium: важны для работы в Docker с ограниченной памятью
+    # Аргументы Chromium: важно для Docker с 1 ГБ RAM.
     CHROMIUM_ARGS = [
         "--no-sandbox",
-        "--disable-dev-shm-usage",     # использовать диск вместо /dev/shm
+        "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-extensions",
         "--disable-software-rasterizer",
         "--disable-background-networking",
         "--disable-sync",
+        "--js-flags=--max-old-space-size=256",
+        "--renderer-process-limit=1",
+        "--disable-features=site-per-process",
     ]
+
+    # Хосты-трекеры и реклама — режем, чтобы не грузить их JS.
+    BLOCKED_HOSTS = (
+        "mc.yandex.ru",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "facebook.net",
+        "facebook.com",
+        "sentry.io",
+        "top-fwz1.mail.ru",
+        "ad.mail.ru",
+    )
 
     def __init__(self, headless: bool = True):
         self.headless = headless
@@ -115,12 +131,20 @@ class GeekJobParser(BaseParser):
         return result
 
     def _route_handler(self, route) -> None:
-        """Блокирует загрузку тяжёлых ресурсов — экономит RAM и трафик."""
+        """Блокирует картинки/медиа/шрифты/трекеры — экономит RAM и трафик."""
         try:
             if route.request.resource_type in ("image", "media", "font"):
                 route.abort()
-            else:
-                route.continue_()
+                return
+
+            url = route.request.url
+            if "://" in url:
+                host = url.split("/")[2].lower()
+                if any(b in host for b in self.BLOCKED_HOSTS):
+                    route.abort()
+                    return
+
+            route.continue_()
         except Exception:
             try:
                 route.continue_()
@@ -213,7 +237,7 @@ class GeekJobParser(BaseParser):
                 page.set_default_timeout(30000)
                 page.route("**/*", self._route_handler)
 
-                for query in QUERIES:
+                for query in PLAYWRIGHT_QUERIES:
                     logging.info(f"[GEEKJOB] Запрос: '{query}'")
                     url = f"{self.BASE_URL}?qs={quote(query)}"
 

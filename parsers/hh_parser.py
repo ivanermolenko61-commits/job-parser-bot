@@ -7,10 +7,12 @@ Playwright для рендеринга JS.
 Количество откликов анонимно не видно, поэтому поле applications_count
 остаётся пустым.
 
-Оптимизация памяти:
-  • Блокировка картинок/шрифтов/медиа.
+Оптимизация памяти (важно: лимит контейнера — 1 ГБ RAM):
+  • Блокировка картинок/шрифтов/медиа/трекеров.
   • Одна страница переиспользуется.
-  • Аргументы Chromium для Docker.
+  • Аргументы Chromium для Docker + ограничение V8 heap и процессов.
+  • Короткий список запросов (PLAYWRIGHT_QUERIES).
+  • items_on_page=20 вместо 50 — меньше DOM и меньше строка HTML.
 """
 import logging
 import re
@@ -20,7 +22,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from config import QUERIES, REQUEST_DELAY
+from config import PLAYWRIGHT_QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
 
 
@@ -86,7 +88,7 @@ class HHParser(BaseParser):
     )
     ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
 
-    # Аргументы Chromium для Docker
+    # Аргументы Chromium: важно для Docker с 1 ГБ RAM.
     CHROMIUM_ARGS = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -95,9 +97,24 @@ class HHParser(BaseParser):
         "--disable-software-rasterizer",
         "--disable-background-networking",
         "--disable-sync",
+        "--js-flags=--max-old-space-size=256",
+        "--renderer-process-limit=1",
+        "--disable-features=site-per-process",
     ]
 
-    def __init__(self, headless: bool = True, max_pages: int = 2):
+    # Хосты-трекеры и реклама — режем, чтобы не грузить их JS.
+    BLOCKED_HOSTS = (
+        "mc.yandex.ru",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "facebook.net",
+        "facebook.com",
+        "sentry.io",
+        "top-fwz1.mail.ru",
+        "ad.mail.ru",
+    )
+
+    def __init__(self, headless: bool = True, max_pages: int = 1):
         self.headless = headless
         self.max_pages = max_pages
 
@@ -123,12 +140,20 @@ class HHParser(BaseParser):
         return " ".join(s.split()).strip()
 
     def _route_handler(self, route) -> None:
-        """Блокирует загрузку тяжёлых ресурсов."""
+        """Блокирует картинки/медиа/шрифты/трекеры — экономит RAM и трафик."""
         try:
             if route.request.resource_type in ("image", "media", "font"):
                 route.abort()
-            else:
-                route.continue_()
+                return
+
+            url = route.request.url
+            if "://" in url:
+                host = url.split("/")[2].lower()
+                if any(b in host for b in self.BLOCKED_HOSTS):
+                    route.abort()
+                    return
+
+            route.continue_()
         except Exception:
             try:
                 route.continue_()
@@ -238,7 +263,7 @@ class HHParser(BaseParser):
                 })
                 page.route("**/*", self._route_handler)
 
-                for query in QUERIES:
+                for query in PLAYWRIGHT_QUERIES:
                     logging.info(f"[HH] Запрос: '{query}'")
 
                     for page_num in range(self.max_pages):
@@ -246,7 +271,7 @@ class HHParser(BaseParser):
                             f"?text={quote(query)}"
                             f"&experience=noExperience"
                             f"&experience=between1And3"
-                            f"&items_on_page=50"
+                            f"&items_on_page=20"
                             f"&page={page_num}"
                         )
                         url = self.BASE_URL + params
