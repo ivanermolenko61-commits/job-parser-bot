@@ -271,7 +271,7 @@ class HHParser(BaseParser):
                             f"?text={quote(query)}"
                             f"&experience=noExperience"
                             f"&experience=between1And3"
-                            f"&items_on_page=20"
+                            f"&items_on_page=50"
                             f"&page={page_num}"
                         )
                         url = self.BASE_URL + params
