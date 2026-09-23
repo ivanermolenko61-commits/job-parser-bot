@@ -42,6 +42,15 @@ scheduler = AsyncIOScheduler()
 
 subscribed = True
 
+# Сколько вакансий показывать в /list по умолчанию
+DEFAULT_LIST_LIMIT = 30
+
+# Максимальный лимит (защита от слишком длинных списков)
+MAX_LIST_LIMIT = 100
+
+# Сколько символов помещается в одно сообщение Telegram (запас от 4096)
+MSG_CHAR_LIMIT = 3500
+
 
 # ---------- Клавиатура ----------
 
@@ -84,6 +93,29 @@ def _human_date(iso_str: str) -> str:
     return iso_str
 
 
+# ---------- Разбивка длинных сообщений ----------
+
+def _split_messages(text: str, limit: int = MSG_CHAR_LIMIT) -> list[str]:
+    """Разбивает длинный текст на части по границам строк."""
+    if len(text) <= limit:
+        return [text]
+
+    parts = []
+    current = []
+
+    for line in text.split("\n"):
+        if sum(len(l) + 1 for l in current) + len(line) + 1 > limit:
+            parts.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        parts.append("\n".join(current))
+
+    return parts
+
+
 # ---------- Middleware ----------
 
 class WhitelistMiddleware(BaseMiddleware):
@@ -111,40 +143,49 @@ dp.callback_query.middleware(WhitelistMiddleware(MY_CHAT_ID))
 
 # ---------- Проверка вакансий ----------
 
+_check_lock = asyncio.Lock()
+
+
 async def check_vacancies():
+    """Запускает парсеры и отправляет новые вакансии. Защищена от параллельных запусков."""
     if not subscribed:
         logging.info("[BOT] Подписка отключена, пропуск проверки")
         return
 
-    logging.info("[BOT] Проверка новых вакансий...")
-
-    try:
-        new_vacancies = fetch_new_vacancies()
-    except Exception:
-        logging.exception("[BOT] Ошибка при получении вакансий")
+    if _check_lock.locked():
+        logging.info("[BOT] Проверка уже идёт, пропуск")
         return
 
-    if not new_vacancies:
-        logging.info("[BOT] Новых вакансий нет")
-        return
+    async with _check_lock:
+        logging.info("[BOT] Проверка новых вакансий...")
 
-    logging.info(f"[BOT] Найдено новых: {len(new_vacancies)}")
-
-    sent_count = 0
-    for v in new_vacancies:
         try:
-            await bot.send_message(
-                chat_id=MY_CHAT_ID,
-                text=v.format_message(),
-                parse_mode="HTML",
-            )
-            sent_count += 1
-            await asyncio.sleep(0.5)
+            new_vacancies = fetch_new_vacancies()
         except Exception:
-            logging.exception(f"[BOT] Не удалось отправить {v.url}")
+            logging.exception("[BOT] Ошибка при получении вакансий")
+            return
 
-    if sent_count:
-        mark_vacancies_sent(new_vacancies[:sent_count])
+        if not new_vacancies:
+            logging.info("[BOT] Новых вакансий нет")
+            return
+
+        logging.info(f"[BOT] Найдено новых: {len(new_vacancies)}")
+
+        sent_count = 0
+        for v in new_vacancies:
+            try:
+                await bot.send_message(
+                    chat_id=MY_CHAT_ID,
+                    text=v.format_message(),
+                    parse_mode="HTML",
+                )
+                sent_count += 1
+                await asyncio.sleep(0.5)
+            except Exception:
+                logging.exception(f"[BOT] Не удалось отправить {v.url}")
+
+        if sent_count:
+            mark_vacancies_sent(new_vacancies[:sent_count])
 
 
 # ---------- Команды ----------
@@ -159,12 +200,20 @@ async def cmd_start(message: Message):
         f"Слежу за новыми вакансиями <b>Junior/стажёр</b> по разработке.\n"
         f"Удалёнка в приоритете, но беру и офисные.\n\n"
         f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n\n"
+        f"<b>Команды:</b>\n"
+        f"/list — последние {DEFAULT_LIST_LIMIT} вакансий\n"
+        f"/list 50 — последние 50\n"
+        f"/status — статистика\n"
+        f"/check — проверить сейчас\n"
+        f"/reset — очистить базу и загрузить заново\n"
+        f"/stop — приостановить\n\n"
         f"Пользуйся кнопками внизу 👇",
         parse_mode="HTML",
         reply_markup=main_reply_kb(),
     )
 
-    await check_vacancies()
+    # Фоновая проверка — не блокирует ответ
+    asyncio.create_task(check_vacancies())
 
 
 @dp.message(Command("stop"))
@@ -195,12 +244,33 @@ async def cmd_status(message: Message):
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    """Показывает последние 20 вакансий из базы (от свежих к старым)."""
-    vacancies = get_recent_vacancies(limit=20)
+    """Показывает последние N вакансий. /list 50 — последние 50."""
+    # Разбор аргумента
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    limit = DEFAULT_LIST_LIMIT
+
+    if len(parts) > 1:
+        try:
+            limit = int(parts[1].strip())
+            if limit <= 0:
+                raise ValueError
+            if limit > MAX_LIST_LIMIT:
+                limit = MAX_LIST_LIMIT
+        except ValueError:
+            await message.answer(
+                f"⚠️ Не понял число: <code>{parts[1]}</code>\n"
+                f"Пример: <code>/list 50</code>",
+                parse_mode="HTML",
+            )
+            return
+
+    vacancies = get_recent_vacancies(limit=limit)
 
     if not vacancies:
         await message.answer(
-            "📭 В базе пока пусто.\n\nНажмите «🔍 Проверить сейчас», чтобы загрузить вакансии.",
+            "📭 В базе пока пусто.\n\n"
+            "Нажмите «🔍 Проверить сейчас» или отправьте /check.",
             reply_markup=main_reply_kb(),
         )
         return
@@ -223,7 +293,14 @@ async def cmd_list(message: Message):
             f"  <a href='{v['url']}'>Открыть вакансию</a>\n"
         )
 
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())
+    full_text = "\n".join(lines)
+
+    # Разбиваем на несколько сообщений, если не влезает
+    for chunk in _split_messages(full_text):
+        await message.answer(chunk, parse_mode="HTML")
+
+    # Клавиатуру добавляем только к последнему сообщению
+    await message.answer("— Конец списка —", reply_markup=main_reply_kb())
 
 
 @dp.message(Command("check"))
