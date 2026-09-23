@@ -25,6 +25,7 @@ class HabrParser(BaseParser):
     SENIORITY_WORDS = [
         "senior", "lead ", "principal", "middle", "head of",
         "team lead", "tech lead", "director", "руководитель",
+        "ведущий", "ведущая", "ведущее",
     ]
 
     EXCLUDE_WORDS = [
@@ -43,6 +44,19 @@ class HabrParser(BaseParser):
         "data scientist", "дата-сайентист", "data science",
         "тренер", "coach",
         "cvm", "cmo",
+        # Безопасность — не разработка
+        "безопасност", "security", "appsec", "infosec",
+    ]
+
+    # IT-слова: хотя бы одно должно быть в заголовке
+    INCLUDE_IT_WORDS = [
+        "python", "java", " go ", "golang", "javascript", " typescript",
+        "c++", "c#", "php", "ruby", "swift", "kotlin", "scala", "rust",
+        "developer", "разработчик", "программист",
+        "backend", "бэкенд", "frontend", "фронтенд", "fullstack", "фулстек",
+        "ml engineer", "ml-инженер", "data engineer", "data-инженер",
+        "dba", "1с", "1c", "разработк",
+        "embedded", "bios", "bsp",
     ]
 
     LEVEL_PATTERN = re.compile(
@@ -51,9 +65,6 @@ class HabrParser(BaseParser):
     )
     COMPANY_RATING_PATTERN = re.compile(r"[\d.,]+\s*$")
     CITY_PATTERN = re.compile(r"[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?")
-    SALARY_NUMBER = re.compile(r"от\s+([\d\s]+)")
-
-    MAX_JUNIOR_SALARY = 200_000
 
     def __init__(self):
         self.headers = {
@@ -65,18 +76,11 @@ class HabrParser(BaseParser):
         }
 
     def _fetch_page(self, query: str, page: int) -> str | None:
-        params = {
-            "q": query,
-            "type": "all",
-            "sort": "date",
-            "page": page,
-        }
+        params = {"q": query, "type": "all", "sort": "date", "page": page}
         try:
             response = requests.get(
-                self.BASE_URL,
-                params=params,
-                headers=self.headers,
-                timeout=15,
+                self.BASE_URL, params=params,
+                headers=self.headers, timeout=15,
             )
             response.raise_for_status()
             return response.text
@@ -89,21 +93,12 @@ class HabrParser(BaseParser):
 
         if any(w in t for w in self.EXCLUDE_WORDS):
             return False
-
         if any(w in t for w in self.SENIORITY_WORDS):
+            return False
+        if not any(w in t for w in self.INCLUDE_IT_WORDS):
             return False
 
         return True
-
-    def _is_junior_salary(self, salary: str) -> bool:
-        m = self.SALARY_NUMBER.search(salary)
-        if not m:
-            return True
-        try:
-            number = int(m.group(1).replace(" ", ""))
-            return number < self.MAX_JUNIOR_SALARY
-        except ValueError:
-            return True
 
     def _clean_company(self, company: str) -> str:
         return self.COMPANY_RATING_PATTERN.sub("", company).strip()
@@ -116,21 +111,12 @@ class HabrParser(BaseParser):
         return salary.strip()
 
     def _parse_published_date(self, card) -> str:
-        """Извлекает дату публикации вакансии.
-
-        Хабр Карьера отдаёт либо ISO-дату в атрибуте datetime тега <time>,
-        либо текст вроде 'сегодня', '5 часов назад', '3 дня назад'.
-        """
         date_tag = card.select_one(".vacancy-card__date")
         if not date_tag:
             return ""
-
-        # Пробуем найти <time datetime="...">
         time_el = date_tag.find("time")
         if time_el and time_el.get("datetime"):
             return time_el["datetime"]
-
-        # Иначе — берём текст тега
         return date_tag.get_text(strip=True)
 
     def _parse_meta(self, card) -> tuple[str, str, bool]:
@@ -171,24 +157,17 @@ class HabrParser(BaseParser):
                     continue
 
                 title = title_link.get_text(strip=True)
-
                 if not self._is_relevant_category(title):
                     continue
 
                 location, level, is_remote = self._parse_meta(card)
-
                 if level.lower() not in self.ALLOWED_LEVELS:
                     continue
 
                 salary_tag = card.select_one(".vacancy-card__salary")
                 salary = self._clean_salary(salary_tag.get_text(strip=True)) if salary_tag else "не указана"
 
-                if not self._is_junior_salary(salary):
-                    logging.debug(f"[HABR] Пропуск (зарплата): {title} — {salary}")
-                    continue
-
                 published_at = self._parse_published_date(card)
-
                 url = "https://career.habr.com" + title_link.get("href", "")
 
                 company_tag = card.select_one(".vacancy-card__company")
