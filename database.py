@@ -14,7 +14,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаёт таблицу, если её нет."""
+    """Создаёт таблицу, если её нет, и делает миграции."""
     with _connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS vacancies (
@@ -28,6 +28,12 @@ def init_db() -> None:
                 UNIQUE(source, vacancy_id)
             )
         """)
+
+        try:
+            conn.execute("ALTER TABLE vacancies ADD COLUMN published_at TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
 
 
@@ -47,16 +53,17 @@ def mark_sent(
     title: str = "",
     company: str = "",
     url: str = "",
+    published_at: str = "",
 ) -> None:
     """Помечает вакансию как отправленную."""
     with _connect() as conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO vacancies
-                (source, vacancy_id, title, company, url)
-            VALUES (?, ?, ?, ?, ?)
+                (source, vacancy_id, title, company, url, published_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source, vacancy_id, title, company, url),
+            (source, vacancy_id, title, company, url, published_at),
         )
         conn.commit()
 
@@ -71,7 +78,7 @@ def stats() -> dict:
         ).fetchall()
 
         last = conn.execute(
-            "SELECT found_at FROM vacancies ORDER BY found_at DESC LIMIT 1"
+            "SELECT found_at FROM vacancies ORDER BY found_at DESC, id DESC LIMIT 1"
         ).fetchone()
 
         return {
@@ -81,8 +88,53 @@ def stats() -> dict:
         }
 
 
+def get_recent_vacancies(limit: int = 20) -> list[dict]:
+    """Возвращает последние N вакансий.
+
+    Сортировка:
+      1. Записи с датой публикации — сначала (в порядке убывания даты)
+      2. Записи без даты публикации — в конце (в порядке found_at)
+
+    ISO-формат published_at ('2026-09-23T14:27:10+03:00') корректно
+    сортируется лексикографически — год/месяц/день/час/минута идут
+    в правильном порядке.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT source, vacancy_id, title, company, url, found_at, published_at
+            FROM vacancies
+            ORDER BY
+                CASE WHEN published_at IS NULL OR published_at = '' THEN 1 ELSE 0 END,
+                published_at DESC,
+                found_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def cleanup_old(days: int = 30) -> int:
+    """Удаляет вакансии старше N дней. Возвращает число удалённых."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            f"DELETE FROM vacancies WHERE found_at < datetime('now', '-{days} days')"
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def reset_db() -> int:
+    """Полностью очищает таблицу vacancies. Возвращает число удалённых."""
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM vacancies")
+        conn.commit()
+        return cursor.rowcount
+
+
 if __name__ == "__main__":
-    # Для локального теста — инициализируем и выводим статистику
     init_db()
     print("База инициализирована:", DB_PATH)
     print("Статистика:", stats())
