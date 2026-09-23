@@ -1,11 +1,12 @@
 """Менеджер парсеров: запускает все источники, возвращает только новые вакансии."""
 import logging
 
-from database import is_sent, mark_sent
+from database import is_duplicate, is_sent, mark_sent
 from parsers.base import Vacancy
 from parsers.dreamjob_parser import DreamJobParser
 from parsers.geekjob_parser import GeekJobParser
 from parsers.habr_parser import HabrParser
+from parsers.hh_parser import HHParser
 
 
 def get_all_parsers() -> list:
@@ -14,13 +15,22 @@ def get_all_parsers() -> list:
         HabrParser(),
         DreamJobParser(),
         GeekJobParser(),
+        HHParser(),
     ]
 
 
 def fetch_new_vacancies() -> list[Vacancy]:
-    """Запускает все парсеры, возвращает только НОВЫЕ вакансии."""
+    """Запускает все парсеры, возвращает только НОВЫЕ вакансии.
+
+    Дедупликация двойная:
+      1. По (source, vacancy_id) — точный дубль с того же сайта.
+      2. По (title, company) — один и тот же работодатель разместил
+         вакансию на нескольких площадках. Берём только первую.
+    """
     parsers = get_all_parsers()
     new_vacancies = []
+    # Локальный кэш для пары (title, company), чтобы не дёргать БД на каждом
+    seen_pairs: set[tuple[str, str]] = set()
 
     for parser in parsers:
         logging.info(f"[MANAGER] Запуск парсера: {parser.source_name}")
@@ -32,8 +42,19 @@ def fetch_new_vacancies() -> list[Vacancy]:
 
         source_new = 0
         for v in vacancies:
+            # Дубль по ID с того же источника
             if is_sent(v.source, v.vacancy_id):
                 continue
+
+            # Дубль по названию+компании (кросс-источник)
+            pair = (v.title.strip().lower(), v.company.strip().lower())
+            if pair in seen_pairs:
+                logging.debug(f"[MANAGER] Пропуск дубля: {v.title} / {v.company}")
+                continue
+            if is_duplicate(v.title, v.company):
+                continue
+
+            seen_pairs.add(pair)
             new_vacancies.append(v)
             source_new += 1
 

@@ -42,11 +42,12 @@ scheduler = AsyncIOScheduler()
 
 subscribed = True
 
-DEFAULT_LIST_LIMIT = 30
-MAX_LIST_LIMIT = 100
+# По умолчанию показываем до 300 вакансий (практически всё, что есть в БД)
+DEFAULT_LIST_LIMIT = 300
+# Жёсткий лимит — защита от слишком длинных списков
+MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 
-# Срок хранения вакансий в базе (дней)
 CLEANUP_DAYS = 7
 
 
@@ -68,12 +69,7 @@ def main_reply_kb():
 # ---------- Форматирование даты ----------
 
 def _human_date(iso_str: str) -> str:
-    """Преобразует ISO-дату в '23.09 в 14:27'.
-
-    Поддерживает:
-      - ISO: 2026-09-23T14:27:10
-      - Русский текст: '27 августа' — оставляем как есть.
-    """
+    """Преобразует ISO-дату в '23.09 в 14:27'."""
     if not iso_str:
         return ""
 
@@ -94,6 +90,17 @@ def _human_date(iso_str: str) -> str:
             continue
 
     return iso_str
+
+
+def _human_date_short(date_str: str) -> str:
+    """Только дата: '2026-09-23' → '23.09'."""
+    if not date_str:
+        return ""
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return dt.strftime("%d.%m")
+    except ValueError:
+        return date_str
 
 
 # ---------- Разбивка длинных сообщений ----------
@@ -149,19 +156,19 @@ dp.callback_query.middleware(WhitelistMiddleware(MY_CHAT_ID))
 _check_lock = asyncio.Lock()
 
 
-async def check_vacancies():
+async def check_vacancies() -> bool:
     """Запускает парсеры в отдельном потоке и отправляет новые вакансии.
 
-    Парсеры синхронные и используют Playwright — их нельзя запускать в
-    основном потоке asyncio, иначе заблокируют обработку сообщений.
+    Возвращает True, если проверка реально выполнена.
+    Возвращает False, если проверка пропущена (уже идёт или подписка off).
     """
     if not subscribed:
         logging.info("[BOT] Подписка отключена, пропуск проверки")
-        return
+        return False
 
     if _check_lock.locked():
         logging.info("[BOT] Проверка уже идёт, пропуск")
-        return
+        return False
 
     async with _check_lock:
         logging.info("[BOT] Проверка новых вакансий...")
@@ -170,11 +177,11 @@ async def check_vacancies():
             new_vacancies = await asyncio.to_thread(fetch_new_vacancies)
         except Exception:
             logging.exception("[BOT] Ошибка при получении вакансий")
-            return
+            return True
 
         if not new_vacancies:
             logging.info("[BOT] Новых вакансий нет")
-            return
+            return True
 
         logging.info(f"[BOT] Найдено новых: {len(new_vacancies)}")
 
@@ -194,6 +201,8 @@ async def check_vacancies():
         if sent_count:
             mark_vacancies_sent(new_vacancies[:sent_count])
 
+        return True
+
 
 # ---------- Общая логика /list ----------
 
@@ -209,23 +218,28 @@ async def _send_list(message: Message, limit: int):
         )
         return
 
-    lines = [f"📋 <b>Последние {len(vacancies)} вакансий</b> (свежие сверху):\n"]
+    lines = [f"📋 <b>Все вакансии в базе ({len(vacancies)} шт.)</b>\n"]
 
     for v in vacancies:
         published = v.get("published_at") or ""
-        found = v.get("found_at", "")[:16]
+        found = v.get("found_at", "")[:10]
 
         if published:
             time_str = f"🕒 Опубликовано: {_human_date(published)}"
+        elif found:
+            time_str = f"🕒 Найдено: {_human_date_short(found)}"
         else:
-            time_str = f"🕒 Найдено: {_human_date(found)}"
+            time_str = ""
 
-        lines.append(
-            f"{time_str}\n"
+        block = (
             f"• <b>{v['title']}</b>\n"
             f"  {v['company']}\n"
             f"  <a href='{v['url']}'>Открыть вакансию</a>\n"
         )
+        if time_str:
+            block = f"{time_str}\n{block}"
+
+        lines.append(block)
 
     full_text = "\n".join(lines)
 
@@ -249,8 +263,8 @@ async def cmd_start(message: Message):
         f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n"
         f"🗑 Вакансии старше <b>{CLEANUP_DAYS} дней</b> удаляются автоматически.\n\n"
         f"<b>Команды:</b>\n"
-        f"/list — последние {DEFAULT_LIST_LIMIT} вакансий\n"
-        f"/list 50 — последние 50\n"
+        f"/list — все вакансии из базы\n"
+        f"/list 50 — только первые 50\n"
         f"/status — статистика\n"
         f"/check — проверить сейчас\n"
         f"/reset — очистить базу и загрузить заново\n"
@@ -285,14 +299,16 @@ async def cmd_status(message: Message):
     if s["last_found"]:
         lines.append(f"\n🕒 Последняя: {s['last_found']}")
     lines.append(f"\n⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} мин")
-    lines.append(f"🗑 Хранение: {CLEANUP_DAYS} дней")
+    lines.append(f"🗑 Хранение: {CLEANUP_DAYS} дней (от даты публикации)")
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
+    if _check_lock.locked():
+        lines.append("🔄 Проверка сейчас идёт")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())
 
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    """Показывает последние N вакансий. /list 50 — последние 50."""
+    """Показывает вакансии. /list — все, /list 50 — первые 50."""
     text = message.text or ""
     parts = text.split(maxsplit=1)
     limit = DEFAULT_LIST_LIMIT
@@ -311,14 +327,34 @@ async def cmd_list(message: Message):
 
 @dp.message(Command("check"))
 async def cmd_check(message: Message):
+    """Запускает проверку и сообщает результат корректно."""
     await message.answer("🔍 Проверяю вакансии…")
-    await check_vacancies()
-    await message.answer("✅ Проверка завершена.", reply_markup=main_reply_kb())
+
+    performed = await check_vacancies()
+
+    if performed:
+        await message.answer(
+            "✅ Проверка завершена.",
+            reply_markup=main_reply_kb(),
+        )
+    else:
+        await message.answer(
+            "⏳ Проверка уже идёт — дождитесь её окончания.\n"
+            "Новые вакансии придут отдельными сообщениями.",
+            reply_markup=main_reply_kb(),
+        )
 
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
     """Очищает базу и заново загружает вакансии."""
+    if _check_lock.locked():
+        await message.answer(
+            "⏳ Проверка уже идёт. Дождитесь её окончания и попробуйте /reset снова.",
+            reply_markup=main_reply_kb(),
+        )
+        return
+
     deleted = reset_db()
     logging.info(f"[BOT] База очищена: удалено {deleted} записей")
 
@@ -367,13 +403,11 @@ async def btn_resume(message: Message):
 async def main():
     init_db()
 
-    # Первая очистка при старте
     deleted = cleanup_old(days=CLEANUP_DAYS)
     logging.info(
         f"Очистка БД: удалено {deleted} записей старше {CLEANUP_DAYS} дней"
     )
 
-    # Ежедневная очистка в 03:00
     scheduler.add_job(
         lambda: logging.info(
             f"Очистка БД: удалено {cleanup_old(days=CLEANUP_DAYS)} записей"

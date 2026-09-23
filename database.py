@@ -6,7 +6,6 @@ from datetime import datetime
 from config import DB_PATH
 
 
-# Русские месяцы → номер
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
@@ -81,6 +80,29 @@ def is_sent(source: str, vacancy_id: str) -> bool:
         return row is not None
 
 
+def is_duplicate(title: str, company: str) -> bool:
+    """Проверяет, есть ли уже вакансия с таким названием и компанией.
+
+    Это ловит дубли между источниками: одна и та же вакансия ОМЕГА может
+    быть и на hh.ru, и на Dream Job, и на GeekJob. vacancy_id у них разные,
+    но title + company совпадают.
+    """
+    if not title or not company:
+        return False
+
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM vacancies
+            WHERE LOWER(TRIM(title)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(company)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (title, company),
+        ).fetchone()
+        return row is not None
+
+
 def mark_sent(
     source: str,
     vacancy_id: str,
@@ -149,10 +171,7 @@ def get_recent_vacancies(limit: int = 20) -> list[dict]:
 
 
 def cleanup_old(days: int = 7) -> int:
-    """Удаляет вакансии старше N дней. Возвращает число удалённых.
-
-    Возраст считается по published_at, если он есть. Иначе — по found_at.
-    """
+    """Удаляет вакансии старше N дней. Возвращает число удалённых."""
     with _connect() as conn:
         cursor = conn.execute(
             """
