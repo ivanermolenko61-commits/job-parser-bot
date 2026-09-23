@@ -4,6 +4,7 @@ import logging
 from database import is_sent, mark_sent
 from parsers.base import Vacancy
 from parsers.dreamjob_parser import DreamJobParser
+from parsers.geekjob_parser import GeekJobParser
 from parsers.habr_parser import HabrParser
 
 
@@ -12,6 +13,7 @@ def get_all_parsers() -> list:
     return [
         HabrParser(),
         DreamJobParser(),
+        GeekJobParser(),
     ]
 
 

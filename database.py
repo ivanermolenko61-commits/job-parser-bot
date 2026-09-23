@@ -1,9 +1,17 @@
 """Работа с SQLite: хранение уже отправленных вакансий."""
+import re
 import sqlite3
 from datetime import datetime
-from typing import Optional
 
 from config import DB_PATH
+
+
+# Русские месяцы → номер
+MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
 
 
 def _connect() -> sqlite3.Connection:
@@ -11,6 +19,32 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _normalize_date(text: str) -> str:
+    """Приводит дату к ISO (без timezone) для корректной сортировки."""
+    if not text:
+        return ""
+
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)", text)
+        if m:
+            return f"{m.group(1)}T{m.group(2)}"
+        return text
+
+    m = re.match(r"^(\d{1,2})\s+([а-яё]+)", text.lower().strip())
+    if m:
+        day = int(m.group(1))
+        month_name = m.group(2)
+        month = MONTHS_RU.get(month_name)
+        if month:
+            now = datetime.now()
+            year = now.year
+            if month > now.month:
+                year -= 1
+            return f"{year}-{month:02d}-{day:02d}T00:00:00"
+
+    return text
 
 
 def init_db() -> None:
@@ -56,6 +90,8 @@ def mark_sent(
     published_at: str = "",
 ) -> None:
     """Помечает вакансию как отправленную."""
+    normalized_date = _normalize_date(published_at)
+
     with _connect() as conn:
         conn.execute(
             """
@@ -63,7 +99,7 @@ def mark_sent(
                 (source, vacancy_id, title, company, url, published_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source, vacancy_id, title, company, url, published_at),
+            (source, vacancy_id, title, company, url, normalized_date),
         )
         conn.commit()
 
@@ -92,12 +128,8 @@ def get_recent_vacancies(limit: int = 20) -> list[dict]:
     """Возвращает последние N вакансий.
 
     Сортировка:
-      1. Записи с датой публикации — сначала (в порядке убывания даты)
-      2. Записи без даты публикации — в конце (в порядке found_at)
-
-    ISO-формат published_at ('2026-09-23T14:27:10+03:00') корректно
-    сортируется лексикографически — год/месяц/день/час/минута идут
-    в правильном порядке.
+      1. Записи с датой публикации — сначала (по убыванию published_at)
+      2. Записи без даты публикации — в конце (по убыванию found_at)
     """
     with _connect() as conn:
         rows = conn.execute(
@@ -116,11 +148,21 @@ def get_recent_vacancies(limit: int = 20) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def cleanup_old(days: int = 30) -> int:
-    """Удаляет вакансии старше N дней. Возвращает число удалённых."""
+def cleanup_old(days: int = 7) -> int:
+    """Удаляет вакансии старше N дней. Возвращает число удалённых.
+
+    Возраст считается по published_at, если он есть. Иначе — по found_at.
+    """
     with _connect() as conn:
         cursor = conn.execute(
-            f"DELETE FROM vacancies WHERE found_at < datetime('now', '-{days} days')"
+            """
+            DELETE FROM vacancies
+            WHERE COALESCE(
+                NULLIF(published_at, ''),
+                found_at
+            ) < datetime('now', ?)
+            """,
+            (f'-{days} days',),
         )
         conn.commit()
         return cursor.rowcount

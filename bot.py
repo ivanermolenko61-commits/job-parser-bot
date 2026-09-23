@@ -46,6 +46,9 @@ DEFAULT_LIST_LIMIT = 30
 MAX_LIST_LIMIT = 100
 MSG_CHAR_LIMIT = 3500
 
+# Срок хранения вакансий в базе (дней)
+CLEANUP_DAYS = 7
+
 
 # ---------- Клавиатура ----------
 
@@ -65,7 +68,12 @@ def main_reply_kb():
 # ---------- Форматирование даты ----------
 
 def _human_date(iso_str: str) -> str:
-    """Преобразует ISO-дату в '23.09 в 14:27'."""
+    """Преобразует ISO-дату в '23.09 в 14:27'.
+
+    Поддерживает:
+      - ISO: 2026-09-23T14:27:10
+      - Русский текст: '27 августа' — оставляем как есть.
+    """
     if not iso_str:
         return ""
 
@@ -142,7 +150,11 @@ _check_lock = asyncio.Lock()
 
 
 async def check_vacancies():
-    """Запускает парсеры и отправляет новые вакансии."""
+    """Запускает парсеры в отдельном потоке и отправляет новые вакансии.
+
+    Парсеры синхронные и используют Playwright — их нельзя запускать в
+    основном потоке asyncio, иначе заблокируют обработку сообщений.
+    """
     if not subscribed:
         logging.info("[BOT] Подписка отключена, пропуск проверки")
         return
@@ -155,7 +167,7 @@ async def check_vacancies():
         logging.info("[BOT] Проверка новых вакансий...")
 
         try:
-            new_vacancies = fetch_new_vacancies()
+            new_vacancies = await asyncio.to_thread(fetch_new_vacancies)
         except Exception:
             logging.exception("[BOT] Ошибка при получении вакансий")
             return
@@ -234,7 +246,8 @@ async def cmd_start(message: Message):
         f"👋 Привет!\n\n"
         f"Слежу за новыми вакансиями <b>Junior/стажёр</b> по разработке.\n"
         f"Удалёнка в приоритете, но беру и офисные.\n\n"
-        f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n\n"
+        f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n"
+        f"🗑 Вакансии старше <b>{CLEANUP_DAYS} дней</b> удаляются автоматически.\n\n"
         f"<b>Команды:</b>\n"
         f"/list — последние {DEFAULT_LIST_LIMIT} вакансий\n"
         f"/list 50 — последние 50\n"
@@ -272,6 +285,7 @@ async def cmd_status(message: Message):
     if s["last_found"]:
         lines.append(f"\n🕒 Последняя: {s['last_found']}")
     lines.append(f"\n⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} мин")
+    lines.append(f"🗑 Хранение: {CLEANUP_DAYS} дней")
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())
 
@@ -283,21 +297,14 @@ async def cmd_list(message: Message):
     parts = text.split(maxsplit=1)
     limit = DEFAULT_LIST_LIMIT
 
-    # Проверяем, есть ли второй аргумент и является ли он числом
     if len(parts) > 1:
         arg = parts[1].strip()
-
         if arg.isdigit():
             limit = int(arg)
             if limit <= 0:
                 limit = DEFAULT_LIST_LIMIT
             if limit > MAX_LIST_LIMIT:
                 limit = MAX_LIST_LIMIT
-        else:
-            # Не число — игнорируем (например, пришло от reply-кнопки)
-            # Но если аргумент выглядит как что-то явно осмысленное, ругаемся
-            # (здесь просто игнорируем и показываем дефолт)
-            pass
 
     await _send_list(message, limit)
 
@@ -360,12 +367,16 @@ async def btn_resume(message: Message):
 async def main():
     init_db()
 
-    deleted = cleanup_old(days=30)
-    logging.info(f"Очистка БД: удалено {deleted} записей старше 30 дней")
+    # Первая очистка при старте
+    deleted = cleanup_old(days=CLEANUP_DAYS)
+    logging.info(
+        f"Очистка БД: удалено {deleted} записей старше {CLEANUP_DAYS} дней"
+    )
 
+    # Ежедневная очистка в 03:00
     scheduler.add_job(
         lambda: logging.info(
-            f"Очистка БД: удалено {cleanup_old(days=30)} записей"
+            f"Очистка БД: удалено {cleanup_old(days=CLEANUP_DAYS)} записей"
         ),
         "cron",
         hour=3,
