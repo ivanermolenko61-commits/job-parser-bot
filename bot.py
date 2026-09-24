@@ -16,7 +16,7 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
-from config import CHECK_INTERVAL_MINUTES
+from config import CHECK_INTERVAL_MINUTES, MAX_VACANCY_AGE_DAYS
 from database import (
     cleanup_old,
     get_recent_vacancies,
@@ -48,7 +48,8 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 
-CLEANUP_DAYS = 7
+# Срок хранения вакансий в БД (дней)
+CLEANUP_DAYS = 5
 
 
 # ---------- Клавиатура ----------
@@ -185,7 +186,11 @@ async def check_vacancies() -> bool:
 
         logging.info(f"[BOT] Найдено новых: {len(new_vacancies)}")
 
-        sent_count = 0
+        # Важно: собираем РЕАЛЬНО отправленные вакансии в отдельный список,
+        # а не режем исходный по счётчику. Иначе при сбое на середине списка
+        # упавшая вакансия помечается отправленной (и теряется), а успешные
+        # после неё — не помечаются (и придут повторно).
+        sent_ok: list = []
         for v in new_vacancies:
             try:
                 await bot.send_message(
@@ -193,13 +198,19 @@ async def check_vacancies() -> bool:
                     text=v.format_message(),
                     parse_mode="HTML",
                 )
-                sent_count += 1
+                sent_ok.append(v)
                 await asyncio.sleep(0.5)
             except Exception:
                 logging.exception(f"[BOT] Не удалось отправить {v.url}")
 
-        if sent_count:
-            mark_vacancies_sent(new_vacancies[:sent_count])
+        if sent_ok:
+            mark_vacancies_sent(sent_ok)
+            logging.info(f"[BOT] Успешно отправлено: {len(sent_ok)}")
+        if len(sent_ok) < len(new_vacancies):
+            logging.warning(
+                f"[BOT] Не отправлено: {len(new_vacancies) - len(sent_ok)} "
+                f"(будут повторены в следующую проверку)"
+            )
 
         return True
 
@@ -261,7 +272,8 @@ async def cmd_start(message: Message):
         f"Слежу за новыми вакансиями <b>Junior/стажёр</b> по разработке.\n"
         f"Удалёнка в приоритете, но беру и офисные.\n\n"
         f"⏱ Проверка каждые <b>{CHECK_INTERVAL_MINUTES} мин</b>.\n"
-        f"🗑 Вакансии старше <b>{CLEANUP_DAYS} дней</b> удаляются автоматически.\n\n"
+        f"🗑 Вакансии старше <b>{CLEANUP_DAYS} дней</b> не отправляются "
+        f"и удаляются из базы.\n\n"
         f"<b>Команды:</b>\n"
         f"/list — все вакансии из базы\n"
         f"/list 50 — только первые 50\n"
@@ -300,6 +312,9 @@ async def cmd_status(message: Message):
         lines.append(f"\n🕒 Последняя: {s['last_found']}")
     lines.append(f"\n⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} мин")
     lines.append(f"🗑 Хранение: {CLEANUP_DAYS} дней (от даты публикации)")
+    lines.append(
+        f"🆕 Фильтр свежести: не старше {MAX_VACANCY_AGE_DAYS} дней"
+    )
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
     if _check_lock.locked():
         lines.append("🔄 Проверка сейчас идёт")

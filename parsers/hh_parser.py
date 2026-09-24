@@ -12,7 +12,7 @@ Playwright для рендеринга JS.
   • Одна страница переиспользуется.
   • Аргументы Chromium для Docker + ограничение V8 heap и процессов.
   • Короткий список запросов (PLAYWRIGHT_QUERIES).
-  • items_on_page=20 вместо 50 — меньше DOM и меньше строка HTML.
+  • items_on_page=50 — меньше навигаций при том же охвате.
 """
 import logging
 import re
@@ -272,6 +272,7 @@ class HHParser(BaseParser):
                             f"&experience=noExperience"
                             f"&experience=between1And3"
                             f"&items_on_page=50"
+                            f"&order_by=publication_time"
                             f"&page={page_num}"
                         )
                         url = self.BASE_URL + params

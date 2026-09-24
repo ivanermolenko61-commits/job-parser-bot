@@ -1,7 +1,7 @@
 """Работа с SQLite: хранение уже отправленных вакансий."""
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import DB_PATH
 
@@ -20,8 +20,12 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _normalize_date(text: str) -> str:
-    """Приводит дату к ISO (без timezone) для корректной сортировки."""
+def normalize_date(text: str) -> str:
+    """Приводит дату к ISO (без timezone) для корректной сортировки.
+
+    Публичная функция — используется также в parser_manager для проверки
+    свежести вакансии.
+    """
     if not text:
         return ""
 
@@ -39,11 +43,42 @@ def _normalize_date(text: str) -> str:
         if month:
             now = datetime.now()
             year = now.year
-            if month > now.month:
+            # Если месяц в будущем относительно текущего — значит это
+            # прошлый год. Но если месяц тот же, а день ещё не наступил
+            # в этом году — тоже прошлый год.
+            if month > now.month or (month == now.month and day > now.day):
                 year -= 1
             return f"{year}-{month:02d}-{day:02d}T00:00:00"
 
     return text
+
+
+def is_fresh(published_at: str, max_age_days: int) -> bool:
+    """Проверяет, что вакансия не старше max_age_days.
+
+    Если published_at пустой — считаем вакансию свежей (пропускаем, чтобы
+    не терять валидные вакансии без указанной даты).
+    """
+    if not published_at:
+        return True
+
+    normalized = normalize_date(published_at)
+    if not normalized:
+        return True
+
+    # Парсим нормализованную дату
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(normalized[:19], fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        # Не смогли распарсить — не блокируем вакансию
+        return True
+
+    threshold = datetime.now() - timedelta(days=max_age_days)
+    return dt >= threshold
 
 
 def init_db() -> None:
@@ -83,7 +118,7 @@ def is_sent(source: str, vacancy_id: str) -> bool:
 def is_duplicate(title: str, company: str) -> bool:
     """Проверяет, есть ли уже вакансия с таким названием и компанией.
 
-    Это ловит дубли между источниками: одна и та же вакансия ОМЕГА может
+    Это ловит дубли между источниками: одна и та же вакансия может
     быть и на hh.ru, и на Dream Job, и на GeekJob. vacancy_id у них разные,
     но title + company совпадают.
     """
@@ -112,7 +147,7 @@ def mark_sent(
     published_at: str = "",
 ) -> None:
     """Помечает вакансию как отправленную."""
-    normalized_date = _normalize_date(published_at)
+    normalized_date = normalize_date(published_at)
 
     with _connect() as conn:
         conn.execute(
@@ -170,15 +205,23 @@ def get_recent_vacancies(limit: int = 20) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def cleanup_old(days: int = 7) -> int:
-    """Удаляет вакансии старше N дней. Возвращает число удалённых."""
+def cleanup_old(days: int = 5) -> int:
+    """Удаляет вакансии старше N дней. Возвращает число удалённых.
+
+    Важно: published_at хранится как ISO-строка с 'T' (2026-09-19T14:30:00),
+    а found_at — в формате SQLite с пробелом (2026-09-19 14:30:00).
+    Чтобы сравнение работало корректно, приводим обе даты к формату,
+    который понимает datetime() в SQLite: REPLACE(..., 'T', ' ').
+    """
     with _connect() as conn:
         cursor = conn.execute(
             """
             DELETE FROM vacancies
-            WHERE COALESCE(
-                NULLIF(published_at, ''),
-                found_at
+            WHERE datetime(
+                REPLACE(
+                    COALESCE(NULLIF(published_at, ''), found_at),
+                    'T', ' '
+                )
             ) < datetime('now', ?)
             """,
             (f'-{days} days',),
