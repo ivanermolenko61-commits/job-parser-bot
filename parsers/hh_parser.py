@@ -4,8 +4,9 @@
 Playwright для рендеринга JS.
 
 Публичный API hh.ru закрыт с декабря 2025 — поэтому парсим HTML.
-Количество откликов анонимно не видно, поэтому поле applications_count
-остаётся пустым.
+Дату публикации HH анонимно не отдаёт, поэтому поле published_at
+всегда пустое. Свежесть обеспечивается параметром search_period в URL
+запроса — HH сам отсекает вакансии старше указанного числа дней.
 
 Оптимизация памяти (важно: лимит контейнера — 1 ГБ RAM):
   • Блокировка картинок/шрифтов/медиа/трекеров.
@@ -22,7 +23,7 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from config import PLAYWRIGHT_QUERIES, REQUEST_DELAY
+from config import MAX_VACANCY_AGE_DAYS, PLAYWRIGHT_QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
 
 
@@ -208,11 +209,9 @@ class HHParser(BaseParser):
             elif is_remote:
                 location = "удалённо"
 
+            # HH анонимно дату публикации не отдаёт. Свежесть обеспечивается
+            # параметром search_period в URL запроса — HH сам отсекает старое.
             published_at = ""
-            date_tag = card.select_one('[data-qa="vacancy-serp-item-activity"]')
-            if date_tag:
-                published_at = self._clean(date_tag.get_text())
-                published_at = published_at.replace("Активна", "").strip()
 
             return Vacancy(
                 source=self.source_name,
@@ -273,6 +272,7 @@ class HHParser(BaseParser):
                             f"&experience=between1And3"
                             f"&items_on_page=50"
                             f"&order_by=publication_time"
+                            f"&search_period={MAX_VACANCY_AGE_DAYS}"
                             f"&page={page_num}"
                         )
                         url = self.BASE_URL + params
