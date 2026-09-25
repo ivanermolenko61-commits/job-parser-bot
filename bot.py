@@ -25,6 +25,7 @@ from database import (
     reset_db,
     stats,
 )
+from health import monitor
 from parser_manager import fetch_new_vacancies, mark_vacancies_sent
 
 load_dotenv()
@@ -181,6 +182,14 @@ async def check_vacancies() -> bool:
             logging.exception("[BOT] Ошибка при получении вакансий")
             return True
 
+        # Сообщения «парсер сломался / снова работает» — до вакансий,
+        # и даже если новых вакансий нет (как раз тогда они и важны)
+        for alert in monitor.pop_alerts():
+            try:
+                await bot.send_message(chat_id=MY_CHAT_ID, text=alert, parse_mode="HTML")
+            except Exception:
+                logging.exception("[BOT] Не удалось отправить health-оповещение")
+
         if not new_vacancies:
             logging.info("[BOT] Новых вакансий нет")
             return True
@@ -318,6 +327,14 @@ async def cmd_status(message: Message):
         f"🆕 Фильтр свежести: не старше {MAX_VACANCY_AGE_DAYS} дней"
     )
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
+    if monitor.streak:
+        lines.append("\n<b>Парсеры:</b>")
+        for source, streak in sorted(monitor.streak.items()):
+            if streak == 0:
+                lines.append(f"🟢 {source}: работает")
+            else:
+                reason = html.escape(monitor.last_reason.get(source, ""))
+                lines.append(f"🔴 {source}: не работает, неудачных проверок подряд: {streak} ({reason})")
     if _check_lock.locked():
         lines.append("🔄 Проверка сейчас идёт")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_reply_kb())

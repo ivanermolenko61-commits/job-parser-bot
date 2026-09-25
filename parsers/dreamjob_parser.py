@@ -158,6 +158,7 @@ class DreamJobParser(BaseParser):
         """Возвращает (вакансии, прошедшие фильтры; сколько карточек было на странице)."""
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select(".vacancy-new__item")
+        self.cards_seen += len(cards)  # для health-мониторинга
         logging.info(f"[DREAMJOB] Найдено карточек: {len(cards)}")
 
         vacancies = []

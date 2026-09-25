@@ -4,6 +4,7 @@ import logging
 
 from config import MAX_VACANCY_AGE_DAYS
 from database import is_duplicate, is_fresh, is_sent, mark_sent
+from health import monitor
 from parsers.base import Vacancy
 from parsers.dreamjob_parser import DreamJobParser
 from parsers.geekjob_parser import GeekJobParser
@@ -40,11 +41,14 @@ def fetch_new_vacancies() -> list[Vacancy]:
 
     for parser in parsers:
         logging.info(f"[MANAGER] Запуск парсера: {parser.source_name}")
+        error = None
         try:
             vacancies = parser.fetch()
         except Exception as e:
             logging.exception(f"[MANAGER] Ошибка в парсере {parser.source_name}: {e}")
             vacancies = []
+            error = e
+        monitor.record(parser.source_name, parser.cards_seen, error)
 
         # Освобождаем память после парсера (особенно важно для Playwright)
         collected = gc.collect()

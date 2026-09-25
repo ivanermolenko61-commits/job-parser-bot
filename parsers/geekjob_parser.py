@@ -160,6 +160,7 @@ class GeekJobParser(BaseParser):
     def _parse_html(self, html: str) -> list[Vacancy]:
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select(".collection-item.avatar")
+        self.cards_seen += len(cards)  # для health-мониторинга
         logging.info(f"[GEEKJOB] Найдено карточек: {len(cards)}")
 
         vacancies = []

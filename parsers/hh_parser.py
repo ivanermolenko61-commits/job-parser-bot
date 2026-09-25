@@ -166,6 +166,7 @@ class HHParser(BaseParser):
     def _parse_html(self, html: str) -> list[Vacancy]:
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select('[data-qa="vacancy-serp__vacancy"]')
+        self.cards_seen += len(cards)  # для health-мониторинга
         logging.info(f"[HH] Найдено карточек: {len(cards)}")
 
         vacancies = []

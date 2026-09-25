@@ -112,6 +112,7 @@ class HabrParser(BaseParser):
         soup = BeautifulSoup(html, "html.parser")
         vacancies = []
         cards = soup.select(".vacancy-card")
+        self.cards_seen += len(cards)  # для health-мониторинга
 
         for card in cards:
             try:
