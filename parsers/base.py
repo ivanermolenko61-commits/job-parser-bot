@@ -1,4 +1,5 @@
 """Базовый класс для всех парсеров вакансий."""
+import html
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -19,21 +20,27 @@ class Vacancy:
     applications_count: str = ""  # количество откликов (пока только hh.ru)
 
     def format_message(self) -> str:
-        """Форматирует вакансию для отправки в Telegram (HTML)."""
+        """Форматирует вакансию для отправки в Telegram (HTML).
+
+        Все поля с сайтов экранируются через html.escape: символы & < >
+        в названии («R&D», «C++ <junior>») иначе ломают разметку, и Telegram
+        отказывается отправлять сообщение.
+        """
+        esc = html.escape
         remote_mark = "🌍 " if self.is_remote else ""
-        lines = [f"🔍 {remote_mark}<b>{self.title}</b>"]
-        lines.append(f"🏢 Компания: {self.company}")
+        lines = [f"🔍 {remote_mark}<b>{esc(self.title)}</b>"]
+        lines.append(f"🏢 Компания: {esc(self.company)}")
         if self.location:
-            lines.append(f"📍 Локация: {self.location}")
+            lines.append(f"📍 Локация: {esc(self.location)}")
         if self.salary:
-            lines.append(f"💰 Зарплата: {self.salary}")
+            lines.append(f"💰 Зарплата: {esc(self.salary)}")
         if self.experience:
-            lines.append(f"💼 Опыт: {self.experience}")
+            lines.append(f"💼 Опыт: {esc(self.experience)}")
         if self.applications_count:
-            lines.append(f"📊 Откликов: {self.applications_count}")
+            lines.append(f"📊 Откликов: {esc(self.applications_count)}")
         if self.published_at:
-            lines.append(f"🕒 Опубликовано: {self.published_at}")
-        lines.append(f"🔗 <a href='{self.url}'>Открыть вакансию</a>")
+            lines.append(f"🕒 Опубликовано: {esc(self.published_at)}")
+        lines.append(f"🔗 <a href=\"{esc(self.url)}\">Открыть вакансию</a>")
         return "\n".join(lines)
 
 

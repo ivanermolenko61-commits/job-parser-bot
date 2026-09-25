@@ -1,9 +1,18 @@
-"""Работа с SQLite: хранение уже отправленных вакансий."""
+"""Работа с SQLite: хранение уже отправленных вакансий.
+
+Две таблицы:
+  • vacancies     — вакансии для /list, чистятся через CLEANUP_DAYS.
+  • sent_history  — только «что уже отправляли» (source + vacancy_id),
+                    хранится SENT_HISTORY_DAYS. Нужна, чтобы вакансия без
+                    даты публикации (DreamJob) не пришла повторно после того,
+                    как её удалили из vacancies, а на сайте она всё ещё висит.
+"""
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
-from config import DB_PATH
+from config import DB_PATH, SENT_HISTORY_DAYS
 
 
 MONTHS_RU = {
@@ -13,11 +22,29 @@ MONTHS_RU = {
 }
 
 
-def _connect() -> sqlite3.Connection:
-    """Создаёт соединение с базой."""
+@contextmanager
+def _connect():
+    """Открывает соединение с базой и гарантированно закрывает его.
+
+    Обычный `with sqlite3.connect(...)` только коммитит транзакцию,
+    но НЕ закрывает соединение — поэтому оборачиваем сами.
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    # Встроенный LOWER() в SQLite понижает только латиницу («Т1» ≠ «т1»),
+    # поэтому для сравнения названий используем Python-овский lower().
+    conn.create_function(
+        "PY_LOWER", 1, lambda s: s.lower() if isinstance(s, str) else s,
+        deterministic=True,
+    )
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def normalize_date(text: str) -> str:
@@ -102,14 +129,28 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sent_history (
+                source TEXT NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source, vacancy_id)
+            )
+        """)
+        # Миграция: всё, что уже есть в vacancies, считаем отправленным
+        conn.execute("""
+            INSERT OR IGNORE INTO sent_history (source, vacancy_id, sent_at)
+            SELECT source, vacancy_id, found_at FROM vacancies
+        """)
+
         conn.commit()
 
 
 def is_sent(source: str, vacancy_id: str) -> bool:
-    """Проверяет, отправляли ли уже эту вакансию."""
+    """Проверяет, отправляли ли уже эту вакансию (за SENT_HISTORY_DAYS)."""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM vacancies WHERE source = ? AND vacancy_id = ?",
+            "SELECT 1 FROM sent_history WHERE source = ? AND vacancy_id = ?",
             (source, vacancy_id),
         ).fetchone()
         return row is not None
@@ -129,8 +170,8 @@ def is_duplicate(title: str, company: str) -> bool:
         row = conn.execute(
             """
             SELECT 1 FROM vacancies
-            WHERE LOWER(TRIM(title)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(company)) = LOWER(TRIM(?))
+            WHERE PY_LOWER(TRIM(title)) = PY_LOWER(TRIM(?))
+              AND PY_LOWER(TRIM(company)) = PY_LOWER(TRIM(?))
             LIMIT 1
             """,
             (title, company),
@@ -157,6 +198,10 @@ def mark_sent(
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (source, vacancy_id, title, company, url, normalized_date),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO sent_history (source, vacancy_id) VALUES (?, ?)",
+            (source, vacancy_id),
         )
         conn.commit()
 
@@ -226,16 +271,28 @@ def cleanup_old(days: int = 5) -> int:
             """,
             (f'-{days} days',),
         )
+        deleted = cursor.rowcount
+        # История отправок живёт дольше — защита от повторной отправки
+        conn.execute(
+            "DELETE FROM sent_history WHERE sent_at < datetime('now', ?)",
+            (f'-{SENT_HISTORY_DAYS} days',),
+        )
         conn.commit()
-        return cursor.rowcount
+        return deleted
 
 
 def reset_db() -> int:
-    """Полностью очищает таблицу vacancies. Возвращает число удалённых."""
+    """Полностью очищает базу (вакансии и историю отправок).
+
+    История тоже чистится, иначе «загрузить заново» ничего бы не прислал.
+    Возвращает число удалённых вакансий.
+    """
     with _connect() as conn:
         cursor = conn.execute("DELETE FROM vacancies")
+        deleted = cursor.rowcount
+        conn.execute("DELETE FROM sent_history")
         conn.commit()
-        return cursor.rowcount
+        return deleted
 
 
 if __name__ == "__main__":

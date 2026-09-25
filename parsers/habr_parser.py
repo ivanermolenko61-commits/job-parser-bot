@@ -100,8 +100,20 @@ class HabrParser(BaseParser):
 
         return True
 
-    def _clean_company(self, company: str) -> str:
-        return self.COMPANY_RATING_PATTERN.sub("", company).strip()
+    def _extract_company(self, company_tag) -> str:
+        """Название компании без рейтинга.
+
+        Рейтинг лежит в отдельном блоке .vacancy-card__company-rating —
+        удаляем его из разметки. Раньше цифры отрезались регуляркой с конца
+        строки, и заодно портились названия вроде «X5» → «X», «Т1» → «Т».
+        Регулярка осталась как запасной вариант, если разметку поменяют.
+        """
+        rating = company_tag.select(".vacancy-card__company-rating")
+        if rating:
+            for r in rating:
+                r.decompose()
+            return company_tag.get_text(strip=True)
+        return self.COMPANY_RATING_PATTERN.sub("", company_tag.get_text(strip=True)).strip()
 
     def _clean_salary(self, salary: str) -> str:
         if "Похожие специалисты" in salary:
@@ -146,11 +158,13 @@ class HabrParser(BaseParser):
         location = ", ".join(unique_cities)
         return location, level, is_remote
 
-    def _parse_html(self, html: str) -> list[Vacancy]:
+    def _parse_html(self, html: str) -> tuple[list[Vacancy], int]:
+        """Возвращает (вакансии, прошедшие фильтры; сколько карточек было на странице)."""
         soup = BeautifulSoup(html, "html.parser")
         vacancies = []
+        cards = soup.select(".vacancy-card")
 
-        for card in soup.select(".vacancy-card"):
+        for card in cards:
             try:
                 title_link = card.select_one(".vacancy-card__title-link")
                 if not title_link:
@@ -171,7 +185,7 @@ class HabrParser(BaseParser):
                 url = "https://career.habr.com" + title_link.get("href", "")
 
                 company_tag = card.select_one(".vacancy-card__company")
-                company = self._clean_company(company_tag.get_text(strip=True)) if company_tag else "Не указана"
+                company = self._extract_company(company_tag) if company_tag else "Не указана"
 
                 parts = []
                 if level:
@@ -199,7 +213,7 @@ class HabrParser(BaseParser):
                 logging.debug(f"[HABR] Ошибка парсинга карточки: {e}")
                 continue
 
-        return vacancies
+        return vacancies, len(cards)
 
     def fetch(self) -> list[Vacancy]:
         seen_ids = set()
@@ -212,8 +226,11 @@ class HabrParser(BaseParser):
                 if not html:
                     break
 
-                vacancies = self._parse_html(html)
-                if not vacancies:
+                vacancies, cards_count = self._parse_html(html)
+                # Останавливаемся, только если страница пустая. Если карточки
+                # были, но ни одна не прошла фильтры — следующая страница
+                # всё равно может содержать подходящие.
+                if cards_count == 0:
                     break
 
                 for v in vacancies:

@@ -1,5 +1,6 @@
 """Telegram-бот: мониторинг вакансий Junior/стажёр по разработке."""
 import asyncio
+import html
 import logging
 import os
 from datetime import datetime
@@ -242,10 +243,11 @@ async def _send_list(message: Message, limit: int):
         else:
             time_str = ""
 
+        # Экранируем: «&» или «<» в названии иначе ломают HTML-разметку
         block = (
-            f"• <b>{v['title']}</b>\n"
-            f"  {v['company']}\n"
-            f"  <a href='{v['url']}'>Открыть вакансию</a>\n"
+            f"• <b>{html.escape(v['title'] or '')}</b>\n"
+            f"  {html.escape(v['company'] or '')}\n"
+            f"  <a href=\"{html.escape(v['url'] or '')}\">Открыть вакансию</a>\n"
         )
         if time_str:
             block = f"{time_str}\n{block}"

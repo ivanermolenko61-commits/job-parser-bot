@@ -218,7 +218,8 @@ class DreamJobParser(BaseParser):
             logging.debug(f"[DREAMJOB] Ошибка парсинга: {e}")
             return None
 
-    def _parse_html(self, html: str) -> list[Vacancy]:
+    def _parse_html(self, html: str) -> tuple[list[Vacancy], int]:
+        """Возвращает (вакансии, прошедшие фильтры; сколько карточек было на странице)."""
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select(".vacancy-new__item")
         logging.info(f"[DREAMJOB] Найдено карточек: {len(cards)}")
@@ -230,7 +231,7 @@ class DreamJobParser(BaseParser):
                 vacancies.append(v)
 
         logging.info(f"[DREAMJOB] Прошло фильтры: {len(vacancies)}")
-        return vacancies
+        return vacancies, len(cards)
 
     def fetch(self) -> list[Vacancy]:
         seen_ids = set()
@@ -243,8 +244,11 @@ class DreamJobParser(BaseParser):
                 if not html:
                     break
 
-                vacancies = self._parse_html(html)
-                if not vacancies:
+                vacancies, cards_count = self._parse_html(html)
+                # Останавливаемся, только если страница пустая. Если карточки
+                # были, но ни одна не прошла фильтры — следующая страница
+                # всё равно может содержать подходящие.
+                if cards_count == 0:
                     break
 
                 for v in vacancies:
