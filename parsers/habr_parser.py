@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from config import MAX_PAGES_PER_QUERY, QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
+from parsers.filters import LEVEL_PATTERN, is_allowed_level, is_relevant_title
 
 
 class HabrParser(BaseParser):
@@ -20,49 +21,6 @@ class HabrParser(BaseParser):
     source_name = "habr"
     BASE_URL = "https://career.habr.com/vacancies"
 
-    ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
-
-    SENIORITY_WORDS = [
-        "senior", "lead ", "principal", "middle", "head of",
-        "team lead", "tech lead", "director", "руководитель",
-        "ведущий", "ведущая", "ведущее",
-    ]
-
-    EXCLUDE_WORDS = [
-        "менеджер", "manager", "product", "продукт",
-        "проектами", "проектов", "project manager",
-        "аналитик", "analyst",
-        "дизайнер", "designer",
-        "исследователь", "researcher", "research", "ресерчер",
-        "qa", "тестировщик", "тестирован", "testing", "test engineer",
-        "devops", "sre", "administrator", "администратор",
-        "техподдержка", "поддержки", "сопровождени", "support",
-        "маркетолог", "marketing", "hr ", "рекрутер", "recruiter",
-        "sales", "продаж",
-        "бухгалтер", "юрист", "юрисконсульт", "логист",
-        "документами", "документооборот", "делопроизвод",
-        "data scientist", "дата-сайентист", "data science",
-        "тренер", "coach",
-        "cvm", "cmo",
-        # Безопасность — не разработка
-        "безопасност", "security", "appsec", "infosec",
-    ]
-
-    # IT-слова: хотя бы одно должно быть в заголовке
-    INCLUDE_IT_WORDS = [
-        "python", "java", " go ", "golang", "javascript", " typescript",
-        "c++", "c#", "php", "ruby", "swift", "kotlin", "scala", "rust",
-        "developer", "разработчик", "программист",
-        "backend", "бэкенд", "frontend", "фронтенд", "fullstack", "фулстек",
-        "ml engineer", "ml-инженер", "data engineer", "data-инженер",
-        "dba", "1с", "1c", "разработк",
-        "embedded", "bios", "bsp",
-    ]
-
-    LEVEL_PATTERN = re.compile(
-        r"(Junior|Middle|Senior|Lead|Intern|Стажёр|Стажер|Trainee)",
-        re.IGNORECASE,
-    )
     COMPANY_RATING_PATTERN = re.compile(r"[\d.,]+\s*$")
     CITY_PATTERN = re.compile(r"[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?")
 
@@ -89,16 +47,7 @@ class HabrParser(BaseParser):
             return None
 
     def _is_relevant_category(self, title: str) -> bool:
-        t = title.lower()
-
-        if any(w in t for w in self.EXCLUDE_WORDS):
-            return False
-        if any(w in t for w in self.SENIORITY_WORDS):
-            return False
-        if not any(w in t for w in self.INCLUDE_IT_WORDS):
-            return False
-
-        return True
+        return is_relevant_title(title)
 
     def _extract_company(self, company_tag) -> str:
         """Название компании без рейтинга.
@@ -139,7 +88,7 @@ class HabrParser(BaseParser):
         text = meta_tag.get_text(" ", strip=True)
 
         level = ""
-        m = self.LEVEL_PATTERN.search(text)
+        m = LEVEL_PATTERN.search(text)
         if m:
             level = m.group(1)
             text = text.replace(m.group(0), " ", 1)
@@ -175,7 +124,7 @@ class HabrParser(BaseParser):
                     continue
 
                 location, level, is_remote = self._parse_meta(card)
-                if level.lower() not in self.ALLOWED_LEVELS:
+                if not is_allowed_level(level):
                     continue
 
                 salary_tag = card.select_one(".vacancy-card__salary")

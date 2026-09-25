@@ -10,7 +10,6 @@
   • Короткий список запросов (PLAYWRIGHT_QUERIES).
 """
 import logging
-import re
 import time
 from urllib.parse import quote
 
@@ -19,6 +18,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 from config import PLAYWRIGHT_QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
+from parsers.filters import is_allowed_level, is_relevant_title
 
 
 LABEL_TRANSLATIONS = {
@@ -35,48 +35,6 @@ class GeekJobParser(BaseParser):
 
     source_name = "geekjob"
     BASE_URL = "https://geekjob.ru/vacancies"
-
-    SENIORITY_WORDS = [
-        "senior", "lead ", "principal", "middle", "head of",
-        "team lead", "tech lead", "director", "руководитель",
-        "ведущий", "ведущая", "ведущее",
-    ]
-
-    EXCLUDE_WORDS = [
-        "менеджер", "manager", "product", "продукт",
-        "проектами", "проектов", "project manager",
-        "аналитик", "analyst",
-        "дизайнер", "designer",
-        "исследователь", "researcher", "research", "ресерчер",
-        "qa", "тестировщик", "тестирован", "testing", "test engineer",
-        "devops", "sre", "administrator", "администратор",
-        "техподдержка", "поддержки", "сопровождени", "support",
-        "маркетолог", "marketing", "hr ", "рекрутер", "recruiter",
-        "sales", "продаж",
-        "бухгалтер", "юрист", "юрисконсульт", "логист",
-        "документами", "документооборот", "делопроизвод",
-        "data scientist", "дата-сайентист", "data science",
-        "тренер", "coach",
-        "cvm", "cmo",
-        "безопасност", "security", "appsec", "infosec",
-    ]
-
-    INCLUDE_IT_WORDS = [
-        "python", "java", " go ", "golang", "javascript", " typescript",
-        "c++", "c#", "php", "ruby", "swift", "kotlin", "scala", "rust",
-        "developer", "разработчик", "программист",
-        "backend", "бэкенд", "frontend", "фронтенд", "fullstack", "фулстек",
-        "ml engineer", "ml-инженер", "data engineer", "data-инженер",
-        "dba", "1с", "1c", "разработк",
-        "embedded", "bios", "bsp",
-        "ios", "android",
-    ]
-
-    LEVEL_PATTERN = re.compile(
-        r"(Junior|Middle|Senior|Lead|Intern|Стажёр|Стажер|Trainee)",
-        re.IGNORECASE,
-    )
-    ALLOWED_LEVELS = {"", "junior", "intern", "стажёр", "стажер", "trainee"}
 
     # Аргументы Chromium: важно для Docker с 1 ГБ RAM.
     CHROMIUM_ARGS = [
@@ -108,14 +66,7 @@ class GeekJobParser(BaseParser):
         self.headless = headless
 
     def _is_relevant(self, title: str) -> bool:
-        t = title.lower()
-        if any(w in t for w in self.EXCLUDE_WORDS):
-            return False
-        if any(w in t for w in self.SENIORITY_WORDS):
-            return False
-        if not any(w in t for w in self.INCLUDE_IT_WORDS):
-            return False
-        return True
+        return is_relevant_title(title)
 
     def _clean(self, s: str) -> str:
         if not s:
@@ -167,9 +118,7 @@ class GeekJobParser(BaseParser):
             if not self._is_relevant(title):
                 return None
 
-            m = self.LEVEL_PATTERN.search(title)
-            level = m.group(1) if m else ""
-            if level.lower() not in self.ALLOWED_LEVELS:
+            if not is_allowed_level(title):
                 return None
 
             company_tag = card.select_one(".company-name")

@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from config import QUERIES, REQUEST_DELAY
 from parsers.base import BaseParser, Vacancy
+from parsers.filters import is_relevant_title, is_russian_location
 
 
 class DreamJobParser(BaseParser):
@@ -20,59 +21,6 @@ class DreamJobParser(BaseParser):
 
     source_name = "dreamjob"
     BASE_URL = "https://dreamjob.ru/vakansii"
-
-    SENIORITY_WORDS = [
-        "senior", "lead ", "principal", "middle", "head of",
-        "team lead", "tech lead", "director", "руководитель",
-    ]
-
-    EXCLUDE_WORDS = [
-        "менеджер", "manager", "product", "продукт",
-        "проектами", "проектов",
-        "аналитик", "analyst",
-        "дизайнер", "designer",
-        "исследователь", "researcher", "research", "ресерчер",
-        "qa", "тестировщик", "тестирован", "testing",
-        "quality assurance",
-        "devops", "sre", "administrator", "администратор",
-        "техподдержка", "поддержки", "сопровождени", "support",
-        "маркетолог", "marketing", "hr ", "рекрутер",
-        "sales", "продаж",
-        "бухгалтер", "accountant", "юрист", "юрисконсульт", "логист",
-        "документами", "документооборот", "делопроизвод",
-        "тренер", "coach",
-        "воспитатель", "учитель", "педагог", "репетитор",
-        "банк", "банка", "банке", "банковск",
-        "риелтор", "риэлтор", "недвижимост",
-        "агент по", "агентств",
-        "юридических лиц", "юридическим",
-        "кредитных", "кредитован", "ипотек",
-        "секретарь", "офис-менеджер",
-        "водитель", "курьер", "продавец", "кассир",
-        "оператор call", "оператор колл",
-        "сварщик", "электрик", "монтажник",
-        "медицинск", "врач", "медсестр",
-        "чпу", "cnc", "станк", "станков",
-        "инженер-конструктор", "инженер-технолог",
-    ]
-
-    INCLUDE_IT_WORDS = [
-        "python", "java", " go ", "golang", "javascript", " typescript",
-        "c++", "c#", "php", "ruby", "swift", "kotlin", "scala", "rust",
-        "developer", "разработчик", "программист",
-        "backend", "бэкенд", "frontend", "фронтенд", "fullstack", "фулстек",
-        "ml engineer", "ml-инженер", "data engineer", "data-инженер",
-        "dba", "1с", "1c", "разработк",
-    ]
-
-    GEO_BLACKLIST = [
-        "ташкент", "алматы", "астана", "нур-султан",
-        "тбилиси", "баку", "ереван", "бишкек", "минск",
-        "душанбе", "ашхабад", "кишинёв", "кишинев", "киев",
-        "казахстан", "узбекистан", "грузия", "азербайджан",
-        "армения", "киргизия", "кыргызстан", "беларусь",
-        "белоруссия", "таджикистан", "туркменистан", "молдова",
-    ]
 
     FOREIGN_CURRENCIES = [
         "so'm", "сум", "₸", "тенге", "₼", "манат", "₾", "лари",
@@ -110,22 +58,10 @@ class DreamJobParser(BaseParser):
             return None
 
     def _is_relevant_category(self, title: str) -> bool:
-        t = title.lower()
-
-        if any(w in t for w in self.EXCLUDE_WORDS):
-            return False
-        if any(w in t for w in self.SENIORITY_WORDS):
-            return False
-        if not any(w in t for w in self.INCLUDE_IT_WORDS):
-            return False
-
-        return True
+        return is_relevant_title(title)
 
     def _is_russian_location(self, location: str) -> bool:
-        if not location:
-            return True
-        loc = location.lower()
-        return not any(city in loc for city in self.GEO_BLACKLIST)
+        return is_russian_location(location)
 
     def _is_russian_salary(self, salary: str) -> bool:
         if not salary or salary == "не указана":
