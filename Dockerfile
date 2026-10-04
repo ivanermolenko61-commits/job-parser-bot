@@ -16,6 +16,7 @@ RUN playwright install --with-deps chromium
 COPY bot.py .
 COPY config.py .
 COPY database.py .
+COPY health.py .
 COPY parser_manager.py .
 COPY parsers/ ./parsers/
 

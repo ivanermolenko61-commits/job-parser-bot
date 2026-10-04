@@ -177,7 +177,11 @@ async def check_vacancies() -> bool:
         logging.info("[BOT] Проверка новых вакансий...")
 
         try:
-            new_vacancies = await asyncio.to_thread(fetch_new_vacancies)
+            # Запасной предохранитель: даже если что-то зависло мимо таймаутов
+            # парсеров, блокировка проверки освободится
+            new_vacancies = await asyncio.wait_for(
+                asyncio.to_thread(fetch_new_vacancies), timeout=2400  # > суммы таймаутов парсеров (~1700 с); поток при этом не прерывается
+            )
         except Exception:
             logging.exception("[BOT] Ошибка при получении вакансий")
             return True

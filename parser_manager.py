@@ -1,6 +1,9 @@
 """Менеджер парсеров: запускает все источники, возвращает только новые вакансии."""
 import gc
 import logging
+import os
+import signal
+import threading
 
 from config import MAX_VACANCY_AGE_DAYS
 from database import is_duplicate, is_fresh, is_sent, mark_sent
@@ -10,6 +13,66 @@ from parsers.dreamjob_parser import DreamJobParser
 from parsers.geekjob_parser import GeekJobParser
 from parsers.habr_parser import HabrParser
 from parsers.hh_parser import HHParser
+
+
+# Сколько секунд парсеру разрешено работать целиком. Без этого один зависший
+# сайт/Chromium навсегда занимает _check_lock, и бот молча перестаёт слать вакансии.
+PARSER_TIMEOUT_SEC = {"hh": 600, "geekjob": 600}
+DEFAULT_PARSER_TIMEOUT_SEC = 240
+
+
+def _kill_chromium() -> None:
+    """Убивает зависший Chromium, чтобы поток Playwright мог завершиться.
+
+    В образе python:3.11-slim нет pkill, поэтому обходим /proc сами (Linux).
+    Парсеры идут по очереди, так что чужого Chromium в контейнере нет.
+    """
+    me = os.getpid()
+    try:
+        pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return  # не Linux (локально на Windows) — нечего убивать
+    killed = 0
+    for pid in pids:
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+            if b"chrom" in cmd:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+        except (OSError, ProcessLookupError):
+            continue
+    logging.warning(f"[MANAGER] Завершено процессов Chromium: {killed}")
+
+
+def _fetch_with_timeout(parser) -> list[Vacancy]:
+    """parser.fetch() с общим таймаутом. При превышении бросает TimeoutError."""
+    timeout = PARSER_TIMEOUT_SEC.get(parser.source_name, DEFAULT_PARSER_TIMEOUT_SEC)
+    box: dict = {}
+
+    def run():
+        try:
+            box["result"] = parser.fetch()
+        except Exception as e:  # передаём ошибку в основной поток
+            box["error"] = e
+
+    # daemon=True: зависший поток не мешает процессу завершиться
+    t = threading.Thread(target=run, name=f"parser-{parser.source_name}", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        _kill_chromium()
+        t.join(5)
+        if t.is_alive():
+            logging.error(
+                f"[MANAGER] Поток {parser.source_name} не завершился даже после kill (утечка)"
+            )
+        raise TimeoutError(f"парсер завис, прервано через {timeout} с")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
 
 
 def get_all_parsers() -> list:
@@ -43,7 +106,7 @@ def fetch_new_vacancies() -> list[Vacancy]:
         logging.info(f"[MANAGER] Запуск парсера: {parser.source_name}")
         error = None
         try:
-            vacancies = parser.fetch()
+            vacancies = _fetch_with_timeout(parser)
         except Exception as e:
             logging.exception(f"[MANAGER] Ошибка в парсере {parser.source_name}: {e}")
             vacancies = []
