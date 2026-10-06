@@ -17,6 +17,9 @@ from config import DB_PATH, DUPLICATE_WINDOW_DAYS, SENT_HISTORY_DAYS
 from parsers.filters import dedup_key
 
 
+# Сколько дней хранить заказы фриланса
+FREELANCE_KEEP_DAYS = 14
+
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
@@ -157,6 +160,7 @@ def init_db() -> None:
              for r in rows],
         )
 
+        _init_freelance(conn)
         conn.commit()
 
 
@@ -297,6 +301,10 @@ def cleanup_old(days: int = 5) -> int:
             "DELETE FROM sent_history WHERE sent_at < datetime('now', ?)",
             (f'-{SENT_HISTORY_DAYS} days',),
         )
+        conn.execute(
+            "DELETE FROM freelance_orders WHERE seen_at < datetime('now', ?)",
+            (f'-{FREELANCE_KEEP_DAYS} days',),
+        )
         conn.commit()
         return deleted
 
@@ -313,6 +321,149 @@ def reset_db() -> int:
         conn.execute("DELETE FROM sent_history")
         conn.commit()
         return deleted
+
+
+# ---------- Фриланс ----------
+
+def _init_freelance(conn) -> None:
+    """Таблицы раздела «Фриланс». Вызывается из init_db()."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_orders (
+            order_id INTEGER PRIMARY KEY,
+            site TEXT,
+            title TEXT,
+            url TEXT,
+            price_text TEXT,
+            fit INTEGER,
+            ai_json TEXT,
+            published_at TEXT,
+            dedup_key TEXT,
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+
+def kv_get(key: str, default: str | None = None) -> str | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def kv_set(key: str, value) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+
+def freelance_seen_ids(order_ids: list[int]) -> set[int]:
+    """Какие из order_id уже есть в БД (отправлены или отброшены)."""
+    if not order_ids:
+        return set()
+    found: set[int] = set()
+    with _connect() as conn:
+        for i in range(0, len(order_ids), 500):
+            chunk = order_ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT order_id FROM freelance_orders WHERE order_id IN ({marks})",
+                chunk,
+            ).fetchall()
+            found.update(r["order_id"] for r in rows)
+    return found
+
+
+def freelance_dup_keys(keys: list[str], days: int) -> set[str]:
+    """Какие из dedup_key уже встречались за последние N дней.
+
+    Учитываются только отправленные и оценённые заказы: запись-дубль
+    (без sent_at и без fit) не должна «съедать» оригинал.
+    """
+    keys = [k for k in keys if k]
+    if not keys:
+        return set()
+    found: set[str] = set()
+    with _connect() as conn:
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT DISTINCT dedup_key FROM freelance_orders "
+                f"WHERE dedup_key IN ({marks}) AND seen_at >= datetime('now', ?) "
+                f"AND (sent_at IS NOT NULL OR fit IS NOT NULL)",
+                [*chunk, f"-{days} days"],
+            ).fetchall()
+            found.update(r["dedup_key"] for r in rows)
+    return found
+
+
+def freelance_save(
+    order_id: int,
+    site: str,
+    title: str,
+    url: str,
+    price_text: str,
+    published_at: str,
+    dedup: str,
+    fit: int | None,
+    ai_json: str,
+    sent: bool,
+) -> None:
+    """Запоминает заказ. sent=False — просмотрен, но не отправлен (низкий fit, лимит)."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO freelance_orders
+                (order_id, site, title, url, price_text, fit, ai_json,
+                 published_at, dedup_key, sent_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
+            """,
+            (order_id, site, title, url, price_text, fit, ai_json,
+             published_at, dedup, 1 if sent else 0),
+        )
+
+
+def freelance_recent(limit: int = 10) -> list[dict]:
+    """Последние отправленные заказы."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT order_id, site, title, url, price_text, fit, published_at
+            FROM freelance_orders
+            WHERE sent_at IS NOT NULL
+            ORDER BY order_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_stats() -> dict:
+    """Счётчики за последние сутки: прошли префильтр / отправлены."""
+    with _connect() as conn:
+        seen = conn.execute(
+            "SELECT COUNT(*) FROM freelance_orders "
+            "WHERE seen_at >= datetime('now', '-1 day')"
+        ).fetchone()[0]
+        sent = conn.execute(
+            "SELECT COUNT(*) FROM freelance_orders "
+            "WHERE sent_at >= datetime('now', '-1 day')"
+        ).fetchone()[0]
+        return {"seen_24h": seen, "sent_24h": sent}
 
 
 if __name__ == "__main__":

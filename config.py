@@ -68,3 +68,13 @@ CHECK_INTERVAL_MINUTES = 15
 
 # --- База данных ---
 DB_PATH = "vacancies.db"
+# --- Фриланс (alot.pro) ---
+# Якорь для поиска верхней границы id (заведомо старше текущих заказов)
+ALOT_SEED_ID = 17328000
+FREELANCE_INTERVAL_MINUTES = 10
+# Минимальная оценка YandexGPT (0-10), с которой заказ отправляется
+FREELANCE_MIN_FIT = 6
+# Заказы старше этого возраста не отправляются
+FREELANCE_MAX_AGE_HOURS = 24
+# Максимум сообщений за один цикл, остальное — сводкой «ещё N»
+FREELANCE_MAX_PER_CYCLE = 15

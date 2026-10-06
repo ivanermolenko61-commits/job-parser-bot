@@ -11,6 +11,7 @@
 
 Состояние живёт в памяти процесса: после перезапуска бота счёт начинается заново.
 """
+import html
 import logging
 
 FAIL_THRESHOLD = 3
@@ -36,7 +37,7 @@ class HealthMonitor:
             if self.streak[source] == self.threshold:
                 self._pending.append(
                     f"⚠️ <b>Парсер {source} не работает</b>\n"
-                    f"{self.threshold} проверки подряд: {reason}.\n\n"
+                    f"{self.threshold} проверки подряд: {html.escape(reason)}.\n\n"
                     f"Скорее всего, сайт поменял вёрстку или блокирует запросы. "
                     f"Вакансии с {source} сейчас не приходят."
                 )

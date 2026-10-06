@@ -19,5 +19,6 @@ COPY database.py .
 COPY health.py .
 COPY parser_manager.py .
 COPY parsers/ ./parsers/
+COPY freelance/ ./freelance/
 
 CMD ["python", "bot.py"]

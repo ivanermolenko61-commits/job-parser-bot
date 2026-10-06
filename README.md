@@ -1,90 +1,249 @@
-cat > README.md << 'EOF'
-# 💼 Job Parser Bot
+# Job Parser Bot
 
-Telegram-бот для мониторинга **Junior-вакансий и стажировок** в IT. Парсит Хабр Карьеру каждые 15 минут и присылает ссылки на новые вакансии для быстрого отклика.
+Telegram-бот для мониторинга вакансий IT Junior/стажёров и фриланс-заказов.
 
-## 🎯 Возможности
+Две основные функции:
 
-- 🔍 **Автоматический поиск** Junior/стажировок по разработке
-- 🌍 **Удалёнка в приоритете** (сортировка — удалённые сверху)
-- ⏱ **Проверка каждые 15 минут** — новая вакансия приходит быстрее, чем набирается 100+ откликов
-- 📬 **Дедупликация** — одна вакансия отправляется один раз
-- 🛡 **Только владелец** — посторонние не могут пользоваться ботом
+- **📋 Вакансии** — автоматический поиск Junior-вакансий по разработке из нескольких источников (Habr, DreamJob, hh.ru, GeekJob), дедупликация, периодическая проверка каждые 15 минут.
+- **💼 Фриланс** — скан фриланс-заказов с alot.pro (агрегатор фриланс-бирж), префильтр по категориям и ключевым словам, оценка релевантности через YandexGPT (fit 0–10), рекомендуемая цена и примерное время реализации.
 
-## 📋 Что фильтруется
+## Источники вакансий
 
-**Включается:**
-- Junior, Intern, Trainee, «стажёр», «ученик»
-- Разработка любого направления: backend, frontend, data, ML, mobile, embedded
+Бот парсит следующие площадки:
 
-**Исключается:**
-- Middle, Senior, Lead, руководители
-- Менеджеры, аналитики, дизайнеры, QA
-- Поддержка, сопровождение, DevOps
-- HR, маркетинг, продажи, юристы
+| Источник | Парсер | Метод |
+|---|---|---|
+| career.habr.com | `habr_parser.py` | requests + BeautifulSoup |
+| dreamjob.ru | `dreamjob_parser.py` | requests + BeautifulSoup |
+| hh.ru | `hh_parser.py` | Playwright + Chromium |
+| geekjob.ru | `geekjob_parser.py` | Playwright + Chromium |
 
-## 🎛 Команды
+Поиск ведётся по ключевым словам из `config.py` (Python, junior, стажёр, разработчик и др.). Вакансии старше 5 дней не отправляются. Удалённые вакансии показываются в приоритете.
+
+## Фриланс-заказы
+
+Заказы приходят с **alot.pro** (агрегатор фриланс-бирж) каждые 10 минут:
+
+- **Префильтр** (перед AI): категория разработки, исключение вакансионных сайтов и явно не нашего (1C, Bitrix, дизайн, переводы и т.д.)
+- **AI-оценка** (YandexGPT):
+  - `fit` (0–10) — насколько подходит ваш профиль (от skills, опыта в prompt)
+  - `сложность` (0–10) — техническая сложность реализации
+  - `часы` — примерное время на реализацию
+  - `рекомендуемая цена` — калькуляция на основе fit + сложности + часов
+- **Фильтр по AI**: отправляются только заказы с `fit ≥ 6` (настраивается в `config.py`)
+- **Свежесть**: заказы старше 24 часов не берутся
+- **Дедупликация**: одинаковые заказы за 3 дня отправляются один раз
+
+Без `YANDEX_API_KEY` заказы приходят с пометкой «без AI-оценки», но префильтр работает.
+
+## Команды
 
 | Команда | Что делает |
 |---|---|
-| `/start` | Приветствие + первая проверка |
-| `/check` | Проверить вакансии прямо сейчас |
-| `/status` | Статистика: сколько в базе, по источникам |
-| `/stop` | Приостановить уведомления |
+| `/start` | Приветствие, первая проверка вакансий |
+| `/check` | Проверить новые вакансии сейчас |
+| `/status` | Статистика: сколько в БД, по источникам, последняя проверка |
+| `/list` | Список всех вакансий в БД (с пагинацией) |
+| `/stop` | Приостановить уведомления о вакансиях |
+| `/reset` | Очистить БД (все вакансии удаляются) |
 
-## 🏗 Архитектура
+## Reply-кнопки
 
-    job-parser-bot/
-    ├── bot.py                  # aiogram: команды, рассылка
-    ├── parser_manager.py       # Координатор парсеров
-    ├── database.py             # SQLite: дедупликация
-    ├── config.py               # Настройки
-    ├── parsers/
-    │   ├── base.py             # Базовый класс парсера
-    │   └── habr_parser.py      # Парсер Хабр Карьеры
-    ├── requirements.txt
-    ├── Dockerfile
-    └── README.md
+Внизу экрана доступны быстрые кнопки:
 
-## 🚀 Установка
+- **📋 Список** — список вакансий
+- **📊 Статус** — статистика
+- **🔍 Проверить сейчас** — мгновенная проверка
+- **💼 Фриланс** — меню фриланс-заказов
+- **⏸ Пауза / ▶️ Возобновить** — включение/выключение уведомлений
 
-    git clone https://github.com/ivanermolenko61-commits/job-parser-bot.git
-    cd job-parser-bot
-    python -m venv .venv
-    source .venv/Scripts/activate    # Windows Git Bash
-    pip install -r requirements.txt
+### Меню фриланса
 
-Создайте `.env`:
+При нажатии на **💼 Фриланс** появляется inline-клавиатура:
 
-    BOT_TOKEN=ваш_токен_от_BotFather
-    MY_CHAT_ID=ваш_id_от_userinfobot
+- **📬 Свежие** — показать последние заказы с AI-оценкой
+- **⚙️ Проверить сейчас** — запустить цикл сканирования
+- **⏸️ / ▶️ Toggle** — включить/выключить отправку заказов (отдельно от вакансий)
+- **📊 Статистика** — сводка по заказам
 
-Запуск:
+## Настройка
 
-    python bot.py
+### .env
 
-## 🐳 Деплой
+Создайте файл `.env` на основе `.env.example`:
 
-Проект разворачивается на [BotHost](https://bothost.ru/) в Docker-контейнере.
+```ini
+BOT_TOKEN=your_token_from_botfather
+MY_CHAT_ID=your_chat_id_from_userinfobot
+# Опционально для AI-оценки фриланс-заказов:
+YANDEX_API_KEY=your_yandex_api_key
+YANDEX_FOLDER_ID=your_yandex_folder_id
+```
 
-## 🛠 Технологии
+- `BOT_TOKEN` — токен от [BotFather](https://t.me/botfather)
+- `MY_CHAT_ID` — ваш ID в Telegram (используйте [@userinfobot](https://t.me/userinfobot))
+- `YANDEX_API_KEY`, `YANDEX_FOLDER_ID` — учётные данные YandexGPT API; без них заказы приходят без оценки
 
-- **Python 3.11**
-- **aiogram 3** — Telegram Bot API
-- **APScheduler** — планировщик
-- **requests** + **BeautifulSoup** — парсинг HTML
-- **SQLite** — хранение отправленных вакансий
-- **Docker** — контейнеризация
+### config.py
 
-## 📝 Что можно улучшить
+Основные параметры:
 
-- [ ] Добавить Dream Job, GeekJob как источники
-- [ ] Отсеивать вакансии с опытом 3+ лет
-- [ ] Настраиваемые фильтры через команды бота
-- [ ] Уведомления о вакансиях с высокой зарплатой
-- [ ] Экспорт вакансий в CSV
+| Параметр | Значение | Назначение |
+|---|---|---|
+| `QUERIES` | список слов | Поисковые запросы для лёгких парсеров (Habr, DreamJob) |
+| `PLAYWRIGHT_QUERIES` | список слов | Запросы для Playwright-парсеров (hh.ru, GeekJob) |
+| `MAX_PAGES_PER_QUERY` | 1 | Страниц на каждый запрос (1 стр = ~25 карточек) |
+| `CHECK_INTERVAL_MINUTES` | 15 | Интервал проверки вакансий |
+| `MAX_VACANCY_AGE_DAYS` | 5 | Вакансии старше не отправляются |
+| `FREELANCE_INTERVAL_MINUTES` | 10 | Интервал проверки фриланс-заказов |
+| `FREELANCE_MIN_FIT` | 6 | Минимальная оценка YandexGPT (0–10) для отправки |
+| `FREELANCE_MAX_AGE_HOURS` | 24 | Заказы старше не берутся |
+| `FREELANCE_MAX_PER_CYCLE` | 15 | Макс. отдельных сообщений за цикл; остальное — сводкой |
+| `ALOT_SEED_ID` | 17328000 | Якорь поиска верхней границы id |
 
-## 📄 Лицензия
+Параметры фриланса (фильтры, слова-признаки) находятся в `freelance/filters.py`.
+
+## Установка и запуск
+
+### Локально
+
+1. **Клонируем репозиторий:**
+   ```bash
+   git clone https://github.com/ivanermolenko61-commits/job-parser-bot.git
+   cd job-parser-bot
+   ```
+
+2. **Создаём виртуальное окружение:**
+   ```bash
+   python -m venv .venv
+   source .venv/Scripts/activate  # Windows (PowerShell: .venv\Scripts\Activate.ps1)
+   # или
+   source .venv/bin/activate      # Linux/macOS
+   ```
+
+3. **Устанавливаем зависимости:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Скачиваем Chromium для Playwright:**
+   ```bash
+   playwright install chromium
+   ```
+
+5. **Создаём `.env`:**
+   ```bash
+   cp .env.example .env
+   # Отредактируйте .env, добавив ваши токены
+   ```
+
+6. **Запускаем бот:**
+   ```bash
+   python bot.py
+   ```
+
+### Docker
+
+Проект разворачивается на платформах вроде [BotHost](https://bothost.ru/):
+
+```bash
+docker build -t job-parser-bot .
+docker run -d \
+  --env-file .env \
+  --name job-parser-bot \
+  job-parser-bot
+```
+
+**Примечание:** Dockerfile содержит `playwright install --with-deps chromium`, поэтому образ получается достаточно большим (~2 GB). В BotHost это нормально.
+
+## Структура проекта
+
+```
+job-parser-bot/
+├── bot.py                    # Главный модуль: Telegram Bot API, команды, рассылка
+├── config.py                 # Настройки: ключевые слова, интервалы, параметры фильтров
+├── database.py               # SQLite: дедупликация вакансий и заказов
+├── parser_manager.py         # Координатор всех парсеров, таймауты
+├── health.py                 # Мониторинг работоспособности
+│
+├── parsers/                  # Парсеры вакансий
+│   ├── base.py              # Базовый класс Vacancy и BaseParser
+│   ├── habr_parser.py       # Parses career.habr.com
+│   ├── dreamjob_parser.py   # Parses dreamjob.ru
+│   ├── hh_parser.py         # Parses hh.ru (Playwright)
+│   ├── geekjob_parser.py    # Parses geekjob.ru (Playwright)
+│   └── filters.py           # Фильтры при дедупликации вакансий
+│
+├── freelance/               # Фриланс-модуль (alot.pro)
+│   ├── pipeline.py          # Цикл: скан, префильтр, дедуп, AI-оценка
+│   ├── alot_client.py       # API alot.pro
+│   ├── ai_scorer.py         # YandexGPT интеграция
+│   └── filters.py           # Префильтры по категориям, словам
+│
+├── requirements.txt         # Python-зависимости
+├── Dockerfile               # Docker-образ
+├── .env.example             # Шаблон переменных окружения
+└── README.md                # Этот файл
+```
+
+## Как добавить свой парсер вакансий
+
+1. **Создайте файл** `parsers/your_site_parser.py`
+2. **Наследуйте от BaseParser**:
+   ```python
+   from parsers.base import BaseParser, Vacancy
+   
+   class YourSiteParser(BaseParser):
+       source_name = "yoursite"
+       
+       def fetch(self) -> list[Vacancy]:
+           # Реализуйте логику парсинга
+           return [...]
+   ```
+3. **Добавьте в `parser_manager.py`**:
+   - Импортируйте парсер
+   - Добавьте его в функцию `get_all_parsers()`
+4. **Тестируйте** и добавьте поддерживаемые запросы в `config.py` (или `PLAYWRIGHT_QUERIES` для Playwright)
+
+## Как менять фильтры фриланса
+
+Основные фильтры находятся в `freelance/filters.py`:
+
+- **`DEV_CATEGORIES`** — категории alot.pro, относящиеся к разработке
+- **`INCLUDE_WORDS`** — слова-признаки подходящего заказа (бот, telegram, python, парсер, API и др.)
+- **`EXCLUDE_WORDS`** — явно не наше (1C, Bitrix, дизайн, копирайт и др.)
+
+Функция `is_candidate()` применяет эти фильтры. Чтобы изменить логику, отредактируйте этот файл и перезагрузите бот.
+
+**Параметры в `config.py`:**
+- `FREELANCE_MIN_FIT` — минимальная оценка для отправки
+- `FREELANCE_MAX_AGE_HOURS` — максимальный возраст заказа
+
+## Важные замечания
+
+### API alot.pro неофициальный
+
+Интеграция с alot.pro построена на обратном инжиниринге публичного API (всё доступно в браузере). При изменении фронтенда сайта API может поломаться.
+
+**Что происходит при поломке:**
+- Модуль отправляет health-алерт (если настроен)
+- Вакансии продолжают работать, заказы временно не приходят
+- Логируется ошибка с типом исключения
+
+Проверяйте логи:
+```bash
+grep FREELANCE bot.log  # или в Telegram через /status
+```
+
+### Параметры для экономии ресурсов
+
+Если Chromium занимает слишком много памяти/CPU:
+
+- Уменьшайте `MAX_PAGES_PER_QUERY`
+- Сокращайте `PLAYWRIGHT_QUERIES`
+- Увеличивайте `CHECK_INTERVAL_MINUTES`
+- Отключайте GeekJob парсер в `parser_manager.py` временно
+
+## Лицензия
 
 MIT
-EOF
