@@ -2,7 +2,8 @@
 
 Две таблицы:
   • vacancies     — вакансии для /list, чистятся через CLEANUP_DAYS.
-  • sent_history  — только «что уже отправляли» (source + vacancy_id),
+  • sent_history  — только «что уже отправляли» (source + vacancy_id
+                    и dedup_key — нормализованные название+компания),
                     хранится SENT_HISTORY_DAYS. Нужна, чтобы вакансия без
                     даты публикации (DreamJob) не пришла повторно после того,
                     как её удалили из vacancies, а на сайте она всё ещё висит.
@@ -12,7 +13,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
-from config import DB_PATH, SENT_HISTORY_DAYS
+from config import DB_PATH, DUPLICATE_WINDOW_DAYS, SENT_HISTORY_DAYS
+from parsers.filters import dedup_key
 
 
 MONTHS_RU = {
@@ -31,12 +33,6 @@ def _connect():
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # Встроенный LOWER() в SQLite понижает только латиницу («Т1» ≠ «т1»),
-    # поэтому для сравнения названий используем Python-овский lower().
-    conn.create_function(
-        "PY_LOWER", 1, lambda s: s.lower() if isinstance(s, str) else s,
-        deterministic=True,
-    )
     try:
         yield conn
         conn.commit()
@@ -137,11 +133,29 @@ def init_db() -> None:
                 PRIMARY KEY (source, vacancy_id)
             )
         """)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(sent_history)")]
+        if "dedup_key" not in cols:
+            conn.execute("ALTER TABLE sent_history ADD COLUMN dedup_key TEXT DEFAULT ''")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sent_dedup ON sent_history(dedup_key)"
+        )
         # Миграция: всё, что уже есть в vacancies, считаем отправленным
         conn.execute("""
             INSERT OR IGNORE INTO sent_history (source, vacancy_id, sent_at)
             SELECT source, vacancy_id, found_at FROM vacancies
         """)
+        # Миграция: ключ дубля для старых записей (берём из vacancies)
+        rows = conn.execute("""
+            SELECT v.source, v.vacancy_id, v.title, v.company
+            FROM vacancies v
+            JOIN sent_history s USING (source, vacancy_id)
+            WHERE s.dedup_key IS NULL OR s.dedup_key = ''
+        """).fetchall()
+        conn.executemany(
+            "UPDATE sent_history SET dedup_key = ? WHERE source = ? AND vacancy_id = ?",
+            [(dedup_key(r["title"], r["company"]), r["source"], r["vacancy_id"])
+             for r in rows],
+        )
 
         conn.commit()
 
@@ -157,24 +171,27 @@ def is_sent(source: str, vacancy_id: str) -> bool:
 
 
 def is_duplicate(title: str, company: str) -> bool:
-    """Проверяет, есть ли уже вакансия с таким названием и компанией.
+    """Проверяет, отправляли ли уже такую вакансию с другой площадки.
 
-    Это ловит дубли между источниками: одна и та же вакансия может
-    быть и на hh.ru, и на Dream Job, и на GeekJob. vacancy_id у них разные,
-    но title + company совпадают.
+    Одна и та же вакансия бывает и на hh.ru, и на Dream Job, и на GeekJob:
+    vacancy_id разные, а название+компания совпадают после нормализации
+    (регистр, кавычки, ООО/АО — см. dedup_key). Смотрим в sent_history,
+    а не в vacancies: та чистится через 5 дней, и дубль без даты (DreamJob)
+    пришёл бы снова. Окно — DUPLICATE_WINDOW_DAYS: у крупных работодателей
+    бывают разные вакансии с одним названием, за 60 дней они бы глохли.
     """
-    if not title or not company:
+    key = dedup_key(title, company)
+    if not key:
         return False
 
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT 1 FROM vacancies
-            WHERE PY_LOWER(TRIM(title)) = PY_LOWER(TRIM(?))
-              AND PY_LOWER(TRIM(company)) = PY_LOWER(TRIM(?))
+            SELECT 1 FROM sent_history
+            WHERE dedup_key = ? AND sent_at >= datetime('now', ?)
             LIMIT 1
             """,
-            (title, company),
+            (key, f"-{DUPLICATE_WINDOW_DAYS} days"),
         ).fetchone()
         return row is not None
 
@@ -200,8 +217,11 @@ def mark_sent(
             (source, vacancy_id, title, company, url, normalized_date),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO sent_history (source, vacancy_id) VALUES (?, ?)",
-            (source, vacancy_id),
+            """
+            INSERT OR IGNORE INTO sent_history (source, vacancy_id, dedup_key)
+            VALUES (?, ?, ?)
+            """,
+            (source, vacancy_id, dedup_key(title, company)),
         )
         conn.commit()
 

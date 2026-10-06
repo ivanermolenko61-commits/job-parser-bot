@@ -10,6 +10,7 @@ from database import is_duplicate, is_fresh, is_sent, mark_sent
 from health import monitor
 from parsers.base import Vacancy
 from parsers.dreamjob_parser import DreamJobParser
+from parsers.filters import dedup_key
 from parsers.geekjob_parser import GeekJobParser
 from parsers.habr_parser import HabrParser
 from parsers.hh_parser import HHParser
@@ -99,7 +100,7 @@ def fetch_new_vacancies() -> list[Vacancy]:
     """
     parsers = get_all_parsers()
     new_vacancies = []
-    seen_pairs: set[tuple[str, str]] = set()
+    seen_keys: set[str] = set()
     skipped_stale = 0
 
     for parser in parsers:
@@ -136,14 +137,15 @@ def fetch_new_vacancies() -> list[Vacancy]:
                 continue
 
             # 3. Дубль по названию+компании (кросс-источник)
-            pair = (v.title.strip().lower(), v.company.strip().lower())
-            if pair in seen_pairs:
+            key = dedup_key(v.title, v.company)
+            if key and key in seen_keys:
                 logging.debug(f"[MANAGER] Пропуск дубля: {v.title} / {v.company}")
                 continue
             if is_duplicate(v.title, v.company):
                 continue
 
-            seen_pairs.add(pair)
+            if key:
+                seen_keys.add(key)
             new_vacancies.append(v)
             source_new += 1
 
