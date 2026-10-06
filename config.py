@@ -73,7 +73,7 @@ DB_PATH = "vacancies.db"
 ALOT_SEED_ID = 17328000
 FREELANCE_INTERVAL_MINUTES = 10
 # Минимальная оценка YandexGPT (0-10), с которой заказ отправляется
-FREELANCE_MIN_FIT = 6
+FREELANCE_MIN_FIT = 5
 # Заказы старше этого возраста не отправляются
 FREELANCE_MAX_AGE_HOURS = 24
 # Максимум сообщений за один цикл, остальное — сводкой «ещё N»

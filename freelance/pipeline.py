@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -36,9 +37,10 @@ from freelance.filters import is_candidate, norm_dedup_key
 from health import monitor
 
 DEDUP_DAYS = 3
-MAX_AI_PER_CYCLE = 25
-# Общий дедлайн на AI-оценку (сек от старта prepare_cycle); после него заказы идут без AI
-AI_DEADLINE_SEC = 480
+MAX_AI_PER_CYCLE = 120
+AI_WORKERS = 4
+# Общий дедлайн на AI-оценку (сек от старта prepare_cycle); неоценённые откладываются
+AI_DEADLINE_SEC = 600
 # Максимум попыток отправки одного заказа, потом сдаёмся и считаем обработанным
 MAX_SEND_ATTEMPTS = 3
 # Верхняя оценка длительности prepare_cycle (для wait_for в боте)
@@ -147,18 +149,36 @@ def _prepare_cycle() -> CycleResult:
             first_id[k] = o.order_id
             candidates.append(ScoredOrder(o, None, k))
 
-    # AI-оценка: новые первыми; сверх лимита или дедлайна — без AI
-    for idx, sc in enumerate(candidates):
-        in_budget = idx < MAX_AI_PER_CYCLE and time.monotonic() - started < AI_DEADLINE_SEC
-        sc.ai = ai_scorer.score_order(sc.order) if in_budget else None
-        if sc.ai is not None and sc.ai["fit"] < FREELANCE_MIN_FIT:
+    # AI-оценка в несколько потоков, новые первыми. Если AI включён, заказ без
+    # оценки (лимит, дедлайн, сбой) НЕ отправляем, чтобы не засорять чат:
+    # last_id отодвигается назад, и заказ оценится в следующем цикле.
+    ai_on = ai_scorer.is_enabled()
+
+    def _score(item):
+        idx, sc = item
+        if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
+            return None
+        return ai_scorer.score_order(sc.order)
+
+    with ThreadPoolExecutor(AI_WORKERS) as pool:
+        scores = list(pool.map(_score, enumerate(candidates)))
+
+    pending: list[ScoredOrder] = []
+    for sc, ai in zip(candidates, scores):
+        sc.ai = ai
+        if ai is None and ai_on:
+            pending.append(sc)
+        elif ai is not None and ai["fit"] < FREELANCE_MIN_FIT:
             res.rejected.append(sc)
         else:
             res.to_send.append(sc)
+    if pending:
+        res.new_last_id = min(res.new_last_id, min(p.order.order_id for p in pending) - 1)
 
     logging.info(
         f"[FREELANCE] скан: {scan.raw_count}, кандидатов: {len(candidates)}, "
-        f"к отправке: {len(res.to_send)}, отсеяно AI: {len(res.rejected)}"
+        f"к отправке: {len(res.to_send)}, отсеяно AI: {len(res.rejected)}, "
+        f"отложено без оценки: {len(pending)}"
     )
     return res
 
