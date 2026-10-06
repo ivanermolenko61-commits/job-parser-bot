@@ -1,4 +1,4 @@
-"""Оценка фриланс-заказа через YandexGPT.
+"""Оценка фриланс-заказа: Gemini (бесплатно), YandexGPT — опциональный запасной.
 
 Изолирован: если ключей нет или модель ответила мусором, score_order()
 возвращает None, и заказ отправляется без оценки (пометка «без AI»).
@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 
 from dotenv import load_dotenv
 
@@ -17,17 +19,25 @@ FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 
 # полная yandexgpt заметно строже lite к мусору (проверено на реальных заказах)
 MODEL_NAME = os.getenv("YANDEX_MODEL", "yandexgpt")
-# Gemini (бесплатный тариф AI Studio) — основной оценщик, если задан ключ;
-# YandexGPT остаётся запасным на случай сбоя, квоты или недоступности региона
+# Gemini (бесплатный тариф AI Studio) — основной и по умолчанию единственный оценщик.
+# YandexGPT платный: включается только явно (YANDEX_ENABLED=1) как запасной.
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+# Бережём лимиты бесплатного тарифа: не чаще одного запроса в N секунд,
+# при 429 пауза (заказы без оценки откладываются на следующий цикл)
+GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "4.5"))
+GEMINI_COOLDOWN_SEC = 120
+_gemini_lock = threading.Lock()
+_gemini_next_at = 0.0       # не раньше этого момента (monotonic) — следующий запрос
+_gemini_blocked_until = 0.0  # пауза после 429
+YANDEX_ENABLED = os.getenv("YANDEX_ENABLED") == "1" and bool(API_KEY and FOLDER_ID)
 
-# дешёвое сито: заказы с оценкой lite ниже порога дальше не идут (пусто = выключено)
+# дешёвое сито YandexGPT: заказы с оценкой lite ниже порога дальше не идут
 PRESCREEN_MODEL = os.getenv("YANDEX_PRESCREEN_MODEL", "yandexgpt-lite")
 PRESCREEN_MIN_FIT = 4
-REFUSAL_RE =re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
-REQUEST_TIMEOUT_SEC = 20
+REFUSAL_RE = re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
+REQUEST_TIMEOUT_SEC = 30
 BODY_LIMIT = 1500
 
 SYSTEM_PROMPT = (
@@ -71,7 +81,7 @@ _sdk = None
 
 
 def is_enabled() -> bool:
-    return bool(GEMINI_KEY or (API_KEY and FOLDER_ID))
+    return bool(GEMINI_KEY or YANDEX_ENABLED)
 
 
 def _get_model(name: str = MODEL_NAME):
@@ -122,17 +132,16 @@ def parse_ai_json(text: str) -> dict | None:
 
 
 def score_order(order) -> dict | None:
-    """Двухступенчатая оценка: дешёвая lite отсеивает очевидный мусор,
-    полная модель оценивает только прошедших. Это в разы дешевле, чем гнать
-    через полную все заказы. None — AI недоступен или ответ не разобран."""
+    """Оценка заказа: Gemini (бесплатно); при YANDEX_ENABLED=1 — запасной путь
+    через YandexGPT в две ступени (lite отсеивает мусор, полная модель решает
+    по прошедшим). None — AI недоступен или ответ не разобран."""
     if not is_enabled():
         return None
     if GEMINI_KEY:
         result = _ask_gemini(order)
-        if result is not None or not (API_KEY and FOLDER_ID):
+        if result is not None or not YANDEX_ENABLED:
             return result
-        # Gemini не ответил: запасной путь через YandexGPT
-    elif not (API_KEY and FOLDER_ID):
+    elif not YANDEX_ENABLED:
         return None
     if PRESCREEN_MODEL and PRESCREEN_MODEL != MODEL_NAME:
         pre = _ask(PRESCREEN_MODEL, order)
@@ -152,7 +161,16 @@ def _user_prompt(order) -> str:
 
 def _ask_gemini(order) -> dict | None:
     import requests
+    global _gemini_next_at, _gemini_blocked_until
     try:
+        # один запрос за раз с интервалом: потоки пула ждут очереди
+        with _gemini_lock:
+            now = time.monotonic()
+            if now < _gemini_blocked_until:
+                return None
+            if now < _gemini_next_at:
+                time.sleep(_gemini_next_at - now)
+            _gemini_next_at = time.monotonic() + GEMINI_MIN_INTERVAL_SEC
         resp = requests.post(
             GEMINI_URL.format(GEMINI_MODEL),
             headers={"x-goog-api-key": GEMINI_KEY},
@@ -164,6 +182,10 @@ def _ask_gemini(order) -> dict | None:
             },
             timeout=REQUEST_TIMEOUT_SEC,
         )
+        if resp.status_code == 429:
+            _gemini_blocked_until = time.monotonic() + GEMINI_COOLDOWN_SEC
+            logging.warning("[AI] Gemini: лимит запросов, пауза 2 мин")
+            return None
         if resp.status_code != 200:
             logging.warning(f"[AI] Gemini HTTP {resp.status_code}: {resp.text[:150]!r}")
             return None
