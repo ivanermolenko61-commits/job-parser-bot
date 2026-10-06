@@ -17,7 +17,16 @@ FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 
 # полная yandexgpt заметно строже lite к мусору (проверено на реальных заказах)
 MODEL_NAME = os.getenv("YANDEX_MODEL", "yandexgpt")
-REFUSAL_RE = re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
+# Gemini (бесплатный тариф AI Studio) — основной оценщик, если задан ключ;
+# YandexGPT остаётся запасным на случай сбоя, квоты или недоступности региона
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+
+# дешёвое сито: заказы с оценкой lite ниже порога дальше не идут (пусто = выключено)
+PRESCREEN_MODEL = os.getenv("YANDEX_PRESCREEN_MODEL", "yandexgpt-lite")
+PRESCREEN_MIN_FIT = 4
+REFUSAL_RE =re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
 REQUEST_TIMEOUT_SEC = 20
 BODY_LIMIT = 1500
 
@@ -62,10 +71,10 @@ _sdk = None
 
 
 def is_enabled() -> bool:
-    return bool(API_KEY and FOLDER_ID)
+    return bool(GEMINI_KEY or (API_KEY and FOLDER_ID))
 
 
-def _get_model():
+def _get_model(name: str = MODEL_NAME):
     global _sdk
     if _sdk is None:
         # импорт здесь: без SDK бот не падает
@@ -74,7 +83,7 @@ def _get_model():
         except ImportError:  # старое имя пакета
             from yandex_cloud_ml_sdk import YCloudML as _Client
         _sdk = _Client(folder_id=FOLDER_ID, auth=API_KEY)
-    return _sdk.models.completions(MODEL_NAME).configure(temperature=0.2)
+    return _sdk.models.completions(name).configure(temperature=0.2)
 
 
 def parse_ai_json(text: str) -> dict | None:
@@ -113,16 +122,34 @@ def parse_ai_json(text: str) -> dict | None:
 
 
 def score_order(order) -> dict | None:
-    """Оценка заказа. None — AI недоступен или ответ не разобран (фолбэк «без AI»)."""
+    """Двухступенчатая оценка: дешёвая lite отсеивает очевидный мусор,
+    полная модель оценивает только прошедших. Это в разы дешевле, чем гнать
+    через полную все заказы. None — AI недоступен или ответ не разобран."""
     if not is_enabled():
         return None
+    if GEMINI_KEY:
+        result = _ask_gemini(order)
+        if result is not None or not (API_KEY and FOLDER_ID):
+            return result
+        # Gemini не ответил: запасной путь через YandexGPT
+    elif not (API_KEY and FOLDER_ID):
+        return None
+    if PRESCREEN_MODEL and PRESCREEN_MODEL != MODEL_NAME:
+        pre = _ask(PRESCREEN_MODEL, order)
+        if pre is not None and pre["fit"] < PRESCREEN_MIN_FIT:
+            return pre
+        # lite сбоит или пропустила: решает полная модель
+    return _ask(MODEL_NAME, order)
+
+
+def _ask(model_name: str, order) -> dict | None:
     user_prompt = (
         f"Название: {order.title}\n"
         f"Цена: {order.price_text or 'не указана'}\n"
         f"Описание:\n{(order.body or '')[:BODY_LIMIT]}"
     )
     try:
-        result = _get_model().run(
+        result = _get_model(model_name).run(
             [
                 {"role": "system", "text": SYSTEM_PROMPT},
                 {"role": "user", "text": user_prompt},
