@@ -142,12 +142,44 @@ def score_order(order) -> dict | None:
     return _ask(MODEL_NAME, order)
 
 
-def _ask(model_name: str, order) -> dict | None:
-    user_prompt = (
+def _user_prompt(order) -> str:
+    return (
         f"Название: {order.title}\n"
         f"Цена: {order.price_text or 'не указана'}\n"
         f"Описание:\n{(order.body or '')[:BODY_LIMIT]}"
     )
+
+
+def _ask_gemini(order) -> dict | None:
+    import requests
+    try:
+        resp = requests.post(
+            GEMINI_URL.format(GEMINI_MODEL),
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={
+                "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": _user_prompt(order)}]}],
+                "generationConfig": {"temperature": 0.2,
+                                     "responseMimeType": "application/json"},
+            },
+            timeout=REQUEST_TIMEOUT_SEC,
+        )
+        if resp.status_code != 200:
+            logging.warning(f"[AI] Gemini HTTP {resp.status_code}: {resp.text[:150]!r}")
+            return None
+        parts = resp.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+        parsed = parse_ai_json(text)
+        if parsed is None:
+            logging.warning(f"[AI] Gemini ответ не JSON: {text[:150]!r}")
+        return parsed
+    except Exception as e:
+        logging.warning(f"[AI] ошибка Gemini: {type(e).__name__}")
+        return None
+
+
+def _ask(model_name: str, order) -> dict | None:
+    user_prompt = _user_prompt(order)
     try:
         result = _get_model(model_name).run(
             [
