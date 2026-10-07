@@ -1,4 +1,3 @@
-cat > .dockerignore << 'EOF'
 .venv/
 __pycache__/
 *.pyc
@@ -6,4 +5,5 @@ __pycache__/
 .env
 *.db
 README.md
-EOF
+*.db-wal
+*.db-shm

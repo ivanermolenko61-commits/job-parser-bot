@@ -67,4 +67,18 @@ DUPLICATE_WINDOW_DAYS = 7
 CHECK_INTERVAL_MINUTES = 15
 
 # --- База данных ---
-DB_PATH = "vacancies.db"
+# На хостинге можно вынести базу на постоянный том: DB_PATH=/app/data/vacancies.db
+DB_PATH = os.getenv("DB_PATH", "vacancies.db")
+# --- Фриланс (alot.pro) ---
+# Якорь для поиска верхней границы id (заведомо старше текущих заказов)
+ALOT_SEED_ID = 17328000
+FREELANCE_INTERVAL_MINUTES = 10
+# Минимальная AI-оценка (0-10), с которой заказ отправляется
+FREELANCE_MIN_FIT = 5
+# Заказы старше этого возраста не отправляются (API alot.pro не отдаёт статус
+# заказа, поэтому «мёртвые», уже взятые заказы отсекаем свежестью)
+FREELANCE_MAX_AGE_HOURS = 6
+# Через сколько часов бот сам удаляет из чата неразобранные сообщения с заказами
+FREELANCE_MESSAGE_TTL_HOURS = 24
+# Максимум сообщений за один цикл, остальное — сводкой «ещё N»
+FREELANCE_MAX_PER_CYCLE = 15
