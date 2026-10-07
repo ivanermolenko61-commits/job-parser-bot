@@ -31,7 +31,12 @@ GEMINI_COOLDOWN_SEC = 120
 _gemini_lock = threading.Lock()
 _gemini_next_at = 0.0       # не раньше этого момента (monotonic) — следующий запрос
 _gemini_blocked_until = 0.0  # пауза после 429
-YANDEX_ENABLED = os.getenv("YANDEX_ENABLED") == "1" and bool(API_KEY and FOLDER_ID)
+# Запасной путь включён, если есть ключи; отключить: YANDEX_ENABLED=0.
+# Только самая простая модель и дневной потолок, чтобы не платить много.
+YANDEX_ENABLED = os.getenv("YANDEX_ENABLED") != "0" and bool(API_KEY and FOLDER_ID)
+YANDEX_MAX_PER_DAY = int(os.getenv("YANDEX_MAX_PER_DAY", "60"))
+_yandex_day = ""
+_yandex_count = 0
 
 # дешёвое сито YandexGPT: заказы с оценкой lite ниже порога дальше не идут
 PRESCREEN_MODEL = os.getenv("YANDEX_PRESCREEN_MODEL", "yandexgpt-lite")
@@ -143,12 +148,20 @@ def score_order(order) -> dict | None:
             return result
     elif not YANDEX_ENABLED:
         return None
-    if PRESCREEN_MODEL and PRESCREEN_MODEL != MODEL_NAME:
-        pre = _ask(PRESCREEN_MODEL, order)
-        if pre is not None and pre["fit"] < PRESCREEN_MIN_FIT:
-            return pre
-        # lite сбоит или пропустила: решает полная модель
-    return _ask(MODEL_NAME, order)
+    return _ask_yandex_lite(order)
+
+
+def _ask_yandex_lite(order) -> dict | None:
+    """Запасной путь: самая простая модель, не больше YANDEX_MAX_PER_DAY в сутки."""
+    global _yandex_day, _yandex_count
+    today = time.strftime("%Y-%m-%d")
+    with _gemini_lock:
+        if _yandex_day != today:
+            _yandex_day, _yandex_count = today, 0
+        if _yandex_count >= YANDEX_MAX_PER_DAY:
+            return None
+        _yandex_count += 1
+    return _ask(PRESCREEN_MODEL, order)
 
 
 def _user_prompt(order) -> str:
