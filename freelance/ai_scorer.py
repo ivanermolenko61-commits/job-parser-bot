@@ -115,23 +115,18 @@ SYSTEM_PROMPT = (
     '"risks": "главный риск в одну короткую строку"}'
 )
 
-_sdk = None
+YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_MAX_TOKENS = "800"
 
 
 def is_enabled() -> bool:
     return bool(GEMINI_KEY or YANDEX_ENABLED)
 
 
-def _get_model(name: str = YANDEX_MODEL):
-    global _sdk
-    if _sdk is None:
-        # импорт здесь: без SDK бот не падает
-        try:
-            from yandex_ai_studio_sdk import AIStudio as _Client
-        except ImportError:  # старое имя пакета
-            from yandex_cloud_ml_sdk import YCloudML as _Client
-        _sdk = _Client(folder_id=FOLDER_ID, auth=API_KEY)
-    return _sdk.models.completions(name).configure(temperature=0.2)
+def _yandex_headers() -> dict:
+    # IAM-токены начинаются с "t1." (Bearer), остальное - API-ключ сервисного аккаунта
+    scheme = "Bearer" if (API_KEY or "").startswith("t1.") else "Api-Key"
+    return {"Authorization": f"{scheme} {API_KEY}", "x-folder-id": FOLDER_ID or ""}
 
 
 def status() -> dict:
@@ -385,28 +380,61 @@ def _ask_gemini_model(model: str, order):
 
 
 def _ask(model_name: str, order) -> dict | None:
-    user_prompt = _user_prompt(order)
+    """Один запрос к YandexGPT по REST. dict - оценка, None - не вышло."""
+    import requests
+    body = {
+        "modelUri": f"gpt://{FOLDER_ID}/{model_name}/latest",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.2,
+            "maxTokens": YANDEX_MAX_TOKENS,
+        },
+        "messages": [
+            {"role": "system", "text": SYSTEM_PROMPT},
+            {"role": "user", "text": _user_prompt(order)},
+        ],
+    }
+    # Ошибки Yandex только логируются (как при SDK): причина в оповещении
+    # «AI-оценка заказов» остаётся от Gemini. Сетевой сбой и 5xx - один повтор.
+    resp = None
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(YANDEX_URL, headers=_yandex_headers(), json=body,
+                                 timeout=REQUEST_TIMEOUT_SEC)
+        except Exception as e:
+            logging.warning(f"[AI] YandexGPT: сбой запроса (попытка {attempt}): {type(e).__name__}")
+            resp = None
+        if resp is not None and resp.status_code < 500:
+            break
+        if attempt == 1:
+            time.sleep(2)
+    if resp is None:
+        return None
+
+    code = resp.status_code
+    if code != 200:
+        if code == 429:
+            logging.warning("[AI] YandexGPT: лимит запросов (HTTP 429)")
+        elif code in (401, 403):
+            logging.error(f"[AI] YandexGPT: ключ или права отклонены (HTTP {code})")
+        else:
+            logging.warning(f"[AI] YandexGPT: HTTP {code}: {resp.text[:150]!r}")
+        return None
+
     try:
-        result = _get_model(model_name).run(
-            [
-                {"role": "system", "text": SYSTEM_PROMPT},
-                {"role": "user", "text": user_prompt},
-            ],
-            timeout=REQUEST_TIMEOUT_SEC,
-        )
-        for alternative in result:
-            parsed = parse_ai_json(alternative.text)
-            if parsed is None:
-                logging.warning(f"[AI] ответ не JSON: {alternative.text[:150]!r}")
-                if REFUSAL_RE.search(alternative.text or ""):
-                    # фильтр модели отказался: заказ не наш, не переоцениваем вечно
-                    return {"fit": 0, "difficulty": "", "hours": 0.0,
-                            "price_rub": "", "summary": "отказ модели",
-                            "risks": ""}
-            return parsed
-    except Exception:
-        logging.exception("[AI] ошибка YandexGPT")
-    return None
+        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
+    except Exception as e:
+        logging.warning(f"[AI] YandexGPT: не разобран ответ: {type(e).__name__}")
+        return None
+    parsed = parse_ai_json(text)
+    if parsed is None:
+        logging.warning(f"[AI] ответ не JSON: {text[:150]!r}")
+        if REFUSAL_RE.search(text or ""):
+            # фильтр модели отказался: заказ не наш, не переоцениваем вечно
+            return {"fit": 0, "difficulty": "", "hours": 0.0,
+                    "price_rub": "", "summary": "отказ модели",
+                    "risks": ""}
+    return parsed
 
 
 if __name__ == "__main__":
