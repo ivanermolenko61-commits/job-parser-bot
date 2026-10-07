@@ -72,7 +72,7 @@ DB_PATH = os.getenv("DB_PATH", "vacancies.db")
 # --- Фриланс (alot.pro) ---
 # Якорь для поиска верхней границы id (заведомо старше текущих заказов)
 ALOT_SEED_ID = 17328000
-FREELANCE_INTERVAL_MINUTES = 10
+FREELANCE_INTERVAL_MINUTES = 5
 # Минимальная AI-оценка (0-10), с которой заказ отправляется
 FREELANCE_MIN_FIT = 5
 # Заказы старше этого возраста не отправляются (API alot.pro не отдаёт статус

@@ -3,7 +3,7 @@
 Порядок: GEMINI_MODELS по очереди (у каждой свой бесплатный лимит), затем, если
 заданы ключи, yandexgpt-lite (не больше YANDEX_MAX_PER_DAY в сутки). Если ничего не
 ответило, score_order() возвращает None, и бот повторит оценку в следующем цикле
-(после MAX_AI_ATTEMPTS попыток заказ уходит с пометкой «без AI»).
+(заказ ждёт оценки, пока свежий; без оценки в чат не уходит).
 """
 import json
 import logging
@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -24,8 +24,11 @@ FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 # Gemini (бесплатный тариф AI Studio) - основной оценщик. Цепочка моделей: следующая
 # берётся, если предыдущая на паузе (429), недоступна (404) или не дала разбираемый ответ.
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+# gemma: дневной лимит бесплатного тарифа 14 400 (у flash-lite - 500), но 16K токенов
+# в минуту; у каждой модели своя квота, поэтому обе gemma в цепочке
 DEFAULT_GEMINI_MODELS = (
-    "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.1-flash-lite-preview,gemma-4-31b-it"
+    "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.1-flash-lite-preview,"
+    "gemma-4-31b-it,gemma-4-26b-a4b-it"
 )
 
 
@@ -51,7 +54,8 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generat
 # Бережём лимиты бесплатного тарифа: общий интервал между запросами к Gemini,
 # при 429 пауза только той модели, которая ответила 429
 GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "4.5"))
-GEMINI_COOLDOWN_SEC = 120
+GEMINI_COOLDOWN_SEC = 120          # пауза после 429, если Google не назвал срок
+MAX_QUOTA_PAUSE_SEC = 24 * 3600    # потолок паузы по retryDelay (дневная квота)
 CONFIG_ERROR_COOLDOWN_SEC = 300  # после ошибки ключа Gemini не долбим 5 минут
 
 _lock = threading.Lock()
@@ -291,6 +295,48 @@ def _throttle() -> None:
         time.sleep(start - now)
 
 
+def _quota_pause(resp) -> tuple[int, bool]:
+    """Пауза модели после 429: столько, сколько велел Google (RetryInfo.retryDelay),
+    иначе GEMINI_COOLDOWN_SEC. Второе значение - исчерпана ли дневная квота.
+
+    При дневной квоте retryDelay - часы до сброса: без этого модель долбилась бы
+    каждые 2 минуты, а каждый заказ ждал бы её очереди в общем темпе запросов.
+    """
+    pause, daily = GEMINI_COOLDOWN_SEC, False
+    try:
+        details = (resp.json().get("error") or {}).get("details") or []
+        for d in details if isinstance(details, list) else []:
+            if not isinstance(d, dict):
+                continue
+            violations = d.get("violations")
+            for v in violations if isinstance(violations, list) else []:
+                if isinstance(v, dict) and "PerDay" in str(v.get("quotaId", "")):
+                    daily = True
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(d.get("retryDelay", "")))
+            if m:
+                pause = max(1, min(MAX_QUOTA_PAUSE_SEC, math.ceil(float(m.group(1)))))
+    except Exception:
+        return GEMINI_COOLDOWN_SEC, False
+    if daily:
+        # Дневная квота сбрасывается в полночь по тихоокеанскому времени; короткий
+        # retryDelay тут не верим - иначе модель опрашивалась бы до конца суток
+        pause = max(pause, _until_quota_reset())
+    return pause, daily
+
+
+def _until_quota_reset() -> int:
+    """Секунд до полуночи America/Los_Angeles (сброс дневных квот Gemini) + 1 мин."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        return 3600
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    # через UTC: вычитание в одной зоне не учитывает переход на летнее/зимнее время
+    delta = midnight.astimezone(timezone.utc) - now.astimezone(timezone.utc)
+    return min(MAX_QUOTA_PAUSE_SEC, int(delta.total_seconds()) + 60)
+
+
 def _ask_gemini_chain(order) -> dict | None:
     with _lock:
         if time.monotonic() < _config_blocked_until:
@@ -328,10 +374,13 @@ def _ask_gemini_model(model: str, order):
 
     code = resp.status_code
     if code == 429:
+        pause, daily = _quota_pause(resp)
         with _lock:
-            _paused_until[model] = time.monotonic() + GEMINI_COOLDOWN_SEC
-        logging.warning(f"[AI] {model}: лимит запросов, пауза {GEMINI_COOLDOWN_SEC} с, берём следующую")
-        _set_error(f"{model}: HTTP 429 (лимит)")
+            # max: параллельный короткий 429 не затирает паузу дневной квоты
+            _paused_until[model] = max(_paused_until.get(model, 0.0), time.monotonic() + pause)
+        kind = "дневная квота исчерпана" if daily else "лимит запросов"
+        logging.warning(f"[AI] {model}: {kind}, пауза {pause} с, берём следующую")
+        _set_error(f"{model}: HTTP 429 ({kind})")
         return "next"
     if code != 200:
         body = resp.text[:400]

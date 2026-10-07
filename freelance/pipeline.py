@@ -8,7 +8,8 @@
   • курсор alot_last_id идёт только вперёд и не откатывается;
   • неоценённые и неотправленные заказы лежат в БД со статусом pending и счётчиком
     attempts, каждый цикл дозапрашиваются по id (getProjects);
-  • после MAX_AI_ATTEMPTS неудачных оценок заказ уходит с пометкой «без AI»;
+  • без оценки AI заказ в чат не уходит: ждёт в pending, пока AI не ответит
+    (о простое AI приходит health-оповещение); «без AI» - только если ключей нет;
   • pending старше FREELANCE_MAX_AGE_HOURS получает статус expired;
   • успешно отправленные заказы дополнительно держатся в памяти (_sent_ids), чтобы
     сбой записи в БД не привёл к дублю.
@@ -55,14 +56,16 @@ MAX_AI_PER_CYCLE = 120
 AI_WORKERS = 4
 # Общий дедлайн на AI-оценку (сек от старта prepare_cycle); неоценённые откладываются
 AI_DEADLINE_SEC = 600
-# После стольких неудачных оценок заказ отправляется «без AI», а не теряется
-MAX_AI_ATTEMPTS = 3
-# Сколько pending-заказов дозапрашиваем за цикл (один запрос getProjects)
-PENDING_FETCH_LIMIT = 100
+# Сколько pending-заказов дозапрашиваем за цикл (пачки по 100 id - лимит getProjects).
+# Поток ~150 кандидатов в сутки, за 6 ч свежести pending обычно < 50
+PENDING_FETCH_LIMIT = 300
+# Сколько pending читаем из БД за цикл, чтобы пометить просроченные (expired)
+PENDING_SCAN_LIMIT = 5000
+PENDING_BATCH = 100
 # Верхняя оценка длительности prepare_cycle (для wait_for в боте)
 PREPARE_TIMEOUT_SEC = 1800
-# Если столько циклов подряд нет id выше last_id - перепроверяем границу
-STALE_CYCLES_LIMIT = 6
+# Если столько циклов подряд нет id выше last_id - перепроверяем границу (≈ 1 ч)
+STALE_CYCLES_LIMIT = 12
 # При первом запуске/застое отступаем от границы на столько id (~50 id/час * 24 ч с запасом)
 BOOTSTRAP_LOOKBACK = 1500
 LAST_ID_KEY = "alot_last_id"
@@ -116,7 +119,7 @@ class ScoredOrder:
 
 @dataclass
 class CycleResult:
-    to_send: list[ScoredOrder] = field(default_factory=list)   # прошли оценку (или «без AI»)
+    to_send: list[ScoredOrder] = field(default_factory=list)   # прошли оценку («без AI» - нет ключей)
     rejected: list[ScoredOrder] = field(default_factory=list)  # низкий fit: запомнить
     unscored: list[ScoredOrder] = field(default_factory=list)  # не оценены: pending
     batch_dups: list = field(default_factory=list)  # (ScoredOrder, id оригинала)
@@ -156,7 +159,9 @@ def _parse_dt(value: str) -> datetime | None:
 
 def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOrder]:
     """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает по id."""
-    rows = freelance_pending(PENDING_FETCH_LIMIT)
+    # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
+    # простое AI старые строки за пределами лимита висели бы pending
+    rows = freelance_pending(PENDING_SCAN_LIMIT)
     live: dict[int, dict] = {}
     for row in rows:
         oid = row["order_id"]
@@ -166,14 +171,20 @@ def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOr
         if published is not None and published < threshold:
             freelance_set_status(oid, "expired")
             continue
-        live[oid] = row
+        if len(live) < PENDING_FETCH_LIMIT:
+            live[oid] = row
     if not live:
         return {}
-    try:
-        items = _fetch_items(sorted(live))
-    except Exception:
-        # Сеть/alot недоступны: pending остаются в БД и будут запрошены в следующий раз
-        logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
+    items: list[dict] = []
+    ids = sorted(live, reverse=True)  # новые первыми: при сбое сети теряем хвост, а не голову
+    for i in range(0, len(ids), PENDING_BATCH):
+        try:
+            items += _fetch_items(ids[i:i + PENDING_BATCH])
+        except Exception:
+            # Сеть/alot недоступны: pending остаются в БД и будут запрошены в следующий раз
+            logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
+            break
+    if not items:
         return {}
     result: dict[int, ScoredOrder] = {}
     for item in items:
@@ -289,11 +300,11 @@ def _prepare_cycle() -> CycleResult:
     res.candidates = len(candidates)
 
     # AI-оценка в несколько потоков, новые первыми. Заказ без оценки (лимит, дедлайн,
-    # сбой) остаётся pending и оценится в следующем цикле; после MAX_AI_ATTEMPTS
-    # неудач уходит «без AI».
+    # сбой) остаётся pending и оценивается в следующих циклах, пока свежий: без
+    # оценки в чат не уходит (иначе при исчерпанной квоте летит весь поток без фильтра).
+    # «Без AI» отправляется только когда AI выключен совсем (нет ключей).
     ai_on = ai_scorer.is_enabled()
-    to_score = [sc for sc in candidates
-                if sc.ai is None and ai_on and sc.attempts < MAX_AI_ATTEMPTS]
+    to_score = [sc for sc in candidates if sc.ai is None and ai_on]
 
     def _score(item):
         idx, sc = item
@@ -312,7 +323,7 @@ def _prepare_cycle() -> CycleResult:
     for sc in candidates:
         if sc.ai is None:
             if id(sc) not in scored:
-                # AI выключен или попытки исчерпаны: отправляем «без AI»
+                # AI выключен (нет ключей): отправляем «без AI»
                 res.to_send.append(sc)
                 continue
             r = scored[id(sc)]
@@ -322,12 +333,7 @@ def _prepare_cycle() -> CycleResult:
             res.ai_attempted += 1
             if r is None:
                 sc.attempts += 1
-                if sc.attempts >= MAX_AI_ATTEMPTS:
-                    logging.warning(
-                        f"[FREELANCE] {MAX_AI_ATTEMPTS} неудачных оценок, уходит «без AI»: {sc.order.url}")
-                    res.to_send.append(sc)
-                else:
-                    res.unscored.append(sc)
+                res.unscored.append(sc)
                 continue
             res.ai_ok += 1
             sc.ai = r

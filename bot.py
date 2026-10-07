@@ -509,7 +509,11 @@ def _ai_state_text(st: dict) -> str:
         else:
             parts.append("Gemini: все модели недоступны")
         if st["paused"]:
-            paused = ", ".join(f"{html.escape(m)} {sec} с" for m, sec in st["paused"].items())
+            paused = ", ".join(
+                f"{html.escape(m)} {sec // 3600} ч {sec % 3600 // 60} мин" if sec >= 3600
+                else f"{html.escape(m)} {sec} с"
+                for m, sec in st["paused"].items()
+            )
             parts.append(f"на паузе (лимит): {paused}")
     if st["yandex"]:
         parts.append("+ Yandex lite")
