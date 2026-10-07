@@ -5,3 +5,5 @@ __pycache__/
 .env
 *.db
 README.md
+*.db-wal
+*.db-shm

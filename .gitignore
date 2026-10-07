@@ -10,3 +10,5 @@ ofz_cache.json
 Thumbs.db
 .idea/
 .vscode/
+*.db-wal
+*.db-shm

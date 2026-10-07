@@ -25,12 +25,15 @@ from config import (
     CHECK_INTERVAL_MINUTES,
     FREELANCE_INTERVAL_MINUTES,
     FREELANCE_MAX_PER_CYCLE,
+    FREELANCE_MESSAGE_TTL_HOURS,
     FREELANCE_MIN_FIT,
     MAX_VACANCY_AGE_DAYS,
 )
 from database import (
     cleanup_old,
+    freelance_expired_messages,
     freelance_recent,
+    freelance_set_status,
     freelance_stats,
     get_recent_vacancies,
     init_db,
@@ -47,8 +50,10 @@ from freelance.pipeline import (
     PREPARE_TIMEOUT_SEC,
     finish_cycle,
     format_order,
+    format_order_plain,
+    mark_sent_status,
     prepare_cycle,
-    save_order,
+    save_sent,
 )
 from health import monitor
 from parser_manager import fetch_new_vacancies, mark_vacancies_sent
@@ -74,6 +79,8 @@ DEFAULT_LIST_LIMIT = 300
 # Жёсткий лимит — защита от слишком длинных списков
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
+# Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
+FREELANCE_HEALTH_SOURCES = {"alot", "gemini"}
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -280,10 +287,19 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _order_kb(url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть", url=url)],
-    ])
+def _order_kb(order_id: int, url: str | None, taken: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки заказа: открыть, «Взял» / «Не подходит» (после «Взял» - «В работе»)."""
+    rows = []
+    if url:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть", url=url)])
+    if taken:
+        rows.append([InlineKeyboardButton(text="✅ В работе", callback_data=f"fl_noop:{order_id}")])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="✅ Взял", callback_data=f"fl_take:{order_id}"),
+            InlineKeyboardButton(text="❌ Не подходит", callback_data=f"fl_skip:{order_id}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _sort_key_for_cap(sc) -> tuple:
@@ -291,40 +307,70 @@ def _sort_key_for_cap(sc) -> tuple:
     return (sc.fit if sc.fit is not None else 5, sc.order.order_id)
 
 
-async def _deliver_freelance(res) -> dict:
+async def _send_order(sc):
+    """Отправляет один заказ, при отказе Telegram пробует упрощённые варианты.
+
+    Возвращает message_id. TelegramBadRequest на всех вариантах пробрасывается
+    (заказ уйдёт в pending), TelegramRetryAfter и сетевые ошибки - тоже.
+    """
+    o = sc.order
+    variants = []
+    try:
+        variants.append((format_order(sc), "HTML", _order_kb(o.order_id, o.url)))
+    except Exception:
+        logging.exception(f"[FREELANCE] ошибка форматирования {o.url}")
+    variants.append((format_order_plain(sc), None, _order_kb(o.order_id, o.url)))
+    # последний шанс: без кнопки-ссылки (URL мог оказаться невалидным для Telegram)
+    variants.append((format_order_plain(sc), None, _order_kb(o.order_id, None)))
+    last_exc: Exception | None = None
+    for text, parse_mode, markup in variants:
+        try:
+            msg = await bot.send_message(
+                chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode,
+                reply_markup=markup, disable_web_page_preview=True,
+            )
+            return msg.message_id
+        except TelegramBadRequest as e:
+            logging.warning(f"[FREELANCE] Telegram отклонил формат заказа {o.url}: {e}")
+            last_exc = e
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _set_order_status(order_id: int, status: str) -> None:
+    """Статус заказа в БД; если записи ещё нет (сбой записи после отправки), статус
+    запоминается в памяти, и finish_cycle запишет его вместо «sent»."""
+    if await asyncio.to_thread(freelance_set_status, order_id, status):
+        return
+    if await asyncio.to_thread(mark_sent_status, order_id, status):
+        return
+    # запись могла появиться между двумя проверками
+    await asyncio.to_thread(freelance_set_status, order_id, status)
+
+
+async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     """Отправляет заказы цикла и сразу сохраняет каждый успешно отправленный.
 
-    Ошибки делятся на два класса:
-      • «битый» заказ (TelegramBadRequest, ошибка форматирования) — обработан,
-        повторять бессмысленно, last_id из-за него не откатывается;
-      • сетевой сбой / лимиты Telegram — retry: заказ подберётся снова.
+    Ни один заказ не теряется: ошибка форматирования или отказ Telegram приводят к
+    запасному формату (обычный текст), а если и он не прошёл, как и сетевой сбой
+    или лимиты Telegram, - к retry (статус pending, повтор в следующем цикле).
     """
     ranked = sorted(res.to_send, key=_sort_key_for_cap, reverse=True)
     chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=lambda sc: sc.order.order_id)
     extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
-    sent_ok, retry, bad = [], [], []
+    # progress заполняется по ходу: при неожиданном сбое вызывающий знает, что уже ушло
+    progress = progress if progress is not None else {}
+    sent_ok = progress.setdefault("sent", [])
+    retry = progress.setdefault("retry", [])
+    skipped = progress.setdefault("skipped", [])
     flood = False
     for sc in chosen:
         if flood:
             retry.append(sc)
             continue
         try:
-            text = format_order(sc)
-            markup = _order_kb(sc.order.url)
-        except Exception:
-            logging.exception(f"[FREELANCE] ошибка форматирования {sc.order.url}")
-            bad.append(sc)
-            continue
-        try:
-            await bot.send_message(
-                chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
-                reply_markup=markup, disable_web_page_preview=True,
-            )
-        except TelegramBadRequest:
-            logging.exception(f"[FREELANCE] Telegram отклонил заказ {sc.order.url}")
-            bad.append(sc)
-            continue
+            message_id = await _send_order(sc)
         except TelegramRetryAfter as e:
             logging.warning(f"[FREELANCE] flood control, ждём {e.retry_after} с")
             await asyncio.sleep(min(e.retry_after, 30))
@@ -336,33 +382,52 @@ async def _deliver_freelance(res) -> dict:
             retry.append(sc)
             continue
         sent_ok.append(sc)
-        try:
-            await asyncio.to_thread(save_order, sc, True)
-        except Exception:
-            logging.exception(f"[FREELANCE] не удалось сохранить отправленный {sc.order.url}")
+        # запись с повторами; при неудаче заказ остаётся в памяти (_sent_ids) и
+        # дописывается в finish_cycle, поэтому дубля не будет
+        saved = await asyncio.to_thread(save_sent, sc, message_id)
+        if not saved:
+            logging.error(f"[FREELANCE] отправленный заказ не записан в БД: {sc.order.url}")
         await asyncio.sleep(0.5)
 
-    skipped = []
     if extra:
-        lines = [f"➕ Ещё {len(extra)} подходящих заказов (не показаны из-за лимита):"]
-        for sc in sorted(extra, key=_sort_key_for_cap, reverse=True)[:25]:
+        extra_sorted = sorted(extra, key=_sort_key_for_cap, reverse=True)
+        header = f"➕ Ещё {len(extra)} подходящих заказов (не показаны из-за лимита):"
+        items = []
+        for sc in extra_sorted:
             fit = f"{sc.fit}/10 " if sc.fit is not None else ""
-            lines.append(
-                f'• {fit}<a href="{html.escape(sc.order.url)}">'
-                f"{html.escape(sc.order.title[:80])}</a>"
-            )
-        try:
-            for chunk in _split_messages("\n".join(lines)):
+            items.append((sc, (
+                f'• {fit}<a href="{html.escape(sc.order.url or "")}">'
+                f"{html.escape((sc.order.title or '')[:80])}</a>"
+            )))
+        # Все заказы сводки, порезанные на сообщения по лимиту; обработанными
+        # отмечаем только реально показанные
+        groups, cur, cur_len = [], [], len(header)
+        for sc, line in items:
+            if cur and cur_len + len(line) + 1 > MSG_CHAR_LIMIT:
+                groups.append(cur)
+                cur, cur_len = [], 0
+            cur.append((sc, line))
+            cur_len += len(line) + 1
+        if cur:
+            groups.append(cur)
+        failed_from = None
+        for gi, group in enumerate(groups):
+            text = "\n".join(([header] if gi == 0 else []) + [line for _, line in group])
+            try:
                 await bot.send_message(
-                    chat_id=MY_CHAT_ID, text=chunk, parse_mode="HTML",
+                    chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
-            skipped = extra
-        except Exception:
-            # Сводка не ушла: заказы не теряем, last_id откатится до них
-            logging.exception("[FREELANCE] Не удалось отправить сводку")
-            retry.extend(extra)
-    return {"sent": sent_ok, "skipped": skipped, "retry": retry, "bad": bad}
+                skipped.extend(sc for sc, _ in group)
+            except Exception:
+                logging.exception("[FREELANCE] Не удалось отправить сводку")
+                failed_from = gi
+                break
+        if failed_from is not None:
+            # непоказанные заказы не теряем: pending, повтор в следующем цикле
+            for group in groups[failed_from:]:
+                retry.extend(sc for sc, _ in group)
+    return {"sent": sent_ok, "skipped": skipped, "retry": retry}
 
 
 async def check_freelance(manual: bool = False) -> dict | None:
@@ -392,16 +457,60 @@ async def check_freelance(manual: bool = False) -> dict | None:
         if res.error:
             return {"error": res.error, "sent": 0, "extra": 0}
 
-        d = await _deliver_freelance(res)
+        progress: dict = {}
+        try:
+            d = await _deliver_freelance(res, progress)
+        except Exception:
+            # неожиданный сбой: все неотправленные уходят в pending, а не теряются
+            logging.exception("[FREELANCE] _deliver_freelance упал")
+            handled = {sc.order.order_id for key in ("sent", "skipped", "retry")
+                       for sc in progress.get(key, [])}
+            d = {
+                "sent": progress.get("sent", []),
+                "skipped": progress.get("skipped", []),
+                "retry": progress.get("retry", []) + [
+                    sc for sc in res.to_send if sc.order.order_id not in handled],
+            }
         try:
             await asyncio.to_thread(
-                finish_cycle, res, d["sent"], d["skipped"], d["retry"], d["bad"]
+                finish_cycle, res, d["sent"], d["skipped"], d["retry"]
             )
         except Exception:
             logging.exception("[FREELANCE] finish_cycle упал")
             return {"error": "не удалось сохранить итог цикла", "sent": len(d["sent"]), "extra": 0}
         return {"error": "", "sent": len(d["sent"]), "extra": len(d["skipped"]),
-                "failed": len(d["retry"]), "bad": len(d["bad"]), "scanned": res.raw_count}
+                "failed": len(d["retry"]), "scanned": res.raw_count}
+
+
+def _ai_state_text(st: dict) -> str:
+    """Строка статуса AI: активная Gemini-модель, запасные, Yandex, последняя оценка."""
+    if not st["enabled"]:
+        return "выключен (нет ключей), заказы идут без оценки"
+    parts = []
+    if st["gemini"]:
+        models = st["models"]
+        if models:
+            parts.append(f"Gemini: {html.escape(models[0])} (запасные: {len(models) - 1})")
+        else:
+            parts.append("Gemini: все модели недоступны")
+        if st["paused"]:
+            paused = ", ".join(f"{html.escape(m)} {sec} с" for m, sec in st["paused"].items())
+            parts.append(f"на паузе (лимит): {paused}")
+    if st["yandex"]:
+        parts.append("+ Yandex lite")
+    text = "; ".join(parts)
+    last = st["last_ok"]
+    if last:
+        try:
+            at = datetime.fromisoformat(last["at"]).astimezone(MSK).strftime("%d.%m %H:%M")
+        except ValueError:
+            at = last["at"]
+        text += f"\nПоследняя оценка: {at} ({html.escape(last['model'])})"
+    else:
+        text += "\nПоследняя оценка: ещё не было"
+    if st["config_error"]:
+        text += f"\n🔴 Ошибка настройки: {html.escape(st['config_error'])}"
+    return text
 
 
 def _freelance_status_text() -> str:
@@ -415,7 +524,7 @@ def _freelance_status_text() -> str:
             last_ok = datetime.fromisoformat(last_ok).astimezone(MSK).strftime("%d.%m %H:%M")
         except ValueError:
             pass
-    ai_state = "YandexGPT" if ai_scorer.is_enabled() else "выключен (нет ключей), заказы идут без оценки"
+    ai_state = _ai_state_text(ai_scorer.status())
     lines = [
         "📊 <b>Фриланс: статус</b>\n",
         f"Подписка: {'включена' if _freelance_subscribed_sync() else 'на паузе'}",
@@ -484,6 +593,92 @@ async def cb_fl_check(call: CallbackQuery):
         logging.exception("[FREELANCE] fl_check")
         text = "⚠️ Проверка завершилась ошибкой, подробности в логе."
     await call.message.answer(text, parse_mode="HTML")
+
+
+def _order_id_from(data: str) -> int | None:
+    try:
+        return int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+@dp.callback_query(F.data.startswith("fl_take:"))
+async def cb_fl_take(call: CallbackQuery):
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await _set_order_status(order_id, "taken")
+        await call.answer("Отмечено: в работе")
+        # url берём из кнопки «Открыть» исходного сообщения
+        url = None
+        markup = call.message.reply_markup if call.message else None
+        for row in (markup.inline_keyboard if markup else []):
+            for btn in row:
+                if btn.url:
+                    url = btn.url
+        await call.message.edit_reply_markup(reply_markup=_order_kb(order_id, url, taken=True))
+    except Exception:
+        logging.exception("[FREELANCE] fl_take")
+        try:
+            await call.answer("Ошибка, см. лог")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("fl_skip:"))
+async def cb_fl_skip(call: CallbackQuery):
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await _set_order_status(order_id, "dismissed")
+        await call.answer("Убрано")
+        try:
+            await call.message.delete()
+        except TelegramBadRequest:
+            # сообщение слишком старое для удаления: хотя бы уберём кнопки
+            await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        logging.exception("[FREELANCE] fl_skip")
+        try:
+            await call.answer("Ошибка, см. лог")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("fl_noop:"))
+async def cb_fl_noop(call: CallbackQuery):
+    await call.answer("Заказ уже в работе")
+
+
+async def cleanup_freelance_messages():
+    """Раз в час удаляет из чата сообщения с заказами старше TTL (кроме «Взял»)."""
+    try:
+        rows = await asyncio.to_thread(freelance_expired_messages, FREELANCE_MESSAGE_TTL_HOURS)
+        deleted = 0
+        for row in rows:
+            try:
+                await bot.delete_message(chat_id=MY_CHAT_ID, message_id=row["message_id"])
+                deleted += 1
+            except TelegramBadRequest as e:
+                # «message to delete not found», «can't be deleted» (старше 48 ч): уже не нужно
+                logging.info(f"[FREELANCE] сообщение {row['message_id']} не удалено: {e}")
+            except TelegramRetryAfter as e:
+                logging.warning(f"[FREELANCE] flood control при очистке, ждём {e.retry_after} с")
+                await asyncio.sleep(min(e.retry_after, 30))
+                break  # остальные - в следующий час
+            except Exception:
+                logging.exception(f"[FREELANCE] не удалось удалить сообщение {row['message_id']}")
+                continue  # статус не меняем: повторим в следующий час
+            await asyncio.to_thread(freelance_set_status, row["order_id"], "expired")
+            await asyncio.sleep(0.1)
+        if rows:
+            logging.info(f"[FREELANCE] очистка: найдено {len(rows)}, удалено {deleted}")
+    except Exception:
+        logging.exception("[FREELANCE] cleanup_freelance_messages")
 
 
 @dp.callback_query(F.data == "fl_toggle")
@@ -611,9 +806,10 @@ async def cmd_status(message: Message):
         f"🆕 Фильтр свежести: не старше {MAX_VACANCY_AGE_DAYS} дней"
     )
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
-    if monitor.streak:
+    parsers = {k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES}
+    if parsers:
         lines.append("\n<b>Парсеры:</b>")
-        for source, streak in sorted(monitor.streak.items()):
+        for source, streak in sorted(parsers.items()):
             if streak == 0:
                 lines.append(f"🟢 {source}: работает")
             else:
@@ -744,6 +940,11 @@ async def main():
         check_freelance,
         "interval",
         minutes=FREELANCE_INTERVAL_MINUTES,
+    )
+    scheduler.add_job(
+        cleanup_freelance_messages,
+        "interval",
+        hours=1,
     )
     scheduler.start()
     logging.info(f"Планировщик запущен: проверка каждые {CHECK_INTERVAL_MINUTES} мин")

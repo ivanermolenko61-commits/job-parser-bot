@@ -8,6 +8,7 @@
                     даты публикации (DreamJob) не пришла повторно после того,
                     как её удалили из vacancies, а на сайте она всё ещё висит.
 """
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -34,7 +35,8 @@ def _connect():
     Обычный `with sqlite3.connect(...)` только коммитит транзакцию,
     но НЕ закрывает соединение — поэтому оборачиваем сами.
     """
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: джобы вакансий и фриланса пишут параллельно — ждём, а не падаем
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -109,7 +111,12 @@ def is_fresh(published_at: str, max_age_days: int) -> bool:
 
 def init_db() -> None:
     """Создаёт таблицу, если её нет, и делает миграции."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with _connect() as conn:
+        # WAL: чтение не блокирует запись (две джобы работают параллельно)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS vacancies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,8 +349,23 @@ def _init_freelance(conn) -> None:
             sent_at TIMESTAMP
         )
     """)
+    # Миграция: новые колонки добавляем в существующую БД без потери данных
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(freelance_orders)")}
+    if "attempts" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN attempts INTEGER DEFAULT 0")
+    if "message_id" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN message_id INTEGER")
+    if "status" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN status TEXT")
+        conn.execute(
+            "UPDATE freelance_orders SET status = "
+            "CASE WHEN sent_at IS NOT NULL THEN 'sent' ELSE 'rejected' END"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_status ON freelance_orders(status)"
     )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS kv (
@@ -385,15 +407,21 @@ def freelance_seen_ids(order_ids: list[int]) -> set[int]:
     return found
 
 
-def freelance_dup_keys(keys: list[str], days: int) -> set[str]:
+def freelance_dup_keys(keys: list[str], days: int, sent_only: bool = False,
+                       exclude_ids: list[int] | None = None) -> set[str]:
     """Какие из dedup_key уже встречались за последние N дней.
 
     Учитываются только отправленные и оценённые заказы: запись-дубль
     (без sent_at и без fit) не должна «съедать» оригинал.
+    sent_only - только реально отправленные (sent_at задан); exclude_ids -
+    не считать записи с этими order_id (для проверки pending-заказов).
     """
     keys = [k for k in keys if k]
     if not keys:
         return set()
+    exclude = list(exclude_ids or [])
+    cond = "sent_at IS NOT NULL" if sent_only else "(sent_at IS NOT NULL OR fit IS NOT NULL)"
+    excl_sql = f" AND order_id NOT IN ({','.join('?' * len(exclude))})" if exclude else ""
     found: set[str] = set()
     with _connect() as conn:
         for i in range(0, len(keys), 500):
@@ -402,8 +430,8 @@ def freelance_dup_keys(keys: list[str], days: int) -> set[str]:
             rows = conn.execute(
                 f"SELECT DISTINCT dedup_key FROM freelance_orders "
                 f"WHERE dedup_key IN ({marks}) AND seen_at >= datetime('now', ?) "
-                f"AND (sent_at IS NOT NULL OR fit IS NOT NULL)",
-                [*chunk, f"-{days} days"],
+                f"AND {cond}{excl_sql}",
+                [*chunk, f"-{days} days", *exclude],
             ).fetchall()
             found.update(r["dedup_key"] for r in rows)
     return found
@@ -419,35 +447,115 @@ def freelance_save(
     dedup: str,
     fit: int | None,
     ai_json: str,
-    sent: bool,
+    status: str,
+    attempts: int = 0,
+    message_id: int | None = None,
 ) -> None:
-    """Запоминает заказ. sent=False — просмотрен, но не отправлен (низкий fit, лимит)."""
+    """Запоминает заказ (upsert).
+
+    status: pending (ждёт оценки/отправки), sent, taken, dismissed, expired,
+    rejected (просмотрен, но не отправлен: низкий fit, дубль, сводка).
+    Уже закрытый пользователем/очисткой статус (taken/dismissed/expired) повторной
+    записью не затирается. message_id и sent_at, однажды записанные, сохраняются.
+    """
     with _connect() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO freelance_orders
+            INSERT INTO freelance_orders
                 (order_id, site, title, url, price_text, fit, ai_json,
-                 published_at, dedup_key, sent_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
+                 published_at, dedup_key, status, attempts, message_id, sent_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? IN ('sent', 'taken', 'dismissed')
+                         THEN CURRENT_TIMESTAMP ELSE NULL END)
+            ON CONFLICT(order_id) DO UPDATE SET
+                site = excluded.site, title = excluded.title, url = excluded.url,
+                price_text = excluded.price_text,
+                fit = COALESCE(excluded.fit, freelance_orders.fit),
+                ai_json = CASE WHEN excluded.ai_json != '' THEN excluded.ai_json
+                               ELSE freelance_orders.ai_json END,
+                published_at = excluded.published_at,
+                dedup_key = excluded.dedup_key,
+                attempts = excluded.attempts,
+                message_id = COALESCE(excluded.message_id, freelance_orders.message_id),
+                sent_at = COALESCE(freelance_orders.sent_at, excluded.sent_at),
+                status = CASE
+                    WHEN freelance_orders.status IN ('taken', 'dismissed', 'expired')
+                         AND excluded.status IN ('sent', 'pending', 'rejected')
+                    THEN freelance_orders.status
+                    ELSE excluded.status END
             """,
             (order_id, site, title, url, price_text, fit, ai_json,
-             published_at, dedup, 1 if sent else 0),
+             published_at, dedup, status, attempts, message_id, status),
         )
 
 
-def freelance_recent(limit: int = 10) -> list[dict]:
-    """Последние отправленные заказы."""
+def freelance_set_status(order_id: int, status: str) -> bool:
+    """Меняет статус заказа. True, если заказ найден."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE freelance_orders SET status = ? WHERE order_id = ?",
+            (status, order_id),
+        )
+        return cur.rowcount > 0
+
+
+def freelance_set_message(order_id: int, message_id: int) -> None:
+    """Запоминает id сообщения Telegram с заказом (для автоудаления)."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE freelance_orders SET message_id = ? WHERE order_id = ?",
+            (message_id, order_id),
+        )
+
+
+def freelance_expired_messages(ttl_hours: int, limit: int = 200) -> list[dict]:
+    """Отправленные (status='sent', не «Взял») сообщения старше ttl_hours — под удаление."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT order_id, message_id
+            FROM freelance_orders
+            WHERE status = 'sent' AND message_id IS NOT NULL
+              AND sent_at < datetime('now', ?)
+            ORDER BY sent_at
+            LIMIT ?
+            """,
+            (f"-{ttl_hours} hours", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_pending(limit: int = 100) -> list[dict]:
+    """Заказы со статусом pending (не оценены или не отправлены), новые первыми."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT order_id, attempts, ai_json, published_at, dedup_key
+            FROM freelance_orders
+            WHERE status = 'pending'
+            ORDER BY order_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_recent(limit: int = 10, ttl_hours: int | None = None) -> list[dict]:
+    """Последние отправленные заказы, сообщения которых ещё не удалены по TTL."""
+    if ttl_hours is None:
+        from config import FREELANCE_MESSAGE_TTL_HOURS
+        ttl_hours = FREELANCE_MESSAGE_TTL_HOURS
     with _connect() as conn:
         rows = conn.execute(
             """
             SELECT order_id, site, title, url, price_text, fit, published_at
             FROM freelance_orders
-            WHERE sent_at IS NOT NULL
+            WHERE status = 'sent' AND sent_at >= datetime('now', ?)
             ORDER BY order_id DESC
             LIMIT ?
             """,
-            (limit,),
+            (f"-{ttl_hours} hours", limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
