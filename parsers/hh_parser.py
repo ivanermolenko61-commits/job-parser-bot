@@ -1,7 +1,8 @@
 """Парсер вакансий с hh.ru через Playwright.
 
-Сайт — динамический (SPA на React), requests не работает. Требуется
-Playwright для рендеринга JS.
+Сайт — SPA на React, requests не работает. Карточки при этом
+приходят уже в HTML, поэтому страница грузится в Chromium с выключенным JS;
+если так карточек нет — тот же запрос повторяется с JS (прежний способ).
 
 Публичный API hh.ru закрыт с декабря 2025 — поэтому парсим HTML.
 Дату публикации HH анонимно не отдаёт, поэтому поле published_at
@@ -9,6 +10,7 @@ Playwright для рендеринга JS.
 запроса — HH сам отсекает вакансии старше указанного числа дней.
 
 Оптимизация памяти (важно: лимит контейнера — 1 ГБ RAM):
+  • JS выключен (пик ~300 МБ вместо ~770 МБ), с JS — только запасной путь.
   • Блокировка картинок/шрифтов/медиа/трекеров.
   • Одна страница переиспользуется.
   • Аргументы Chromium для Docker + ограничение V8 heap и процессов.
@@ -45,8 +47,13 @@ class HHParser(BaseParser):
         "--disable-sync",
         "--js-flags=--max-old-space-size=256",
         "--renderer-process-limit=1",
-        "--disable-features=site-per-process",
+        # Один флаг: Chromium учитывает только последний --disable-features
+        "--disable-features=site-per-process,BackForwardCache,Translate,OptimizationHints,MediaRouter",
+        "--mute-audio",
     ]
+
+    # Селектор карточки: один и для выборки из браузера, и для разбора в _parse_html
+    CARD_SELECTOR = '[data-qa="vacancy-serp__vacancy"]'
 
     # Хосты-трекеры и реклама — режем, чтобы не грузить их JS.
     BLOCKED_HOSTS = (
@@ -165,7 +172,7 @@ class HHParser(BaseParser):
 
     def _parse_html(self, html: str) -> list[Vacancy]:
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select('[data-qa="vacancy-serp__vacancy"]')
+        cards = soup.select(self.CARD_SELECTOR)
         self.cards_seen += len(cards)  # для health-мониторинга
         logging.info(f"[HH] Найдено карточек: {len(cards)}")
 
@@ -178,6 +185,49 @@ class HHParser(BaseParser):
         logging.info(f"[HH] Прошло фильтры: {len(vacancies)}")
         return vacancies
 
+    def _new_page(self, browser, js: bool):
+        """Страница в своём контексте: с JS или без (JS — главный потребитель RAM)."""
+        context = browser.new_context(java_script_enabled=js)
+        page = context.new_page()
+        page.set_default_timeout(30000)
+        page.set_extra_http_headers({
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        })
+        page.route("**/*", self._route_handler)
+        return page
+
+    @staticmethod
+    def _close_page(page) -> None:
+        if page is None:
+            return
+        try:
+            page.context.close()
+        except Exception:
+            pass
+
+    def _cards_html(self, page) -> list[str]:
+        # Только карточки, а не весь документ (hh отдаёт 1-3 МБ со встроенным JSON)
+        return page.eval_on_selector_all(
+            self.CARD_SELECTOR, "els => els.map(e => e.outerHTML)"
+        )
+
+    def _cards_without_js(self, page, url: str) -> list[str]:
+        """hh отдаёт карточки сразу в HTML: без JS рендерер берёт ~80 МБ вместо ~500.
+
+        Пустой список — значит без JS не вышло (капча, сайт стал требовать JS);
+        тогда вызывающий повторяет запрос прежним способом, с JS.
+        Таймаут загрузки пробрасывается: как и раньше, такой запрос пропускается
+        сразу, без второй минутной попытки (иначе hh не уложится в свой таймаут).
+        """
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return self._cards_html(page)
+        except PlaywrightTimeoutError:
+            raise
+        except Exception as e:
+            logging.info(f"[HH] Без JS не получилось ({type(e).__name__}), повтор с JS")
+            return []
+
     def fetch(self) -> list[Vacancy]:
         seen_ids = set()
         all_vacancies = []
@@ -189,12 +239,7 @@ class HHParser(BaseParser):
             )
             page = None
             try:
-                page = browser.new_page()
-                page.set_default_timeout(30000)
-                page.set_extra_http_headers({
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                })
-                page.route("**/*", self._route_handler)
+                page = self._new_page(browser, js=False)
 
                 for query in PLAYWRIGHT_QUERIES:
                     logging.info(f"[HH] Запрос: '{query}'")
@@ -212,23 +257,38 @@ class HHParser(BaseParser):
                         url = self.BASE_URL + params
 
                         try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                            cards_html = self._cards_without_js(page, url)
                         except PlaywrightTimeoutError:
                             logging.warning(f"[HH] Таймаут для '{query}' стр. {page_num}")
                             break
+                        if not cards_html:
+                            # Запасной путь — ровно прежняя логика, со страницей с JS.
+                            # Страница закрывается сразу, чтобы рендерер с JS не висел в памяти.
+                            js_page = self._new_page(browser, js=True)
+                            try:
+                                try:
+                                    js_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                                except PlaywrightTimeoutError:
+                                    logging.warning(f"[HH] Таймаут для '{query}' стр. {page_num}")
+                                    break
 
-                        try:
-                            page.wait_for_selector(
-                                '[data-qa="vacancy-serp__vacancy"]',
-                                timeout=20000,
-                            )
-                        except PlaywrightTimeoutError:
-                            logging.info(
-                                f"[HH] Нет карточек для '{query}' стр. {page_num}"
-                            )
-                            break
+                                try:
+                                    js_page.wait_for_selector(
+                                        self.CARD_SELECTOR,
+                                        timeout=20000,
+                                    )
+                                except PlaywrightTimeoutError:
+                                    logging.info(
+                                        f"[HH] Нет карточек для '{query}' стр. {page_num}"
+                                    )
+                                    break
 
-                        html = page.content()
+                                cards_html = self._cards_html(js_page)
+                            finally:
+                                self._close_page(js_page)
+
+                        html = "<div>" + "".join(cards_html) + "</div>"
+                        del cards_html
                         vacancies = self._parse_html(html)
 
                         if not vacancies:
@@ -245,11 +305,7 @@ class HHParser(BaseParser):
                     time.sleep(REQUEST_DELAY)
 
             finally:
-                if page is not None:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                self._close_page(page)
                 try:
                     browser.close()
                 except Exception:

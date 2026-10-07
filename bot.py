@@ -55,6 +55,7 @@ from freelance.pipeline import (
     prepare_cycle,
     save_sent,
 )
+import memwatch
 from health import monitor
 from parser_manager import fetch_new_vacancies, mark_vacancies_sent
 
@@ -80,7 +81,7 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 # Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
-FREELANCE_HEALTH_SOURCES = {"alot", "gemini"}
+FREELANCE_HEALTH_SOURCES = {"alot", "gemini", "memory"}  # memory - не парсер вакансий
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -213,7 +214,7 @@ async def check_vacancies() -> bool:
             # Запасной предохранитель: даже если что-то зависло мимо таймаутов
             # парсеров, блокировка проверки освободится
             new_vacancies = await asyncio.wait_for(
-                asyncio.to_thread(fetch_new_vacancies), timeout=2400  # > суммы таймаутов парсеров (~1700 с); поток при этом не прерывается
+                asyncio.to_thread(fetch_new_vacancies), timeout=2400  # > суммы таймаутов парсеров (~2000 с); поток при этом не прерывается
             )
         except Exception:
             logging.exception("[BOT] Ошибка при получении вакансий")
@@ -432,6 +433,20 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
 
 async def check_freelance(manual: bool = False) -> dict | None:
     """Проверка фриланс-заказов. None — пропущена (пауза или уже идёт)."""
+    result = None
+    try:
+        result = await _check_freelance_impl(manual)
+        return result
+    finally:
+        if result is not None:  # цикл реально выполнялся
+            try:
+                await asyncio.to_thread(memwatch.trim)
+                memwatch.log_mem("фриланс")
+            except Exception:
+                logging.exception("[MEM] trim после фриланса не удался")
+
+
+async def _check_freelance_impl(manual: bool = False) -> dict | None:
     if not manual and not await _freelance_subscribed():
         logging.info("[FREELANCE] пауза, пропуск")
         return None
@@ -806,7 +821,10 @@ async def cmd_status(message: Message):
         f"🆕 Фильтр свежести: не старше {MAX_VACANCY_AGE_DAYS} дней"
     )
     lines.append(f"📬 Подписка: {'включена' if subscribed else 'выключена'}")
-    parsers = {k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES}
+    mem = memwatch.mem_used_mb()
+    if mem is not None:
+        lines.append(f"🧠 Память: {mem} МБ из {memwatch.MEM_LIMIT_MB} (пик {memwatch.peak_mb()})")
+    parsers ={k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES}
     if parsers:
         lines.append("\n<b>Парсеры:</b>")
         for source, streak in sorted(parsers.items()):

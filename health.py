@@ -29,24 +29,35 @@ class HealthMonitor:
         self._lock = threading.Lock()
 
     def record(self, source: str, cards_seen: int, error: Exception | None = None,
-               label: str | None = None, immediate: bool = False) -> None:
+               label: str | None = None, immediate: bool = False,
+               reason: str | None = None, recovered_text: str | None = None,
+               bad_text: str | None = None) -> None:
         """Записывает итог прогона одного источника.
 
         label — человекочитаемая подпись для оповещения (иначе «Парсер <source>»).
         immediate — сообщить о поломке сразу, не дожидаясь threshold (ошибка конфигурации).
+        reason — своя причина вместо стандартной («0 карточек на странице»).
+        recovered_text — свой заголовок восстановления вместо «снова работает» (нужен label).
+        bad_text — свой заголовок поломки вместо «не работает», без счётчика проверок (нужен label).
         """
         bad = error is not None or cards_seen == 0
         with self._lock:
             prev = self.streak.get(source, 0)
 
             if bad:
-                reason = f"ошибка: {type(error).__name__}: {error}" if error else "0 карточек на странице"
+                if reason is None:
+                    reason = f"ошибка: {type(error).__name__}: {error}" if error else "0 карточек на странице"
                 self.last_reason[source] = reason
                 self.streak[source] = prev + 1
                 logging.warning(f"[HEALTH] {source}: плохой прогон #{prev + 1} ({reason})")
                 if source not in self._alerted and (immediate or self.streak[source] >= self.threshold):
                     self._alerted.add(source)
-                    if label:
+                    if label and bad_text:
+                        self._pending.append(
+                            f"⚠️ <b>{html.escape(label)}: {html.escape(bad_text)}</b>\n"
+                            f"{html.escape(reason)}."
+                        )
+                    elif label:
                         self._pending.append(
                             f"⚠️ <b>{html.escape(label)}: не работает</b>\n"
                             f"Неудачных проверок подряд: {self.streak[source]}. "
@@ -64,7 +75,7 @@ class HealthMonitor:
                     self._alerted.discard(source)
                     if label:
                         self._pending.append(
-                            f"✅ <b>{html.escape(label)}: снова работает</b>\n"
+                            f"✅ <b>{html.escape(label)}: {html.escape(recovered_text or 'снова работает')}</b>\n"
                             f"(сбой длился {prev} проверок)."
                         )
                     else:

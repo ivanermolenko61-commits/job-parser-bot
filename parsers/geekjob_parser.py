@@ -47,8 +47,13 @@ class GeekJobParser(BaseParser):
         "--disable-sync",
         "--js-flags=--max-old-space-size=256",
         "--renderer-process-limit=1",
-        "--disable-features=site-per-process",
+        # Один флаг: Chromium учитывает только последний --disable-features
+        "--disable-features=site-per-process,BackForwardCache,Translate,OptimizationHints,MediaRouter",
+        "--mute-audio",
     ]
+
+    # Селектор карточки: один и для выборки из браузера, и для разбора в _parse_html
+    CARD_SELECTOR = ".collection-item.avatar"
 
     # Хосты-трекеры и реклама — режем, чтобы не грузить их JS.
     BLOCKED_HOSTS = (
@@ -159,7 +164,7 @@ class GeekJobParser(BaseParser):
 
     def _parse_html(self, html: str) -> list[Vacancy]:
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select(".collection-item.avatar")
+        cards = soup.select(self.CARD_SELECTOR)
         self.cards_seen += len(cards)  # для health-мониторинга
         logging.info(f"[GEEKJOB] Найдено карточек: {len(cards)}")
 
@@ -198,12 +203,17 @@ class GeekJobParser(BaseParser):
                         continue
 
                     try:
-                        page.wait_for_selector(".collection-item.avatar", timeout=10000)
+                        page.wait_for_selector(self.CARD_SELECTOR, timeout=10000)
                     except PlaywrightTimeoutError:
                         logging.info(f"[GEEKJOB] Нет карточек для '{query}'")
                         continue
 
-                    html = page.content()
+                    # Только карточки, а не весь документ
+                    cards_html = page.eval_on_selector_all(
+                        self.CARD_SELECTOR, "els => els.map(e => e.outerHTML)"
+                    )
+                    html = "<div>" + "".join(cards_html) + "</div>"
+                    del cards_html
                     vacancies = self._parse_html(html)
 
                     for v in vacancies:
