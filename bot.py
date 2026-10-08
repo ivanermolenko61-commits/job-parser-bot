@@ -1,6 +1,7 @@
 """Telegram-бот: мониторинг вакансий Junior/стажёр по разработке."""
 import asyncio
 import html
+import json
 import logging
 import os
 from datetime import datetime
@@ -11,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -31,8 +33,10 @@ from config import (
 )
 from database import (
     cleanup_old,
+    freelance_deal_rows,
     freelance_expired_messages,
     freelance_recent,
+    freelance_set_deal_price,
     freelance_set_status,
     freelance_stats,
     get_recent_vacancies,
@@ -42,7 +46,7 @@ from database import (
     reset_db,
     stats,
 )
-from freelance import ai_scorer
+from freelance import ai_scorer, deal_wait, pricing
 from freelance.alot_client import site_name
 from freelance.pipeline import (
     LAST_ID_KEY,
@@ -285,6 +289,7 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=toggle, callback_data="fl_toggle"),
             InlineKeyboardButton(text="📊 Статус", callback_data="fl_status"),
         ],
+        [InlineKeyboardButton(text="📊 Точность цен", callback_data="fl_accuracy")],
     ])
 
 
@@ -621,6 +626,80 @@ def _order_id_from(data: str) -> int | None:
         return None
 
 
+# ожидания цены сделки после «Взял»: (chat_id, id вопроса) -> (order_id, время)
+_pending_deals: deal_wait.Pending = {}
+
+
+def _deal_answer_filter(message: Message):
+    """Ответ с ценой сделки (или /skip) на наш вопрос. Прочие сообщения и команды не трогаем."""
+    if not message.text or not _pending_deals:
+        return False
+    text = message.text.strip()
+    is_skip = text.split("@")[0].lower() == "/skip"
+    if not is_skip and deal_wait.parse_deal(text) is None:
+        return False
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else None
+    key = deal_wait.find(_pending_deals, message.chat.id, reply_id)
+    if key:
+        return {"deal_key": key}
+    if deal_wait.ambiguous(_pending_deals, message.chat.id, reply_id):
+        return {"deal_key": None}  # несколько вопросов: просим reply
+    return False
+
+
+@dp.message(F.text, _deal_answer_filter)
+async def msg_deal_price(message: Message, deal_key: tuple[int, int] | None):
+    if deal_key is None:
+        await message.answer("Ответьте (reply) на вопрос о нужном заказе.")
+        return
+    pending = _pending_deals.pop(deal_key, None)
+    if pending is None:
+        return
+    order_id = pending[0]
+    text = message.text.strip()
+    if text.startswith("/"):
+        await message.answer("Ок, цену не записываю.")
+        return
+    try:
+        ok = await asyncio.to_thread(freelance_set_deal_price, order_id, deal_wait.parse_deal(text))
+        await message.answer("✅ Записано." if ok else "⚠️ Заказ не найден в базе, цену записать не удалось.")
+    except Exception:
+        logging.exception("[FREELANCE] deal_price")
+        await message.answer("⚠️ Не удалось записать цену, подробности в логе.")
+
+
+def _accuracy_text() -> str:
+    rows = []
+    for r in freelance_deal_rows():
+        try:
+            ai = json.loads(r["ai_json"] or "{}")
+        except ValueError:
+            ai = {}
+        rows.append({"category": r["category"], "deal_price": r["deal_price"],
+                     "price_mid": ai.get("price_mid") if isinstance(ai, dict) else 0})
+    rep = pricing.accuracy_report(rows)
+    if not rep["total"]:
+        return ("📊 <b>Точность цен</b>\n\nСделок с ценой и расчётом пока нет. "
+                "Нажимайте «Взял» и отвечайте, за сколько договорились.")
+    lines = [f"📊 <b>Точность цен</b>\nСделок с расчётом: {rep['total']}\n"]
+    for cat, c in sorted(rep["by_category"].items(), key=lambda kv: -kv[1]["n"]):
+        direction = "завышаем" if c["bias"] > 0 else "занижаем"
+        lines.append(f"• {html.escape(cat)}: {c['n']} шт., ошибка {c['mape']:.0f}% "
+                     f"({direction} в среднем на {abs(c['bias']):.0f}%)")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "fl_accuracy")
+async def cb_fl_accuracy(call: CallbackQuery):
+    await call.answer()
+    try:
+        text = await asyncio.to_thread(_accuracy_text)
+        await call.message.answer(text, parse_mode="HTML")
+    except Exception:
+        logging.exception("[FREELANCE] fl_accuracy")
+        await call.message.answer("⚠️ Не удалось собрать статистику.")
+
+
 @dp.callback_query(F.data.startswith("fl_take:"))
 async def cb_fl_take(call: CallbackQuery):
     try:
@@ -638,6 +717,16 @@ async def cb_fl_take(call: CallbackQuery):
                 if btn.url:
                     url = btn.url
         await call.message.edit_reply_markup(reply_markup=_order_kb(order_id, url, taken=True))
+        # спрашиваем итоговую цену (для ставки и точности оценок)
+        deal_wait.purge(_pending_deals)
+        first = ((call.message.text or "").splitlines() or [""])[0]
+        title = html.escape(first.replace("🔥", "").replace("💼", "").strip()[:60])
+        question = await call.message.answer(
+            f"💰 За сколько договорились: {title}?\nОтветьте числом в ₽ или /skip",
+            parse_mode="HTML",
+            reply_markup=ForceReply(input_field_placeholder="Цена в рублях"),
+        )
+        deal_wait.add(_pending_deals, call.message.chat.id, question.message_id, order_id)
     except Exception:
         logging.exception("[FREELANCE] fl_take")
         try:
@@ -654,6 +743,7 @@ async def cb_fl_skip(call: CallbackQuery):
             await call.answer("Некорректная кнопка")
             return
         await _set_order_status(order_id, "dismissed")
+        deal_wait.drop_order(_pending_deals, order_id)
         await call.answer("Убрано")
         try:
             await call.message.delete()

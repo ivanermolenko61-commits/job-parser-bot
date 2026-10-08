@@ -8,18 +8,24 @@
                     даты публикации (DreamJob) не пришла повторно после того,
                     как её удалили из vacancies, а на сайте она всё ещё висит.
 """
+import json
 import os
 import re
 import sqlite3
+import statistics
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
-from config import DB_PATH, DUPLICATE_WINDOW_DAYS, SENT_HISTORY_DAYS
+from config import DB_PATH, DUPLICATE_WINDOW_DAYS, FREELANCE_MIN_FIT, SENT_HISTORY_DAYS
 from parsers.filters import dedup_key
 
 
 # Сколько дней хранить заказы фриланса
 FREELANCE_KEEP_DAYS = 14
+# Строки с бюджетом заказчика нужны для статистики рынка - хранятся дольше
+FREELANCE_MARKET_DAYS = 90
+# Строки со сделкой (deal_price) - для ставки и точности цен
+FREELANCE_DEAL_DAYS = 365
 
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
@@ -308,9 +314,25 @@ def cleanup_old(days: int = 5) -> int:
             "DELETE FROM sent_history WHERE sent_at < datetime('now', ?)",
             (f'-{SENT_HISTORY_DAYS} days',),
         )
+        # строки, оставленные ради статистики рынка, не хранят тяжёлый ai_json
         conn.execute(
-            "DELETE FROM freelance_orders WHERE seen_at < datetime('now', ?)",
+            """
+            UPDATE freelance_orders SET ai_json = ''
+            WHERE seen_at < datetime('now', ?)
+              AND COALESCE(budget, 0) > 0 AND COALESCE(deal_price, 0) <= 0
+              AND ai_json != ''
+            """,
             (f'-{FREELANCE_KEEP_DAYS} days',),
+        )
+        conn.execute(
+            """
+            DELETE FROM freelance_orders
+            WHERE seen_at < datetime('now', ?)
+              AND NOT (COALESCE(budget, 0) > 0 AND COALESCE(fit, 0) >= ? AND seen_at >= datetime('now', ?))
+              AND NOT (COALESCE(deal_price, 0) > 0 AND seen_at >= datetime('now', ?))
+            """,
+            (f'-{FREELANCE_KEEP_DAYS} days', FREELANCE_MIN_FIT, f'-{FREELANCE_MARKET_DAYS} days',
+             f'-{FREELANCE_DEAL_DAYS} days'),
         )
         conn.commit()
         return deleted
@@ -361,8 +383,15 @@ def _init_freelance(conn) -> None:
             "UPDATE freelance_orders SET status = "
             "CASE WHEN sent_at IS NOT NULL THEN 'sent' ELSE 'rejected' END"
         )
+    for col, ddl in (("category", "TEXT"), ("budget", "REAL"),
+                     ("hours", "REAL"), ("deal_price", "REAL")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_category ON freelance_orders(category)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fl_status ON freelance_orders(status)"
@@ -450,6 +479,9 @@ def freelance_save(
     status: str,
     attempts: int = 0,
     message_id: int | None = None,
+    category: str | None = None,
+    budget: float | None = None,
+    hours: float | None = None,
 ) -> None:
     """Запоминает заказ (upsert).
 
@@ -457,14 +489,16 @@ def freelance_save(
     rejected (просмотрен, но не отправлен: низкий fit, дубль, сводка).
     Уже закрытый пользователем/очисткой статус (taken/dismissed/expired) повторной
     записью не затирается. message_id и sent_at, однажды записанные, сохраняются.
+    category/budget/hours - для статистики рынка и ставки (None не затирает записанное).
     """
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO freelance_orders
                 (order_id, site, title, url, price_text, fit, ai_json,
-                 published_at, dedup_key, status, attempts, message_id, sent_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 published_at, dedup_key, status, attempts, message_id,
+                 category, budget, hours, sent_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     CASE WHEN ? IN ('sent', 'taken', 'dismissed')
                          THEN CURRENT_TIMESTAMP ELSE NULL END)
             ON CONFLICT(order_id) DO UPDATE SET
@@ -477,6 +511,9 @@ def freelance_save(
                 dedup_key = excluded.dedup_key,
                 attempts = excluded.attempts,
                 message_id = COALESCE(excluded.message_id, freelance_orders.message_id),
+                category = COALESCE(excluded.category, freelance_orders.category),
+                budget = COALESCE(excluded.budget, freelance_orders.budget),
+                hours = COALESCE(excluded.hours, freelance_orders.hours),
                 sent_at = COALESCE(freelance_orders.sent_at, excluded.sent_at),
                 status = CASE
                     WHEN freelance_orders.status IN ('taken', 'dismissed', 'expired')
@@ -485,7 +522,8 @@ def freelance_save(
                     ELSE excluded.status END
             """,
             (order_id, site, title, url, price_text, fit, ai_json,
-             published_at, dedup, status, attempts, message_id, status),
+             published_at, dedup, status, attempts, message_id,
+             category, budget, hours, status),
         )
 
 
@@ -497,6 +535,75 @@ def freelance_set_status(order_id: int, status: str) -> bool:
             (status, order_id),
         )
         return cur.rowcount > 0
+
+
+def freelance_set_deal_price(order_id: int, price: float | None) -> bool:
+    """Записывает цену, о которой договорились (None - сбросить). True, если заказ найден."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE freelance_orders SET deal_price = ? WHERE order_id = ?",
+            (price, order_id),
+        )
+        return cur.rowcount > 0
+
+
+def market_stats(category: str, days: int = 90, min_points: int = 5) -> dict | None:
+    """Рынок категории по реальным бюджетам заказчиков (budget > 0) за days дней:
+    {"median", "p25", "p75", "n"}. Берутся только заказы с fit >= FREELANCE_MIN_FIT и
+    одна строка на dedup_key (кросспосты не искажают медиану). Меньше min_points
+    точек - None (якорь не применяется)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT MAX(budget) AS budget FROM freelance_orders
+            WHERE category = ? AND budget > 0 AND seen_at >= datetime('now', ?)
+              AND fit >= ?
+            GROUP BY COALESCE(NULLIF(dedup_key, ''), CAST(order_id AS TEXT))
+            """,
+            (category, f"-{days} days", FREELANCE_MIN_FIT),
+        ).fetchall()
+    values = sorted(float(r["budget"]) for r in rows)
+    if len(values) < min_points:
+        return None
+    q = statistics.quantiles(values, n=4, method="inclusive")
+    return {"median": statistics.median(values), "p25": q[0], "p75": q[2], "n": len(values)}
+
+
+def freelance_deals(category: str) -> list[tuple[float, float, float]]:
+    """Сделки категории: [(deal_price, hours, risk)] - для ставки по вашим реальным ценам.
+    risk - коэффициент риска из ai_json (нет - 1.0). Сделки, где цена была ограничена
+    бюджетом заказчика (budget_capped), не берутся: они не отражают нашу ставку."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT deal_price, hours, ai_json FROM freelance_orders
+            WHERE category = ? AND deal_price > 0 AND hours > 0
+            """,
+            (category,),
+        ).fetchall()
+    result = []
+    for r in rows:
+        try:
+            ai = json.loads(r["ai_json"] or "{}")
+        except ValueError:
+            ai = {}
+        if not isinstance(ai, dict) or ai.get("budget_capped"):
+            continue
+        try:
+            risk = float(ai.get("price_risk") or 1.0)
+        except (TypeError, ValueError):
+            risk = 1.0
+        result.append((float(r["deal_price"]), float(r["hours"]), risk if risk > 0 else 1.0))
+    return result
+
+
+def freelance_deal_rows() -> list[dict]:
+    """Заказы со сделкой: category, deal_price, ai_json (для отчёта о точности цен)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT category, deal_price, ai_json FROM freelance_orders WHERE deal_price > 0"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def freelance_set_message(order_id: int, message_id: int) -> None:

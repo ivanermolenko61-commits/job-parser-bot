@@ -1,4 +1,5 @@
 """Настройки бота: ключевые слова, фильтры, интервал."""
+import math
 import os
 
 from dotenv import load_dotenv
@@ -82,3 +83,40 @@ FREELANCE_MAX_AGE_HOURS = 6
 FREELANCE_MESSAGE_TTL_HOURS = 24
 # Максимум сообщений за один цикл, остальное — сводкой «ещё N»
 FREELANCE_MAX_PER_CYCLE = 15
+
+# --- Цена фриланс-заказа (считает код, см. freelance/pricing.py) ---
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# Ставка за час работы с Claude Code, ₽
+def _rate_per_hour() -> float:
+    value = _env_float("FREELANCE_RATE_PER_HOUR", 1000)
+    return value if math.isfinite(value) and value > 0 else 1000.0
+
+
+def _price_spread() -> float:
+    value = _env_float("FREELANCE_PRICE_SPREAD", 0.15)
+    return value if 0 <= value <= 0.5 else 0.15
+
+
+def _min_price(cat: str, default: float) -> float:
+    value = _env_float(f"FREELANCE_MIN_PRICE_{cat.upper()}", default)
+    return value if math.isfinite(value) and value >= 0 else float(default)
+
+
+FREELANCE_RATE_PER_HOUR = _rate_per_hour()
+# Ширина вилки вокруг рекомендуемой цены (0.15 = ±15%)
+FREELANCE_PRICE_SPREAD = _price_spread()
+# Минимальная цена по категории, ₽ (ниже не работаем); env: FREELANCE_MIN_PRICE_<КАТЕГОРИЯ>
+_MIN_PRICE_DEFAULTS = {
+    "tg_bot": 3000, "parser": 1500, "landing": 3000, "site_fix": 1000, "wp": 1500,
+    "script": 1500, "integration": 2500, "sheets": 1500, "other": 1500,
+}
+FREELANCE_MIN_PRICE = {
+    cat: _min_price(cat, v)
+    for cat, v in _MIN_PRICE_DEFAULTS.items()
+}

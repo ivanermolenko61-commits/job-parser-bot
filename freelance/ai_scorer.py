@@ -77,7 +77,7 @@ _yandex_count = 0
 REFUSAL_RE = re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
 REQUEST_TIMEOUT_SEC = 30
 GEMMA_TIMEOUT_SEC = 90
-BODY_LIMIT = 1500
+BODY_LIMIT = 3000
 # Признаки неверного/недействительного ключа (а не проблемы конкретной модели)
 KEY_ERROR_MARKERS = ("API_KEY_INVALID", "API key not valid", "PERMISSION_DENIED",
                      "API key expired", "UNAUTHENTICATED")
@@ -110,17 +110,39 @@ SYSTEM_PROMPT = (
     "Оценивай саму задачу: нужно ли тут писать код или настраивать сайт. "
     "Ручная работа за компьютером (покупать, скачивать, регистрировать, "
     "кликать, заполнять) кодом не решается: fit 0-2.\n"
+    "Цену НЕ называй: её посчитает программа по твоим часам. Твоя задача - "
+    "разложить работу на компоненты и честно оценить часы работы С Claude Code "
+    "(не вручную). Ориентиры по часам: типовой Telegram-бот 3-6 ч; бот с "
+    "оплатой, админкой или интеграцией 6-12 ч; парсер одной страницы/сайта 1-3 ч; "
+    "парсер с авторизацией, капчей или многими сайтами 4-8 ч; лендинг 3-5 ч; "
+    "сайт-визитка 4-8 ч; правка или доработка существующего сайта 0.5-2 ч; "
+    "скрипт или автоматизация 1-3 ч; Google Таблицы/Apps Script 1-4 ч; "
+    "интеграция с API 2-6 ч. Компонент - отдельный кусок работы (например "
+    "«меню и запись», «выгрузка в Google Sheets», «деплой»), у каждого часы "
+    "от 0.25 до 40; компонентов не больше 8.\n"
+    "category - одно из: tg_bot, parser, landing, site_fix, wp, script, "
+    "integration, sheets, other.\n"
+    "clarity: «ясно» (ТЗ понятно), «частично» (есть пробелы), «размыто» (непонятно, что делать).\n"
+    "unknowns - неизвестные, которые могут увеличить объём (нет доступа к API, "
+    "нет макетов, чужой сервер); если их нет - пустой список.\n"
+    "client_budget_ok: true, если указанный бюджет адекватен объёму, false если "
+    "мал; null, если бюджет не указан.\n"
     "Ответь СТРОГО одним JSON-объектом без пояснений и без markdown:\n"
     '{"fit": целое число 0-10 по шкале выше, '
     '"difficulty": "легко" | "средне" | "сложно", '
-    '"hours": число (оценка часов работы с Claude Code), '
-    '"price_rub": "рекомендуемая цена для отклика, диапазон, например 8-12 тыс.", '
+    '"category": "tg_bot" | "parser" | "landing" | "site_fix" | "wp" | "script" | '
+    '"integration" | "sheets" | "other", '
+    '"components": [{"name": "короткое название", "hours": число}], '
+    '"unknowns": ["неизвестное"], '
+    '"clarity": "ясно" | "частично" | "размыто", '
+    '"client_budget_ok": true | false | null, '
     '"summary": "суть заказа в одну короткую строку", '
-    '"risks": "главный риск в одну короткую строку"}'
+    '"risks": "главный риск в одну короткую строку", '
+    '"questions": ["вопрос заказчику"]}'
 )
 
 YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-YANDEX_MAX_TOKENS = "800"
+YANDEX_MAX_TOKENS = "1000"
 
 
 def is_enabled() -> bool:
@@ -160,6 +182,60 @@ def _clean_float(value) -> float:
     return f if math.isfinite(f) else 0.0
 
 
+CATEGORIES = ("tg_bot", "parser", "landing", "site_fix", "wp", "script",
+              "integration", "sheets", "other")
+CLARITY_VALUES = ("ясно", "частично", "размыто")
+MIN_COMPONENT_HOURS = 0.25
+MAX_COMPONENT_HOURS = 40.0
+MAX_COMPONENTS = 8
+MAX_UNKNOWNS = 5
+MAX_QUESTIONS = 3
+
+
+def _parse_hours(value) -> float:
+    """Часы из числа или строки ("2-3", "2 ч", "1,5"): первое число, запятая как точка."""
+    if isinstance(value, str):
+        m = re.search(r"\d+(?:[.,]\d+)?", value)
+        if not m:
+            return 0.0
+        value = m.group(0).replace(",", ".")
+    return max(0.0, _clean_float(value))
+
+
+def _clean_components(raw) -> list[dict]:
+    """Компоненты работы: часы 0.25-40 (вне диапазона - в границу), не больше MAX_COMPONENTS."""
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        hours = _parse_hours(item.get("hours"))
+        name = str(item.get("name") or "").strip()[:80]
+        if hours <= 0 or not name:
+            continue
+        result.append({"name": name,
+                       "hours": round(min(MAX_COMPONENT_HOURS, max(MIN_COMPONENT_HOURS, hours)), 2)})
+        if len(result) >= MAX_COMPONENTS:
+            break
+    return result
+
+
+def _clean_str_list(raw, limit: int, max_len: int) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        text = str(item or "").strip()[:max_len]
+        if text:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def parse_ai_json(text: str) -> dict | None:
     """Достаёт JSON из ответа модели (с ```json-обёрткой, рассуждениями или лишним текстом)."""
     if not text:
@@ -192,17 +268,37 @@ def parse_ai_json(text: str) -> dict | None:
         fit = int(round(fit_raw))
     except (TypeError, ValueError):
         return None
-    hours = _clean_float(data.get("hours"))  # NaN/Infinity -> 0
     difficulty = str(data.get("difficulty") or "").strip().lower()
     if difficulty not in ("легко", "средне", "сложно"):
         difficulty = ""
+    category = str(data.get("category") or "").strip().lower()
+    if category not in CATEGORIES:
+        category = "other"
+    components = _clean_components(data.get("components"))
+    if components:
+        hours = sum(c["hours"] for c in components)  # часы считает код, не модель
+    else:
+        # старый формат; NaN/Infinity -> 0; потолок как у суммы компонентов
+        hours = min(_parse_hours(data.get("hours")), MAX_COMPONENT_HOURS * MAX_COMPONENTS)
+    clarity = str(data.get("clarity") or "").strip().lower()
+    if clarity not in CLARITY_VALUES:
+        clarity = ""
+    budget_ok = data.get("client_budget_ok")
+    if not isinstance(budget_ok, bool):
+        budget_ok = None
     return {
         "fit": max(0, min(10, fit)),
         "difficulty": difficulty,
         "hours": round(hours, 1),
-        "price_rub": str(data.get("price_rub") or "").strip()[:100],
+        "category": category,
+        "components": components,
+        "unknowns": _clean_str_list(data.get("unknowns"), MAX_UNKNOWNS, 120),
+        "clarity": clarity,
+        "client_budget_ok": budget_ok,
+        "price_rub": str(data.get("price_rub") or "").strip()[:100],  # только старые записи
         "summary": str(data.get("summary") or "").strip()[:300],
         "risks": str(data.get("risks") or "").strip()[:300],
+        "questions": _clean_str_list(data.get("questions"), MAX_QUESTIONS, 200),
     }
 
 
@@ -480,9 +576,10 @@ def _ask(model_name: str, order) -> dict | None:
         logging.warning(f"[AI] ответ не JSON: {text[:150]!r}")
         if REFUSAL_RE.search(text or ""):
             # фильтр модели отказался: заказ не наш, не переоцениваем вечно
-            return {"fit": 0, "difficulty": "", "hours": 0.0,
-                    "price_rub": "", "summary": "отказ модели",
-                    "risks": ""}
+            return {"fit": 0, "difficulty": "", "hours": 0.0, "category": "other",
+                    "components": [], "unknowns": [], "clarity": "",
+                    "client_budget_ok": None, "price_rub": "",
+                    "summary": "отказ модели", "risks": "", "questions": []}
     return parsed
 
 
@@ -496,7 +593,8 @@ if __name__ == "__main__":
     print("AI включён:", is_enabled(), "модели:", GEMINI_MODELS)
 
     def mk(i, title, body, price):
-        return FreelanceOrder(i, "youdoru", title, body, price, 0.0, [],
+        digits = re.sub(r"\D", "", price)  # бюджет для расчёта цены ("до 15 000 ₽" -> 15000)
+        return FreelanceOrder(i, "youdoru", title, body, price, float(digits or 0), [],
                               datetime.now(timezone.utc), "")
 
     samples = [
@@ -516,7 +614,13 @@ if __name__ == "__main__":
         print(f"\n{o.title}\n  -> {json.dumps(res, ensure_ascii=False)}")
     print("\nstatus:", json.dumps(status(), ensure_ascii=False))
 
-    # Проверка устойчивого разбора обёрнутого ответа
-    wrapped = '```json\n{"fit": 8, "difficulty": "легко", "hours": 5, "price_rub": "8-12 тыс.", "summary": "x", "risks": "y"}\n```'
+    # Проверка устойчивого разбора обёрнутого ответа (новый формат)
+    wrapped = ('```json\n{"fit": 8, "difficulty": "легко", "category": "tg_bot", '
+               '"components": [{"name": "меню", "hours": 2}, {"name": "таблица", "hours": 1.5}], '
+               '"unknowns": ["нет доступа к CRM"], "clarity": "частично", '
+               '"client_budget_ok": true, "summary": "x", "risks": "y", '
+               '"questions": ["есть ли таблица?"]}\n```')
     print("\nparse ```json:", parse_ai_json(wrapped))
+    print("parse старый формат:", parse_ai_json(
+        '{"fit": 7, "hours": 5, "price_rub": "8-12 тыс."}'))
     print("parse NaN hours:", parse_ai_json('{"fit": 7, "hours": NaN}'))

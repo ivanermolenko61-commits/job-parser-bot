@@ -39,7 +39,7 @@ from database import (
     kv_get,
     kv_set,
 )
-from freelance import ai_scorer
+from freelance import ai_scorer, pricing
 from freelance.alot_client import (
     FreelanceOrder,
     _fetch_items,
@@ -338,7 +338,8 @@ def _prepare_cycle() -> CycleResult:
             res.ai_ok += 1
             sc.ai = r
             res.models_used[r.get("model", "?")] = res.models_used.get(r.get("model", "?"), 0) + 1
-        # оценка есть (новая или сохранённая раньше)
+        # оценка есть (новая или сохранённая раньше): цену считаем кодом, если её ещё нет
+        _ensure_price(sc)
         fit = sc.fit
         if fit is not None and fit < FREELANCE_MIN_FIT:
             res.rejected.append(sc)
@@ -354,6 +355,18 @@ def _prepare_cycle() -> CycleResult:
         f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}"
     )
     return res
+
+
+def _ensure_price(sc: ScoredOrder) -> None:
+    """Считает цену по оценке модели и кладёт price_* в sc.ai (уйдёт в ai_json).
+    Старые оценки без category (формат с price_rub) не трогаем."""
+    ai = sc.ai
+    if not ai or "price_mid" in ai or "category" not in ai:
+        return
+    try:
+        ai.update(pricing.price_order(ai, sc.order.price_value))
+    except Exception:
+        logging.exception(f"[FREELANCE] не удалось посчитать цену {sc.order.url}")
 
 
 def _report_ai_health(res: CycleResult) -> None:
@@ -382,6 +395,9 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None) -> N
         o.published_at.isoformat(), sc.dedup, sc.fit,
         json.dumps(sc.ai, ensure_ascii=False) if sc.ai else "",
         status, sc.attempts, message_id,
+        category=(sc.ai or {}).get("category"),
+        budget=o.price_value if o.price_value and o.price_value > 0 else None,
+        hours=(sc.ai or {}).get("hours") or None,
     )
 
 
@@ -497,6 +513,53 @@ def _fmt_hours(value) -> str:
     return f"{h:.1f}".rstrip("0").rstrip(".")
 
 
+def _money(value) -> str:
+    return f"{int(_num(value)):,}".replace(",", " ")
+
+
+def _price_line(ai: dict) -> str:
+    low, mid, high = (_num(ai.get(k)) for k in ("price_low", "price_mid", "price_high"))
+    line = f"💵 Предложить: {_money(mid)} ₽"
+    if low > 0 and high > 0 and (low != mid or high != mid):
+        line += f" ({_money(low)}–{_money(high)})"
+    return line
+
+
+def _thousands(value: float) -> str:
+    k = value / 1000
+    return f"{k:.1f}".rstrip("0").rstrip(".")
+
+
+def _price_basis_line(ai: dict) -> str:
+    """Откуда цена: формула · рынок категории · бюджет."""
+    parts = []
+    basis = str(ai.get("price_basis") or "").strip()
+    if basis:
+        parts.append(basis[:100])
+    m_low, m_high = _num(ai.get("market_low")), _num(ai.get("market_high"))
+    if m_low > 0 and m_high > 0:
+        name = pricing.CATEGORY_NAMES.get(str(ai.get("category") or ""), "заказов")
+        parts.append(f"рынок {name}: {_thousands(m_low)}–{_thousands(m_high)} тыс.")
+    if _num(ai.get("budget")) > 0:
+        parts.append("бюджет занижен" if ai.get("budget_low") else "бюджет ок")
+    return " · ".join(parts)
+
+
+def _components_line(ai: dict) -> str:
+    comps = ai.get("components")
+    if not isinstance(comps, list):
+        return ""
+    items = []
+    for c in comps[:8]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()[:50]
+        hours = _fmt_hours(c.get("hours"))
+        if name and hours:
+            items.append(f"{name} {hours} ч")
+    return " · ".join(items)
+
+
 def format_order(sc: ScoredOrder, compact: bool = False) -> str:
     """HTML-сообщение о заказе. Итог не длиннее MAX_MESSAGE_LEN (иначе упрощается)."""
     o, ai = sc.order, sc.ai
@@ -516,10 +579,19 @@ def format_order(sc: ScoredOrder, compact: bool = False) -> str:
         hours = _fmt_hours(ai.get("hours"))
         if hours:
             parts.append(f"~{hours} ч")
-        price_rub = str(ai.get("price_rub") or "").strip()
-        if price_rub:
-            parts.append(f"предложить {price_rub[:100]}")
+        price_mid = _num(ai.get("price_mid"))
+        if price_mid <= 0:
+            # старая запись без расчёта цены: прежний вывод
+            price_rub = str(ai.get("price_rub") or "").strip()
+            if price_rub:
+                parts.append(f"предложить {price_rub[:100]}")
         lines.append("🤖 " + " · ".join(e(p) for p in parts))
+        if price_mid > 0:
+            lines.append(_price_line(ai))
+            if not compact:
+                basis = _price_basis_line(ai)
+                if basis:
+                    lines.append(f"   {e(basis)}")
         if not compact:
             summary = str(ai.get("summary") or "")
             risks = str(ai.get("risks") or "")
@@ -527,6 +599,12 @@ def format_order(sc: ScoredOrder, compact: bool = False) -> str:
                 lines.append(f"📝 {e(summary[:300])}")
             if risks:
                 lines.append(f"⚠️ Риск: {e(risks[:300])}")
+            comps = _components_line(ai)
+            if comps:
+                lines.append(f"🧩 {e(comps)}")
+            questions = ai.get("questions")
+            if isinstance(questions, list) and questions and str(questions[0]).strip():
+                lines.append(f"❓ Уточнить: {e(str(questions[0]).strip()[:200])}")
     else:
         lines.append("🤖 без AI")
         if not compact:
