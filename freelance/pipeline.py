@@ -370,12 +370,29 @@ def _ensure_price(sc: ScoredOrder) -> None:
 
 
 def _report_ai_health(res: CycleResult) -> None:
-    """Оповещение, если AI не работает: 3 цикла подряд без единой оценки или ошибка ключа."""
+    """Оповещение, если AI не работает: 3 цикла подряд без единой оценки (не ответил никто
+    из провайдеров). Отклонённый ключ отдельного провайдера - отдельное предупреждение,
+    «AI не работает» оно не вызывает, пока оценки приходят от других."""
     label = "AI-оценка заказов"
     st = ai_scorer.status()
-    if st["config_error"]:
-        monitor.record("gemini", 0, RuntimeError(st["config_error"]), label=label, immediate=True)
-        return
+    key_errors = st.get("key_errors") or {}
+    for name in ("gemini", *st.get("providers", {})):
+        reason = key_errors.get(name, "")
+        if reason:
+            monitor.record(f"ai_key_{name}", 0, RuntimeError(reason),
+                           label=f"Ключ AI-провайдера {name}", immediate=True,
+                           bad_text="ключ отклонён", reason=reason)
+        else:
+            monitor.record(f"ai_key_{name}", 1, label=f"Ключ AI-провайдера {name}",
+                           recovered_text="принят")
+    # признак платного вызова (402 или платная модель) - сразу и отдельно: провайдер выключен до рестарта
+    paid_errors = st.get("paid_errors") or {}
+    for name in st.get("providers", {}):
+        reason = paid_errors.get(name, "")
+        if reason:
+            monitor.record(f"ai_paid_{name}", 0, RuntimeError(reason),
+                           label=f"AI-провайдер {name}", immediate=True,
+                           bad_text="платный вызов, провайдер выключен до рестарта", reason=reason)
     if res.ai_attempted == 0:
         return
     if res.ai_ok == 0:

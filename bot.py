@@ -506,23 +506,45 @@ def _ai_state_text(st: dict) -> str:
     """Строка статуса AI: активная Gemini-модель, запасные, Yandex, последняя оценка."""
     if not st["enabled"]:
         return "выключен (нет ключей), заказы идут без оценки"
-    parts = []
-    if st["gemini"]:
-        models = st["models"]
-        if models:
-            parts.append(f"Gemini: {html.escape(models[0])} (запасные: {len(models) - 1})")
+    def fmt_sec(sec: int) -> str:
+        return f"{sec // 3600} ч {sec % 3600 // 60} мин" if sec >= 3600 else f"{sec} с"
+
+    providers = st.get("providers", {})
+    lines = []
+    for name in st.get("chain", ["gemini", "yandex"]):
+        if name == "gemini":
+            if not st["gemini"]:
+                continue
+            models = st["models"]
+            if models:
+                line = f"Gemini: {html.escape(models[0])} (запасные: {len(models) - 1})"
+            else:
+                line = "Gemini: все модели недоступны"
+            if st["paused"]:
+                paused = ", ".join(f"{html.escape(m)} {fmt_sec(sec)}" for m, sec in st["paused"].items())
+                line += f"; на паузе (лимит): {paused}"
+        elif name == "yandex":
+            if not st["yandex"]:
+                continue
+            line = "Yandex lite"
         else:
-            parts.append("Gemini: все модели недоступны")
-        if st["paused"]:
-            paused = ", ".join(
-                f"{html.escape(m)} {sec // 3600} ч {sec % 3600 // 60} мин" if sec >= 3600
-                else f"{html.escape(m)} {sec} с"
-                for m, sec in st["paused"].items()
-            )
-            parts.append(f"на паузе (лимит): {paused}")
-    if st["yandex"]:
-        parts.append("+ Yandex lite")
-    text = "; ".join(parts)
+            p = providers.get(name)
+            if not p or not p["has_key"]:
+                continue
+            if p["dead"]:
+                reason = p.get("paid_reason") or "платный вызов"
+                line = f"{name}: выключен до рестарта ({html.escape(reason)})"
+            elif p["blocked_sec"]:
+                line = f"{name}: ключ отклонён, пауза {fmt_sec(p['blocked_sec'])}"
+            else:
+                line = f"{name}: {len(p['models'])} мод., сегодня {p['today']}/{p['limit']}"
+                if p["paused"]:
+                    paused = ", ".join(f"{html.escape(m)} {fmt_sec(sec)}" for m, sec in p["paused"].items())
+                    line += f"; на паузе: {paused}"
+                if p["disabled"]:
+                    line += f"; недоступны: {html.escape(', '.join(p['disabled']))}"
+        lines.append(line)
+    text = "\n  • ".join([""] + lines) if lines else "нет активных провайдеров"
     last = st["last_ok"]
     if last:
         try:
@@ -532,8 +554,8 @@ def _ai_state_text(st: dict) -> str:
         text += f"\nПоследняя оценка: {at} ({html.escape(last['model'])})"
     else:
         text += "\nПоследняя оценка: ещё не было"
-    if st["config_error"]:
-        text += f"\n🔴 Ошибка настройки: {html.escape(st['config_error'])}"
+    for name, reason in (st.get("key_errors") or {}).items():
+        text += f"\n🔴 Ошибка настройки ({html.escape(name)}): {html.escape(reason)}"
     return text
 
 
@@ -918,7 +940,7 @@ async def cmd_status(message: Message):
     mem = memwatch.mem_used_mb()
     if mem is not None:
         lines.append(f"🧠 Память: {mem} МБ из {memwatch.MEM_LIMIT_MB} (пик {memwatch.peak_mb()})")
-    parsers ={k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES}
+    parsers ={k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES and not k.startswith(("ai_key_", "ai_paid_"))}
     if parsers:
         lines.append("\n<b>Парсеры:</b>")
         for source, streak in sorted(parsers.items()):
