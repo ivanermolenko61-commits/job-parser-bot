@@ -573,11 +573,14 @@ def market_stats(category: str, days: int = 90, min_points: int = 5,
 def freelance_deals(category: str) -> list[tuple[float, float, float]]:
     """Сделки категории: [(deal_price, hours, risk)] - для ставки по вашим реальным ценам.
     risk - коэффициент риска из ai_json (нет - 1.0). Сделки, где цена была ограничена
-    бюджетом заказчика (budget_capped), не берутся: они не отражают нашу ставку."""
+    бюджетом заказчика (budget_capped), не берутся: они не отражают нашу ставку.
+    Если цену подняли к большому бюджету (budget_raised, а в старых записях - бюджет
+    выше price_mid), сделка берётся не дороже нашего расчёта: щедрый бюджет и так
+    учитывается при каждой оценке, в ставку его не закладываем."""
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT deal_price, hours, ai_json FROM freelance_orders
+            SELECT deal_price, hours, budget, ai_json FROM freelance_orders
             WHERE category = ? AND deal_price > 0 AND hours > 0
             """,
             (category,),
@@ -594,7 +597,15 @@ def freelance_deals(category: str) -> list[tuple[float, float, float]]:
             risk = float(ai.get("price_risk") or 1.0)
         except (TypeError, ValueError):
             risk = 1.0
-        result.append((float(r["deal_price"]), float(r["hours"]), risk if risk > 0 else 1.0))
+        try:
+            own = float((ai.get("price_own") if ai.get("budget_raised") else ai.get("price_mid")) or 0)
+        except (TypeError, ValueError):
+            own = 0.0
+        deal = float(r["deal_price"])
+        raised = ai.get("budget_raised") or float(r["budget"] or 0) > own > 0
+        if raised and own > 0:
+            deal = min(deal, own)
+        result.append((deal, float(r["hours"]), risk if risk > 0 else 1.0))
     return result
 
 

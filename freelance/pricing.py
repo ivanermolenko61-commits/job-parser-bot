@@ -7,8 +7,9 @@
   risk = 1.0 / 1.15 / 1.3 по ясности ТЗ + 0.1 за каждое неизвестное (максимум +0.3)
   own  = max(base × risk, минимум категории, часы × минимальная ставка)
 
-Затем рыночный якорь: бюджет заказчика ограничивает цену сверху (×1.1), а без
-бюджета цена слегка тянется к медиане бюджетов похожих заказов (вес 0.3).
+Затем рыночный якорь: бюджет заказчика ограничивает цену сверху (×1.1), а если
+он выше расчёта - цена поднимается до середины между расчётом и бюджетом.
+Без бюджета цена слегка тянется к медиане бюджетов похожих заказов (вес 0.3).
 Функции calc_price/accuracy_report - чистые (без БД); price_order тянет данные из БД.
 Деньги считаются через Decimal.
 """
@@ -26,11 +27,12 @@ UNKNOWN_STEP = Decimal("0.1")
 UNKNOWN_MAX = Decimal("0.3")
 BUDGET_CAP = Decimal("1.1")             # цена не выше бюджета × 1.1
 BUDGET_LOW_RATIO = Decimal("1.5")       # своя цена > бюджета × 1.5 - «бюджет занижен»
+BUDGET_PULL = Decimal("0.5")            # бюджет выше расчёта: доля разницы, на которую поднимаем цену
 MARKET_WEIGHT = Decimal("0.3")          # вес рыночной медианы, если бюджета нет
 MIN_POINTS = 5                          # минимум точек для рынка и для ставки по сделкам
 RATE_MIN_FACTOR = Decimal("0.3")        # ставка по сделкам: границы от общей ставки
 RATE_MAX_FACTOR = Decimal("5")
-PRICE_VERSION = 2                       # растёт при смене формулы: старые pending-оценки пересчитываются
+PRICE_VERSION = 3                       # растёт при смене формулы: старые pending-оценки пересчитываются
 
 CATEGORY_NAMES = {          # для строки «рынок ботов: ...»
     "tg_bot": "ботов", "parser": "парсеров", "landing": "лендингов",
@@ -134,6 +136,7 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
     mid = own
     out["budget_low"] = False
     out["budget_capped"] = False
+    out["budget_raised"] = False
     if budget_d > 0:
         out["budget"] = int(budget_d)
         out["budget_rate"] = int(budget_d / hours)      # бюджет в пересчёте на ₽/ч
@@ -148,19 +151,29 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
             if own > cap:
                 mid = cap
                 out["budget_capped"] = True
+            elif budget_d > own:
+                # заказчик готов платить больше расчёта: не отдаём разницу целиком
+                mid = own + (budget_d - own) * BUDGET_PULL
+                out["budget_raised"] = True
 
     mid_i = _round_money(mid)
-    if out["budget_capped"]:
-        # округление не должно вернуть цену выше потолка
+    cap_i = None
+    if budget_d >= floor and budget_d > 0:
+        # округление и вилка не должны выйти за потолок бюджета
         cap_i = int((budget_d * BUDGET_CAP / _step(mid)).quantize(Decimal(1), rounding=ROUND_FLOOR) * _step(mid))
         mid_i = min(mid_i, cap_i)
     floor_i = max(_ceil_money(floor), int(_step(Decimal(0))))
     mid_i = max(mid_i, floor_i)
     spread = _dec(FREELANCE_PRICE_SPREAD)
     low_i = min(mid_i, max(_round_money(Decimal(mid_i) * (1 - spread)), floor_i))
-    high_i = max(mid_i, _round_money(Decimal(mid_i) * (1 + spread)))
+    high_i = _round_money(Decimal(mid_i) * (1 + spread))
+    if cap_i is not None:
+        high_i = min(high_i, cap_i)
+    high_i = max(mid_i, high_i)
     if market_ok:
         out["market_verdict"] = market_verdict(mid_i, out["market_low"], out["market_high"])
+    if out["budget_capped"] or out["budget_raised"]:
+        out["price_own"] = _round_money(own)    # расчёт до поправки на бюджет - для сравнения
     out.update({
         "price_low": low_i,
         "price_mid": mid_i,

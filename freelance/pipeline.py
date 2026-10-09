@@ -587,7 +587,16 @@ def _price_basis_line(ai: dict) -> str:
     if budget > 0:
         b_rate = _num(ai.get("budget_rate"))
         b_text = f"бюджет {_money(budget)} ₽" + (f" ≈ {_money(b_rate)} ₽/ч" if b_rate > 0 else "")
-        parts.append(f"{b_text}, занижен" if ai.get("budget_low") else f"{b_text}, ок")
+        own = _num(ai.get("price_own"))
+        if ai.get("budget_low"):
+            b_text += ", занижен"
+        elif not ai.get("budget_capped"):
+            b_text += ", ок"
+        if ai.get("budget_capped") and own > 0:
+            b_text += f" · упёрлось в бюджет +10% (по расчёту {_money(own)} ₽)"
+        elif ai.get("budget_raised") and own > 0:
+            b_text += f" · поднято к бюджету (по расчёту {_money(own)} ₽)"
+        parts.append(b_text)
     return " · ".join(parts)
 
 

@@ -62,10 +62,41 @@ class CalcPriceTest(unittest.TestCase):
         self.assertEqual(r["price_mid"], 7800)
         self.assertFalse(r["budget_capped"])
 
-    def test_budget_above_own_keeps_own(self):
+    def test_budget_above_own_pulls_up(self):
         r = pricing.calc_price(ai(4, "tg_bot"), budget=20000, rate=1000)
-        self.assertEqual(r["price_mid"], 4000)
+        self.assertEqual(r["price_mid"], 12000)  # середина между 4000 и 20000
         self.assertFalse(r["budget_capped"])
+        self.assertTrue(r["budget_raised"])
+        self.assertEqual(r["price_own"], 4000)
+
+    def test_big_budget_real_case(self):
+        # «Сайт под ключ»: 16.5 ч × 1000 × 1.3 = 21 450, бюджет 80 000
+        r = pricing.calc_price(ai(16.5, "other", clarity="размыто"), budget=80000, rate=1000)
+        self.assertEqual(r["price_own"], 21500)
+        self.assertEqual(r["price_mid"], 50500)  # 21450 + 58550 / 2 = 50725 -> шаг 500
+        self.assertLessEqual(r["price_high"], 80000)
+
+    def test_high_not_above_budget_cap(self):
+        # расчёт чуть ниже бюджета: верх вилки не выходит за бюджет × 1.1
+        r = pricing.calc_price(ai(6.5, "integration", clarity="частично", unknowns=["a", "b", "c"]),
+                               budget=10000, rate=1000)
+        self.assertTrue(r["budget_raised"])
+        self.assertLessEqual(r["price_mid"], 10000)
+        self.assertLessEqual(r["price_high"], 11000)
+        self.assertGreaterEqual(r["price_high"], r["price_mid"])
+
+    def test_capped_keeps_own_for_display(self):
+        # «Создать сайт под ключ»: 5 ч × 1000 × 1.45 = 7250, бюджет 5000
+        r = pricing.calc_price(ai(5, "landing", clarity="частично", unknowns=["a", "b", "c"]),
+                               budget=5000, rate=1000)
+        self.assertTrue(r["budget_capped"])
+        self.assertEqual((r["price_mid"], r["price_own"]), (5500, 7300))
+        self.assertLessEqual(r["price_high"], 5500)
+
+    def test_no_budget_no_own(self):
+        r = pricing.calc_price(ai(4), rate=1000)
+        self.assertNotIn("price_own", r)
+        self.assertFalse(r["budget_raised"])
 
     def test_market_ignored_below_5_points(self):
         market = {"median": 10000, "p25": 8000, "p75": 12000, "n": 4}
@@ -83,7 +114,8 @@ class CalcPriceTest(unittest.TestCase):
     def test_market_not_used_when_budget(self):
         market = {"median": 10000, "p25": 8000, "p75": 12000, "n": 9}
         r = pricing.calc_price(ai(4), budget=20000, market=market, rate=1000)
-        self.assertEqual(r["price_mid"], 4000)
+        self.assertEqual(r["price_own"], 4000)   # рыночный сдвиг к медиане не применён
+        self.assertNotIn("price_market_applied", r)
 
     def test_rounding_steps(self):
         r = pricing.calc_price(ai(12, "tg_bot"), rate=1000)  # 12000: шаг 500
@@ -254,21 +286,29 @@ class FormatOrderTest(unittest.TestCase):
         a = {"fit": 8, "difficulty": "средне", "hours": 4.5, "category": "tg_bot",
              "components": [{"name": "меню <b>", "hours": 2}], "questions": ["есть таблица?"],
              "summary": "s", "risks": "r"}
-        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=15000,
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=6000,
                                     market={"median": 5500, "p25": 4000, "p75": 7000, "n": 6},
                                     rate=1000))
-        text = format_order(ScoredOrder(make_order(15000), a))
+        text = format_order(ScoredOrder(make_order(6000), a))
         self.assertIn("💵 Предложить:", text)
         self.assertIn("рынок ботов: 4–7 тыс.", text)
         self.assertIn("рынок ботов: 4–7 тыс. — цена в рынке", text)
-        self.assertIn("бюджет 15 000 ₽ ≈ 3 333 ₽/ч, ок", text)
+        self.assertIn("бюджет 6 000 ₽ ≈ 1 333 ₽/ч, ок · поднято к бюджету (по расчёту 5 200 ₽)", text)
         self.assertIn("🧩 меню &lt;b&gt; 2 ч", text)
         self.assertIn("❓ Уточнить: есть таблица?", text)
         self.assertIn("Бот &lt;для&gt;", text)
-        compact = format_order(ScoredOrder(make_order(15000), a), compact=True)
+        compact = format_order(ScoredOrder(make_order(6000), a), compact=True)
         self.assertIn("💵 Предложить:", compact)
         self.assertNotIn("🧩", compact)
         self.assertLessEqual(len(text), 4000)
+
+    def test_capped_shown(self):
+        a = {"fit": 8, "difficulty": "легко", "hours": 5, "category": "landing",
+             "summary": "s", "risks": "r"}
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=["a", "b", "c"]),
+                                    budget=5000, rate=1000))
+        text = format_order(ScoredOrder(make_order(5000), a))
+        self.assertIn("бюджет 5 000 ₽ ≈ 1 000 ₽/ч · упёрлось в бюджет +10% (по расчёту 7 300 ₽)", text)
 
 
 class DatabaseTest(unittest.TestCase):
@@ -501,11 +541,15 @@ class MarketAndCleanupTest(DatabaseTest):
         database.init_db()
         self.put(1, ai_json=json.dumps({"price_risk": 1.15}))
         self.put(2, ai_json=json.dumps({"budget_capped": True}))
-        for oid in (1, 2):
+        self.put(3, ai_json=json.dumps({"budget_raised": True, "price_own": 4000}))
+        self.put(4, ai_json=json.dumps({"price_mid": 800}))   # старая запись: бюджет 1000 > цены
+        for oid in (1, 2, 3, 4):
             database.freelance_set_deal_price(oid, 5000)
             with database._connect() as c:
                 c.execute("UPDATE freelance_orders SET hours = 4 WHERE order_id = ?", (oid,))
-        self.assertEqual(database.freelance_deals("tg_bot"), [(5000.0, 4.0, 1.15)])
+        # capped выброшена, raised и старая «бюджет выше цены» - не дороже нашего расчёта
+        self.assertEqual(sorted(database.freelance_deals("tg_bot")),
+                         [(800.0, 4.0, 1.0), (4000.0, 4.0, 1.0), (5000.0, 4.0, 1.15)])
 
 
 class ExtraReviewTest(MarketAndCleanupTest):
