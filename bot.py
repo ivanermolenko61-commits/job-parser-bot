@@ -535,7 +535,8 @@ def _ai_state_text(st: dict) -> str:
                 reason = p.get("paid_reason") or "платный вызов"
                 line = f"{name}: выключен до рестарта ({html.escape(reason)})"
             elif p["blocked_sec"]:
-                line = f"{name}: ключ отклонён, пауза {fmt_sec(p['blocked_sec'])}"
+                why = "ключ отклонён" if p.get("key_error") else "адрес недоступен (ответ не от API)"
+                line = f"{name}: {why}, пауза {fmt_sec(p['blocked_sec'])}"
             else:
                 line = f"{name}: {len(p['models'])} мод., сегодня {p['today']}/{p['limit']}"
                 if p["paused"]:

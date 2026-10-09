@@ -168,6 +168,78 @@ class FallbackTest(ProviderTestBase):
         self.assertEqual(st["chain"], ["groq", "cerebras", "mistral", "openrouter"])
         self.assertTrue(st["enabled"])
 
+    def test_non_json_200_pauses_provider(self):
+        # заглушка сети: 200 text/plain «OK» - вторую модель не пробуем, провайдер на паузу
+        prov = self.use(GROQ_MODELS="m1,m2", CEREBRAS_MODELS="c1")
+        stub = resp(200, headers={"content-type": "text/plain"}, text="OK")
+        stub.json.side_effect = ValueError("not json")
+        result, api = self.run_order({"groq.com": stub, "cerebras.ai": resp(200)})
+        self.assertEqual(result["model"], "cerebras:c1")
+        self.assertEqual(api.hosts(), ["api.groq.com", "api.cerebras.ai"])
+        self.assertGreater(prov["groq"].blocked_until, 0)
+        self.assertEqual(prov["groq"].key_error, "")    # это не ошибка ключа
+        _, api = self.run_order({"cerebras.ai": resp(200)})
+        self.assertEqual(api.hosts(), ["api.cerebras.ai"])
+
+    def test_failure_reason_lists_every_provider(self):
+        self.use(GROQ_MODELS="m1", CEREBRAS_MODELS="c1", MISTRAL_MODELS="s1", OPENROUTER_API_KEY="")
+        result, _ = self.run_order({
+            "groq.com": resp(429, headers={"retry-after": "10"}),
+            "cerebras.ai": resp(500),
+            "mistral.ai": resp(200, content="не json"),
+        })
+        self.assertIsNone(result)
+        self.assertEqual(ai_scorer.status()["last_error"],
+                         "groq - HTTP 429 (лимит запросов); cerebras - HTTP 500; mistral - ответ не JSON")
+        # повтор: groq на паузе, без запроса
+        self.run_order({"cerebras.ai": resp(500), "mistral.ai": resp(500)})
+        self.assertTrue(ai_scorer.status()["last_error"].startswith("groq - пауза или дедлайн на заказ; "))
+
+
+    def test_stub_does_not_accept_rejected_key(self):
+        # ключ отклонён, пауза истекла, следующий ответ - заглушка 200: «ключ принят» не снимаем
+        prov = self.use(GROQ_MODELS="m1", CEREBRAS_MODELS="c1")
+        self.run_order({"groq.com": resp(401), "cerebras.ai": resp(200)})
+        prov["groq"].blocked_until = 0.0
+        stub = resp(200, headers={"content-type": "text/plain"}, text="OK")
+        stub.json.side_effect = ValueError("not json")
+        self.run_order({"groq.com": stub, "cerebras.ai": resp(200)})
+        self.assertIn("groq", prov["groq"].key_error)
+
+    def test_skip_reason_names_ceiling(self):
+        self.use(GROQ_MODELS="m1", GROQ_MAX_PER_DAY="1", OPENROUTER_API_KEY="",
+                 CEREBRAS_API_KEY="", MISTRAL_API_KEY="")
+        self.run_order({"groq.com": resp(500)})
+        self.run_order({})
+        self.assertEqual(ai_scorer.status()["last_error"], "groq - дневной потолок 1 исчерпан")
+
+    def test_gemini_stub_pauses_whole_chain(self):
+        self.use(GROQ_MODELS="m1")
+        stub = resp(200, headers={"content-type": "text/plain"}, text="OK")
+        stub.json.side_effect = ValueError("not json")
+        with mock.patch.object(ai_scorer, "GEMINI_KEY", "k"), \
+                mock.patch.object(ai_scorer, "GEMINI_MODELS", ["g1", "g2"]), \
+                mock.patch.object(ai_scorer, "_config_blocked_until", 0.0), \
+                mock.patch.object(ai_scorer, "_throttle"), \
+                mock.patch.object(ai_scorer, "CHAIN", ["gemini", "groq"]):
+            result, api = self.run_order({"googleapis.com": stub, "groq.com": resp(200)})
+            self.assertEqual(result["model"], "groq:m1")
+            self.assertEqual(api.hosts(), ["generativelanguage.googleapis.com", "api.groq.com"])
+            self.assertGreater(ai_scorer._config_blocked_until, 0)
+            self.assertEqual(ai_scorer._config_error, "")
+
+
+class ShortNameTest(unittest.TestCase):
+    def test_cases(self):
+        f = pipeline._short_name
+        self.assertEqual(f("бот"), "бот")
+        self.assertEqual(f("Обработка структурированного JSON вывода и обработка ошибок"),
+                         "Обработка структурированного JSON вывода и…")
+        self.assertEqual(f("a" * 45 + " bcde fgh"), "a" * 45 + " bcde…")   # 51-й символ пробел: слово целое
+        self.assertEqual(f("(" + "x" * 60), "(" + "x" * 49 + "…")           # скобка в начале
+        self.assertEqual(f("Обход блокировки (обработка ошибки 15, ротация IP/прокси)"), "Обход блокировки…")
+        self.assertEqual(f("x" * 47 + " — длинное"), "x" * 47 + "…")             # тире в конце убирается
+
 
 class ChainOrderTest(ProviderTestBase):
     def test_parse_chain(self):

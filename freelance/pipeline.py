@@ -600,6 +600,19 @@ def _price_basis_line(ai: dict) -> str:
     return " · ".join(parts)
 
 
+def _short_name(name: str, limit: int = 50) -> str:
+    """Обрезка по границе слова, без обрубков вида «обработ» и скобки без пары."""
+    if len(name) <= limit:
+        return name
+    cut = name[:limit]
+    if name[limit] != " " and " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    if cut.count("(") > cut.count(")") and cut.rfind("(") > 0:
+        cut = cut[:cut.rfind("(")]
+    cut = cut.rstrip(" ,.;:(/-—") or name[:limit]
+    return cut + "…"
+
+
 def _components_line(ai: dict) -> str:
     comps = ai.get("components")
     if not isinstance(comps, list):
@@ -608,7 +621,7 @@ def _components_line(ai: dict) -> str:
     for c in comps[:8]:
         if not isinstance(c, dict):
             continue
-        name = str(c.get("name") or "").strip()[:50]
+        name = _short_name(str(c.get("name") or "").strip())
         hours = _fmt_hours(c.get("hours"))
         if name and hours:
             items.append(f"{name} {hours} ч")

@@ -72,6 +72,8 @@ _disabled: set[str] = set()           # модели, которых нет (404
 _config_blocked_until = 0.0
 _config_error = ""
 _last_error = ""
+_run_errors = threading.local()   # ошибки текущего провайдера в score_order (по потоку)
+UNREACHABLE_PAUSE_SEC = 3600       # 200 не-JSON: адрес недоступен с этого сервера, проверяем раз в час
 _last_ok: dict | None = None          # {"model": ..., "at": iso}
 
 # YandexGPT ПЛАТНЫЙ (бесплатен только стартовый грант): по умолчанию выключен, не вызывается
@@ -568,11 +570,15 @@ def score_order(order) -> dict | None:
     """Оценка заказа: провайдеры по порядку CHAIN (AI_PROVIDERS); провайдер без ключа
     пропускается, при лимите/сбое заказ сразу уходит следующему. Возвращает dict оценки
     (с ключом "model") или None: AI недоступен или никто не дал разбираемый ответ."""
+    global _last_error
     deadline = time.monotonic() + ORDER_DEADLINE_SEC
+    reasons = []    # почему не ответил каждый провайдер - в оповещение, а не только последняя ошибка
     for name in _chain_active():
         if time.monotonic() >= deadline:
             logging.warning(f"[AI] дедлайн {ORDER_DEADLINE_SEC:g} с на заказ вышел, дальше не пробуем")
+            reasons.append("дедлайн на заказ вышел")
             break
+        _run_errors.items = []
         try:
             if name == "gemini":
                 result = _ask_gemini_chain(order, deadline)
@@ -580,11 +586,18 @@ def score_order(order) -> dict | None:
                 result = _ask_yandex_lite(order) if YANDEX_ENABLED else None
             else:
                 result = _ask_provider(PROVIDERS[name], order, deadline)
-        except Exception:
+        except Exception as e:
             logging.exception(f"[AI] {name}: неожиданный сбой, берём следующего")
-            continue
+            _run_errors.items.append(f"сбой {type(e).__name__}")
+            result = None
+        finally:
+            errors, _run_errors.items = _run_errors.items, None
         if result is not None:
             return result
+        reasons.append(f"{name} - {_short_reason(errors[-1]) if errors else _skip_reason(name)}")
+    if reasons:
+        with _lock:
+            _last_error = "; ".join(reasons)
     return None
 
 
@@ -628,6 +641,14 @@ def _set_error(text: str) -> None:
     global _last_error
     with _lock:
         _last_error = text
+    buf = getattr(_run_errors, "items", None)
+    if buf is not None:
+        buf.append(text)
+
+
+def _short_reason(text: str) -> str:
+    """«github:openai/gpt-4o-mini: нечитаемый ответ» -> «нечитаемый ответ»."""
+    return text.rsplit(": ", 1)[-1]
 
 
 def _is_gemma(model: str) -> bool:
@@ -772,6 +793,14 @@ def _ask_gemini_model(model: str, order):
 
     try:
         payload = resp.json()
+    except Exception as e:
+        # 200 не-JSON - отвечает не API, а сеть по пути: остальные модели Gemini не помогут
+        with _lock:
+            _config_blocked_until = max(_config_blocked_until, time.monotonic() + UNREACHABLE_PAUSE_SEC)
+        logging.warning(f"[AI] {model}: ответ не от API ({type(e).__name__}), пауза {UNREACHABLE_PAUSE_SEC} с")
+        _set_error(f"{model}: ответ не от API (сеть подменяет ответ?)")
+        return "config"
+    try:
         cand = (payload.get("candidates") or [{}])[0]
         parts = (cand.get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
@@ -1062,6 +1091,35 @@ def _mark_paid(p: _Provider, reason: str) -> None:
     _set_error(reason)
 
 
+def _key_accepted(p: _Provider, sent_at: float) -> None:
+    """Ключ принят (реальный ответ API не 401/403) - но только если запрос ушёл ПОСЛЕ
+    установки блокировки: ответ на старый запрос не должен её стирать."""
+    with _lock:
+        if p.key_error and sent_at > p.key_error_at:
+            p.key_error = ""
+            p.blocked_until = 0.0
+
+
+def _skip_reason(name: str) -> str:
+    """Почему провайдер не ответил, если сам ошибку не записал (пропущен без запроса)."""
+    now = time.monotonic()
+    with _lock:
+        if name == "gemini":
+            if now < _config_blocked_until:
+                return _config_error or "адрес недоступен, пауза"
+            return "все модели на паузе (лимит)"
+        p = PROVIDERS.get(name)
+        if p is None:
+            return "не настроен"
+        if p.dead:
+            return p.paid_reason or "выключен до рестарта"
+        if now < p.blocked_until:
+            return p.key_error or "адрес недоступен, пауза"
+        if p.day == _today() and p.count >= p.max_per_day:
+            return f"дневной потолок {p.max_per_day} исчерпан"
+    return "пауза или дедлайн на заказ"
+
+
 def _ask_provider_model(p: _Provider, model: str, order):
     """Один заказ - одна модель. dict - успех; "next" - следующая модель;
     "stop" - провайдер для этого заказа не годится (ключ, 402, потолок, очередь)."""
@@ -1108,13 +1166,8 @@ def _ask_provider_model(p: _Provider, model: str, order):
         break
 
     code = resp.status_code
-    if code not in (401, 403):
-        # ключ принят (реальный ответ не 401/403) - но только если запрос ушёл ПОСЛЕ
-        # установки блокировки: ответ на старый запрос не должен её стирать
-        with _lock:
-            if p.key_error and sent_at > p.key_error_at:
-                p.key_error = ""
-                p.blocked_until = 0.0
+    if code not in (200, 401, 403):
+        _key_accepted(p, sent_at)   # 200 - только после разбора JSON: заглушка сети тоже отвечает 200
     if code == 429:
         pause, daily = _provider_pause(resp)
         until = time.monotonic() + pause
@@ -1160,9 +1213,15 @@ def _ask_provider_model(p: _Provider, model: str, order):
     try:
         payload = resp.json()
     except Exception as e:
-        logging.warning(f"[AI] {label}: не разобран ответ: {type(e).__name__}")
-        _set_error(f"{label}: нечитаемый ответ")
-        return "next"
+        # HTTP 200 не-JSON (например, «OK» text/plain) отвечает не API, а сеть/прокси по пути:
+        # остальные модели того же адреса не помогут, провайдер на паузу
+        with _lock:
+            p.blocked_until = max(p.blocked_until, time.monotonic() + UNREACHABLE_PAUSE_SEC)
+        logging.warning(f"[AI] {label}: ответ не от API ({type(e).__name__}, "
+                        f"{resp.headers.get('content-type')!r}), пауза {UNREACHABLE_PAUSE_SEC} с")
+        _set_error(f"{label}: ответ не от API (сеть подменяет ответ?)")
+        return "stop"
+    _key_accepted(p, sent_at)
     # платность - до разбора choices: платный ответ с кривой структурой тоже должен выключить провайдера
     if p.name == "openrouter" and _openrouter_response_is_paid(payload):
         _mark_paid(p, f"{label}: ответ платной модели ({str(payload.get('model'))[:60]})")
