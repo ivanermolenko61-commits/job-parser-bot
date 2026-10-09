@@ -5,7 +5,7 @@
 
   base = часы × ставка (общая или по вашим сделкам категории)
   risk = 1.0 / 1.15 / 1.3 по ясности ТЗ + 0.1 за каждое неизвестное (максимум +0.3)
-  own  = max(base × risk, минимум категории)
+  own  = max(base × risk, минимум категории, часы × минимальная ставка)
 
 Затем рыночный якорь: бюджет заказчика ограничивает цену сверху (×1.1), а без
 бюджета цена слегка тянется к медиане бюджетов похожих заказов (вес 0.3).
@@ -14,9 +14,11 @@
 """
 import logging
 import statistics
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
-from config import FREELANCE_MIN_PRICE, FREELANCE_PRICE_SPREAD, FREELANCE_RATE_PER_HOUR
+from config import (
+    FREELANCE_MIN_PRICE, FREELANCE_MIN_RATE_PER_HOUR, FREELANCE_PRICE_SPREAD, FREELANCE_RATE_PER_HOUR,
+)
 
 CLARITY_RISK = {"ясно": Decimal("1.0"), "частично": Decimal("1.15"), "размыто": Decimal("1.3")}
 DEFAULT_RISK = Decimal("1.15")          # ясность не указана
@@ -28,6 +30,7 @@ MARKET_WEIGHT = Decimal("0.3")          # вес рыночной медианы
 MIN_POINTS = 5                          # минимум точек для рынка и для ставки по сделкам
 RATE_MIN_FACTOR = Decimal("0.3")        # ставка по сделкам: границы от общей ставки
 RATE_MAX_FACTOR = Decimal("5")
+PRICE_VERSION = 2                       # растёт при смене формулы: старые pending-оценки пересчитываются
 
 CATEGORY_NAMES = {          # для строки «рынок ботов: ...»
     "tg_bot": "ботов", "parser": "парсеров", "landing": "лендингов",
@@ -52,6 +55,11 @@ def _step(value: Decimal) -> Decimal:
 def _round_money(value: Decimal) -> int:
     step = _step(value)
     return int((value / step).quantize(Decimal(1), rounding=ROUND_HALF_UP) * step)
+
+
+def _ceil_money(value: Decimal) -> int:
+    step = _step(value)
+    return int((value / step).quantize(Decimal(1), rounding=ROUND_CEILING) * step)
 
 
 def _fmt_h(hours: Decimal) -> str:
@@ -80,7 +88,8 @@ def rate_from_deals(deals: list, default_rate=None) -> Decimal:
     if len(rates) < MIN_POINTS:
         return default
     rate = Decimal(str(statistics.median(rates)))
-    return min(default * RATE_MAX_FACTOR, max(default * RATE_MIN_FACTOR, rate))
+    rate = min(default * RATE_MAX_FACTOR, max(default * RATE_MIN_FACTOR, rate))
+    return max(rate, _dec(FREELANCE_MIN_RATE_PER_HOUR))
 
 
 def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dict:
@@ -97,15 +106,18 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
         return {}
     category = ai.get("category") if ai.get("category") in FREELANCE_MIN_PRICE else "other"
     rate_d = _dec(rate) if rate is not None and _dec(rate) > 0 else _dec(FREELANCE_RATE_PER_HOUR)
+    rate_d = max(rate_d, _dec(FREELANCE_MIN_RATE_PER_HOUR))
     unknowns = ai.get("unknowns") or []
     risk = risk_factor(ai.get("clarity") or "", len(unknowns) if isinstance(unknowns, list) else 0)
-    floor = _dec(FREELANCE_MIN_PRICE.get(category, 0))
+    cat_floor = _dec(FREELANCE_MIN_PRICE.get(category, 0))
+    # ниже минимальной ставки за час не работаем: ни рынок, ни бюджет цену под неё не опустят
+    floor = max(cat_floor, hours * _dec(FREELANCE_MIN_RATE_PER_HOUR))
 
     own = max(hours * rate_d * risk, floor)
     risk_s = f"{risk:.2f}".rstrip("0").rstrip(".")
     basis = f"{_fmt_h(hours)} ч × {rate_d:.0f} ₽ × {risk_s}"
     if own == floor and hours * rate_d * risk < floor:
-        basis += f" · минимум {floor:.0f} ₽"
+        basis += f" · минимум {cat_floor:.0f} ₽"
 
     out: dict = {}
     budget_d = _dec(budget)
@@ -113,18 +125,21 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
     if budget_d <= 0 and market_ok:
         own = max(own * (1 - MARKET_WEIGHT) + _dec(market["median"]) * MARKET_WEIGHT, floor)
         out["price_market_applied"] = True
+    if market:
+        out["market_n"] = int(_dec(market.get("n")))
     if market_ok:
         out["market_low"] = int(_dec(market.get("p25")))
         out["market_high"] = int(_dec(market.get("p75")))
-        out["market_n"] = int(market["n"])
 
     mid = own
     out["budget_low"] = False
     out["budget_capped"] = False
     if budget_d > 0:
         out["budget"] = int(budget_d)
+        out["budget_rate"] = int(budget_d / hours)      # бюджет в пересчёте на ₽/ч
         if budget_d < floor:
-            # бюджет ниже нашего минимума: не ограничиваем им, показываем свою цену
+            # бюджет ниже нашего минимума: под бюджет не опускаемся, предлагаем сам минимум
+            mid = floor
             out["budget_low"] = True
         else:
             if own > budget_d * BUDGET_LOW_RATIO:
@@ -139,10 +154,13 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
         # округление не должно вернуть цену выше потолка
         cap_i = int((budget_d * BUDGET_CAP / _step(mid)).quantize(Decimal(1), rounding=ROUND_FLOOR) * _step(mid))
         mid_i = min(mid_i, cap_i)
-    mid_i = max(mid_i, int(floor), int(_step(Decimal(0))))
+    floor_i = max(_ceil_money(floor), int(_step(Decimal(0))))
+    mid_i = max(mid_i, floor_i)
     spread = _dec(FREELANCE_PRICE_SPREAD)
-    low_i = min(mid_i, max(_round_money(Decimal(mid_i) * (1 - spread)), int(_step(Decimal(0)))))
+    low_i = min(mid_i, max(_round_money(Decimal(mid_i) * (1 - spread)), floor_i))
     high_i = max(mid_i, _round_money(Decimal(mid_i) * (1 + spread)))
+    if market_ok:
+        out["market_verdict"] = market_verdict(mid_i, out["market_low"], out["market_high"])
     out.update({
         "price_low": low_i,
         "price_mid": mid_i,
@@ -150,8 +168,18 @@ def calc_price(ai: dict, budget=0, market: dict | None = None, rate=None) -> dic
         "price_basis": basis,
         "price_rate": int(rate_d),
         "price_risk": float(risk),
+        "price_v": PRICE_VERSION,
     })
     return out
+
+
+def market_verdict(price: int, p25: int, p75: int) -> str:
+    """Где цена относительно рынка (P25–P75 бюджетов похожих заказов)."""
+    if p75 > 0 and price > p75:
+        return f"выше рынка на {round((price / p75 - 1) * 100)}%"
+    if p25 > 0 and price < p25:
+        return f"ниже рынка на {round((1 - price / p25) * 100)}%"
+    return "в рынке"
 
 
 def price_order(ai: dict, budget=0) -> dict:
@@ -161,7 +189,7 @@ def price_order(ai: dict, budget=0) -> dict:
     category = ai.get("category") or "other"
     try:
         from database import freelance_deals, market_stats
-        market = market_stats(category)
+        market = market_stats(category, report_small=True)
         deals = freelance_deals(category)
         if len(deals) >= MIN_POINTS:
             rate = rate_from_deals(deals)

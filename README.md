@@ -31,14 +31,14 @@ Telegram-бот для мониторинга вакансий IT Junior/ста�
   - `сложность` — техническая сложность реализации (легко/средне/сложно)
   - `часы` — примерное время на реализацию с Claude Code
   - `рекомендуемая цена` — калькуляция на основе fit + сложности + часов
-- **Цепочка AI**: порядок задаёт `AI_PROVIDERS` (по умолчанию `gemini,groq,cerebras,mistral,openrouter`; платный YandexGPT в неё не входит). Провайдер без ключа пропускается. Если провайдер в лимите (429), дневная квота кончилась, ключ отклонён или ответ не JSON — заказ сразу уходит следующему, а провайдер/модель на паузе пропускаются до её окончания. Подробности и ключи — в разделе «AI-провайдеры» ниже.
+- **Цепочка AI**: порядок задаёт `AI_PROVIDERS` (по умолчанию `gemini,cloudflare,openrouter,github,groq,cerebras,mistral`; платный YandexGPT в неё не входит). Провайдер без ключа пропускается. Если провайдер в лимите (429), дневная квота кончилась, ключ отклонён или ответ не JSON — заказ сразу уходит следующему, а провайдер/модель на паузе пропускаются до её окончания. Подробности и ключи — в разделе «AI-провайдеры» ниже.
 - **После оценки**: отправляются только заказы с `fit ≥ FREELANCE_MIN_FIT` (по умолчанию 5, настраивается в `config.py`)
 - **Кнопки под заказом**: 🔗 Открыть, ✅ Взял (сообщение остаётся, помечается «В работе»), ❌ Не подходит (сообщение удаляется)
 - **Автоудаление**: бот сам удаляет неотмеченные заказы из чата через `FREELANCE_MESSAGE_TTL_HOURS` (24 часа по умолчанию).
 - **Дедупликация**: одинаковые заказы за 3 дня отправляются один раз
 
 **Если AI не работает**:
-- Без ключей (ни Gemini, ни Groq/Cerebras/Mistral/OpenRouter, ни включённого Yandex) заказы приходят с пометкой «без AI» (префильтр работает).
+- Без ключей (ни Gemini, ни GitHub/Cloudflare/OpenRouter/Groq/Cerebras/Mistral, ни включённого Yandex) заказы приходят с пометкой «без AI» (префильтр работает).
 - Если ключ задан, но модель не ответила (сбой, таймаут, лимит), заказ ждёт и оценивается в следующих проверках, пока ему меньше `FREELANCE_MAX_AGE_HOURS`. Без оценки в чат он не уходит.
 - Исчерпанная дневная квота модели (HTTP 429 с `retryDelay`) ставит её на паузу до сброса, запросы идут к следующей модели.
 - Если не отвечает ни один провайдер 3 проверки подряд, приходит предупреждение в Telegram. Отклонённый ключ отдельного провайдера — отдельное предупреждение «ключ отклонён» (пока другие провайдеры работают, это не «AI не работает»).
@@ -117,14 +117,16 @@ YANDEX_FOLDER_ID=
 | Провайдер | Получить ключ | Бесплатный тариф | Модели по умолчанию (переменная) |
 |---|---|---|---|
 | Gemini | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | да, без карты | `GEMINI_MODELS` |
-| Groq | [console.groq.com/keys](https://console.groq.com/keys) | да, без карты; ~30 запросов/мин, ~1000/сутки на крупных моделях (плюс лимиты по токенам) | `GROQ_MODELS=openai/gpt-oss-120b,llama-3.3-70b-versatile,llama-3.1-8b-instant` |
-| Cerebras | [cloud.cerebras.ai](https://cloud.cerebras.ai) | да; 5 запросов/мин, 1M токенов/сутки на модель | `CEREBRAS_MODELS=gpt-oss-120b,qwen-3.8-27b` |
-| Mistral | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | тариф **Experiment** (бесплатный, нужна верификация телефона); **данные запросов на нём могут использоваться для обучения** | `MISTRAL_MODELS=mistral-small-latest,ministral-8b-latest` |
-| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | только модели `:free` / `openrouter/free`; без пополнения баланса 50 запросов/сутки на все вместе | `OPENROUTER_MODELS=nvidia/nemotron-3-super-120b-a12b:free,google/gemma-4-31b-it:free,openrouter/free` |
+| GitHub Models | [github.com/settings/personal-access-tokens](https://github.com/settings/personal-access-tokens) (право **Models: read**) | да, нужен только аккаунт GitHub; 15 запросов/мин и 150/сутки на модель; paid usage не включать | `GITHUB_MODELS=openai/gpt-4.1-mini,openai/gpt-4o-mini` |
+| Cloudflare Workers AI | [dash.cloudflare.com](https://dash.cloudflare.com) → AI → Workers AI → Use REST API (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_KEY`) | да, без карты; 10 000 нейронов/сутки (бот берёт не больше 40 заказов); на Workers Paid не переходить | `CLOUDFLARE_MODELS=@cf/openai/gpt-oss-120b,@cf/qwen/qwen3-30b-a3b-fp8` |
+| Groq | [console.groq.com/keys](https://console.groq.com/keys) | сайт недоступен из РФ; без карты; ~30 запросов/мин, ~1000/сутки на крупных моделях (плюс лимиты по токенам) | `GROQ_MODELS=openai/gpt-oss-120b,llama-3.3-70b-versatile,llama-3.1-8b-instant` |
+| Cerebras | [cloud.cerebras.ai](https://cloud.cerebras.ai) | сейчас ключ только с картой; 5 запросов/мин, 1M токенов/сутки на модель | `CEREBRAS_MODELS=gpt-oss-120b,qwen-3.8-27b` |
+| Mistral | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | сейчас ключ только на платном тарифе; был тариф **Experiment**; **данные запросов на нём могут использоваться для обучения** | `MISTRAL_MODELS=mistral-small-latest,ministral-8b-latest` |
+| OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | только модели `:free` / `openrouter/free`; без пополнения баланса 50 запросов/сутки на все вместе | `OPENROUTER_MODELS=nvidia/nemotron-3-super-120b-a12b:free,openrouter/free` |
 | YandexGPT | см. выше | **платный**, по умолчанию выключен (нужны `YANDEX_ENABLED=1` и `yandex` в `AI_PROVIDERS`) | `yandexgpt-lite` |
 
-- Порядок: `AI_PROVIDERS=gemini,groq,cerebras,mistral,openrouter` (неизвестные имена пропускаются с предупреждением в логе; если после разбора цепочка пуста или в ней нет провайдеров с ключами — ERROR в лог и берётся цепочка по умолчанию, чтобы опечатка не отключила AI). Модели внутри провайдера берутся по порядку списка. На один заказ отводится не больше `AI_ORDER_DEADLINE_SEC` (120 с): после этого новые модели и провайдеры не пробуются.
-- У каждого провайдера свой минимальный интервал между запросами (`GROQ_MIN_INTERVAL_SEC` 2.5, `CEREBRAS_MIN_INTERVAL_SEC` 12.5, `MISTRAL_MIN_INTERVAL_SEC` 1.2, `OPENROUTER_MIN_INTERVAL_SEC` 3.5) и свой дневной потолок запросов (`GROQ_MAX_PER_DAY` 900, `CEREBRAS_MAX_PER_DAY` 300, `MISTRAL_MAX_PER_DAY` 1000, `OPENROUTER_MAX_PER_DAY` 45); дневной счётчик идёт по UTC. Если очередь к провайдеру длиннее `AI_PROVIDER_MAX_WAIT_SEC` (20 с), заказ уходит следующему.
+- Порядок: `AI_PROVIDERS=gemini,cloudflare,openrouter,github` (неизвестные имена пропускаются с предупреждением в логе; если после разбора цепочка пуста или в ней нет провайдеров с ключами — ERROR в лог и берётся цепочка по умолчанию, чтобы опечатка не отключила AI). Модели внутри провайдера берутся по порядку списка. На один заказ отводится не больше `AI_ORDER_DEADLINE_SEC` (120 с): после этого новые модели и провайдеры не пробуются.
+- У каждого провайдера свой минимальный интервал между запросами (`CLOUDFLARE_MIN_INTERVAL_SEC` 3, `OPENROUTER_MIN_INTERVAL_SEC` 3.5, `GITHUB_MIN_INTERVAL_SEC` 4.5, `GROQ_MIN_INTERVAL_SEC` 2.5, `CEREBRAS_MIN_INTERVAL_SEC` 12.5, `MISTRAL_MIN_INTERVAL_SEC` 1.2) и свой дневной потолок запросов (`CLOUDFLARE_MAX_PER_DAY` 40, `OPENROUTER_MAX_PER_DAY` 45, `GITHUB_MAX_PER_DAY` 290, `GROQ_MAX_PER_DAY` 900, `CEREBRAS_MAX_PER_DAY` 300, `MISTRAL_MAX_PER_DAY` 1000); дневной счётчик идёт по UTC. Если очередь к провайдеру длиннее `AI_PROVIDER_MAX_WAIT_SEC` (20 с), заказ уходит следующему.
 - 429: пауза модели по `Retry-After` / `x-ratelimit-reset-*`; при дневной квоте — от 1 до 6 часов. 401/403: провайдер выключается на 5 минут (остальные не затрагиваются). 404: модель выключается до рестарта. **402 (требуется оплата) или ответ платной модели OpenRouter (`model` без `:free` и ненулевой `usage.cost`): провайдер выключается до рестарта, в логе ERROR и сразу приходит оповещение в Telegram.** 403 с признаками модерации — отказ по заказу, ключ не блокируется.
 - OpenRouter: из `OPENROUTER_MODELS` отбрасываются модели без `:free` (кроме `openrouter/free`); раз в 6 часов список сверяется с публичным `/models`, модели с ненулевой ценой исключаются. Платные функции (web search и т.п.) в запросах не используются.
 - Статус AI (кнопка статуса фриланса) показывает все провайдеры: модели, паузы, счётчик за сутки.
@@ -148,6 +150,7 @@ YANDEX_FOLDER_ID=
 | `FREELANCE_MAX_PER_CYCLE` | 15 | Макс. отдельных сообщений за цикл; остальное — сводкой |
 | `ALOT_SEED_ID` | 17328000 | Якорь поиска верхней границы id |
 | `FREELANCE_RATE_PER_HOUR` | 1000 | Ставка ₽/ч для расчёта цены (env) |
+| `FREELANCE_MIN_RATE_PER_HOUR` | 775 | Минимальная ставка ₽/ч: цена и низ вилки не ниже часы × ставка, даже при низком бюджете, рынке или сделках (env) |
 | `FREELANCE_PRICE_SPREAD` | 0.15 | Ширина вилки цены ±15% (env) |
 | `FREELANCE_MIN_PRICE` | по категориям | Минимум цены: tg_bot 3000, parser 1500, landing 3000, site_fix 1000, wp 1500, script 1500, integration 2500, sheets 1500, other 1500; env `FREELANCE_MIN_PRICE_<КАТЕГОРИЯ>` |
 
@@ -227,7 +230,7 @@ job-parser-bot/
 ├── freelance/               # Фриланс-модуль (alot.pro)
 │   ├── pipeline.py          # Цикл: скан, префильтр, дедуп, AI-оценка
 │   ├── alot_client.py       # API alot.pro
-│   ├── ai_scorer.py         # цепочка бесплатных AI: Gemini, Groq, Cerebras, Mistral, OpenRouter, YandexGPT
+│   ├── ai_scorer.py         # цепочка бесплатных AI: Gemini, GitHub Models, Cloudflare, OpenRouter, Groq, Cerebras, Mistral, YandexGPT
 │   └── filters.py           # Префильтры по категориям, словам
 │
 ├── requirements.txt         # Python-зависимости

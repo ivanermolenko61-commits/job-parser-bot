@@ -58,7 +58,9 @@ class CalcPriceTest(unittest.TestCase):
     def test_budget_low_flag(self):
         r = pricing.calc_price(ai(10, "tg_bot"), budget=3000, rate=1000)
         self.assertTrue(r["budget_low"])         # 10000 > 4500
-        self.assertEqual(r["price_mid"], 3300)
+        # 3300 = 330 ₽/ч - ниже минимальной ставки: предлагаем минимум 10 × 775
+        self.assertEqual(r["price_mid"], 7800)
+        self.assertFalse(r["budget_capped"])
 
     def test_budget_above_own_keeps_own(self):
         r = pricing.calc_price(ai(4, "tg_bot"), budget=20000, rate=1000)
@@ -115,6 +117,80 @@ class DealRateTest(unittest.TestCase):
         self.assertEqual(rep["total"], 2)
         self.assertAlmostEqual(rep["by_category"]["tg_bot"]["mape"], 10.0)
         self.assertAlmostEqual(rep["by_category"]["tg_bot"]["bias"], 0.0)
+
+
+class MinRateTest(unittest.TestCase):
+    """Цена не ниже часы × FREELANCE_MIN_RATE_PER_HOUR (775 ₽/ч по умолчанию)."""
+
+    def setUp(self):
+        patcher = mock.patch.object(pricing, "FREELANCE_MIN_RATE_PER_HOUR", 775)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_low_rate_raised(self):
+        r = pricing.calc_price(ai(10, "other"), rate=300)
+        self.assertEqual(r["price_rate"], 775)
+        self.assertGreaterEqual(r["price_low"], 7750)
+
+    def test_deal_rate_not_below_min(self):
+        deals = [(1000, 4)] * 5                  # 250 ₽/ч
+        self.assertEqual(pricing.rate_from_deals(deals, 1000), 775)
+
+    def test_market_does_not_pull_below_min(self):
+        market = {"median": 1000, "p25": 800, "p75": 1500, "n": 10}
+        r = pricing.calc_price(ai(10, "other"), market=market, rate=775)
+        self.assertGreaterEqual(r["price_mid"], 7750)
+        self.assertGreaterEqual(r["price_low"], 7750)
+
+    def test_budget_cap_not_below_min(self):
+        # бюджет 8000 ≥ минимума 7750: режем до потолка 8800, вилка не ниже минимума
+        r = pricing.calc_price(ai(10, "other"), budget=8000, rate=1000)
+        self.assertTrue(r["budget_capped"])
+        self.assertEqual(r["price_mid"], 8800)
+        self.assertGreaterEqual(r["price_low"], 7750)
+
+    def test_budget_below_min_not_capped(self):
+        # бюджет 7500 < 10 ч × 775: под него не опускаемся, предлагаем минимум
+        r = pricing.calc_price(ai(10, "other"), budget=7500, rate=1000)
+        self.assertFalse(r["budget_capped"])
+        self.assertTrue(r["budget_low"])
+        self.assertEqual(r["price_mid"], 7800)
+        self.assertEqual(r["price_low"], 7800)
+
+    def test_no_jump_at_budget_edge(self):
+        below = pricing.calc_price(ai(10, "other"), budget=7749, rate=1000)
+        above = pricing.calc_price(ai(10, "other"), budget=7750, rate=1000)
+        self.assertLessEqual(below["price_mid"], above["price_mid"])
+
+    def test_low_edge_of_range_not_below_min(self):
+        r = pricing.calc_price(ai(4, "other"), rate=800)   # 3200, вилка -15% = 2700
+        self.assertEqual(r["price_low"], 3100)            # 4 × 775 = 3100
+
+
+class MarketVerdictTest(unittest.TestCase):
+    def test_verdicts(self):
+        self.assertEqual(pricing.market_verdict(5000, 4000, 7000), "в рынке")
+        self.assertEqual(pricing.market_verdict(8400, 4000, 7000), "выше рынка на 20%")
+        self.assertEqual(pricing.market_verdict(3000, 4000, 7000), "ниже рынка на 25%")
+
+    def test_verdict_and_budget_rate_in_result(self):
+        market = {"median": 3000, "p25": 2000, "p75": 4000, "n": 8}
+        r = pricing.calc_price(ai(10, "other"), budget=3000, market=market, rate=1000)
+        self.assertEqual(r["budget_rate"], 300)
+        self.assertTrue(r["market_verdict"].startswith("выше рынка"))
+        line = _price_basis_line_for(r)
+        self.assertIn("цена выше рынка", line)
+        self.assertIn("≈ 300 ₽/ч, занижен", line)
+
+    def test_few_market_points_shown(self):
+        r = pricing.calc_price(ai(4), market={"median": 5000, "p25": 4000, "p75": 6000, "n": 2}, rate=1000)
+        self.assertNotIn("market_verdict", r)
+        self.assertIn("мало данных (2 из 5)", _price_basis_line_for(r))
+
+
+def _price_basis_line_for(price: dict) -> str:
+    from freelance.pipeline import _price_basis_line
+    return _price_basis_line({**ai(10, "other"), **price})
 
 
 class ParseAiJsonTest(unittest.TestCase):
@@ -184,7 +260,8 @@ class FormatOrderTest(unittest.TestCase):
         text = format_order(ScoredOrder(make_order(15000), a))
         self.assertIn("💵 Предложить:", text)
         self.assertIn("рынок ботов: 4–7 тыс.", text)
-        self.assertIn("бюджет ок", text)
+        self.assertIn("рынок ботов: 4–7 тыс. — цена в рынке", text)
+        self.assertIn("бюджет 15 000 ₽ ≈ 3 333 ₽/ч, ок", text)
         self.assertIn("🧩 меню &lt;b&gt; 2 ч", text)
         self.assertIn("❓ Уточнить: есть таблица?", text)
         self.assertIn("Бот &lt;для&gt;", text)
@@ -229,6 +306,10 @@ class DatabaseTest(unittest.TestCase):
         for i in range(4):
             self.save(i + 1, category="tg_bot", budget=1000.0 * (i + 1))
         self.assertIsNone(database.market_stats("tg_bot"))
+        self.assertEqual(database.market_stats("tg_bot", report_small=True), {"n": 4})
+        r = pricing.price_order(ai(4, "tg_bot"))      # через настоящую БД
+        self.assertEqual(r["market_n"], 4)
+        self.assertNotIn("market_verdict", r)
         self.save(5, category="tg_bot", budget=5000.0)
         self.save(6, category="parser", budget=9999.0)
         self.save(7, category="tg_bot", budget=None)

@@ -547,11 +547,12 @@ def freelance_set_deal_price(order_id: int, price: float | None) -> bool:
         return cur.rowcount > 0
 
 
-def market_stats(category: str, days: int = 90, min_points: int = 5) -> dict | None:
+def market_stats(category: str, days: int = 90, min_points: int = 5,
+                 report_small: bool = False) -> dict | None:
     """Рынок категории по реальным бюджетам заказчиков (budget > 0) за days дней:
     {"median", "p25", "p75", "n"}. Берутся только заказы с fit >= FREELANCE_MIN_FIT и
     одна строка на dedup_key (кросспосты не искажают медиану). Меньше min_points
-    точек - None (якорь не применяется)."""
+    точек - None (якорь не применяется), а с report_small - {"n": N} для подписи «мало данных»."""
     with _connect() as conn:
         rows = conn.execute(
             """
@@ -564,7 +565,7 @@ def market_stats(category: str, days: int = 90, min_points: int = 5) -> dict | N
         ).fetchall()
     values = sorted(float(r["budget"]) for r in rows)
     if len(values) < min_points:
-        return None
+        return {"n": len(values)} if report_small else None
     q = statistics.quantiles(values, n=4, method="inclusive")
     return {"median": statistics.median(values), "p25": q[0], "p75": q[2], "n": len(values)}
 

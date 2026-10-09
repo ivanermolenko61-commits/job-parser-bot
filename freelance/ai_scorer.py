@@ -1,7 +1,7 @@
 """Оценка фриланс-заказа: цепочка бесплатных AI-провайдеров, взаимозаменяемых.
 
-Порядок задаёт AI_PROVIDERS (по умолчанию gemini,groq,cerebras,mistral,openrouter,
-yandex). Провайдер без ключа пропускается. Если провайдер в лимите, квота кончилась,
+Порядок задаёт AI_PROVIDERS (по умолчанию gemini,cloudflare,openrouter,github,groq,
+cerebras,mistral; платный yandex - только явно). Провайдер без ключа пропускается. Если провайдер в лимите, квота кончилась,
 ключ отклонён или ответ не JSON - заказ сразу уходит следующему, а провайдер/модель
 на паузе пропускаются до её окончания. Gemini - свои модели GEMINI_MODELS; groq,
 cerebras, mistral, openrouter - общий OpenAI-совместимый клиент (только бесплатные
@@ -156,7 +156,10 @@ YANDEX_MAX_TOKENS = "1000"
 # ---------------------------------------------------------------------------
 # Бесплатные OpenAI-совместимые провайдеры: groq, cerebras, mistral, openrouter
 # ---------------------------------------------------------------------------
-PROVIDER_NAMES = ("gemini", "groq", "cerebras", "mistral", "openrouter", "yandex")
+# Порядок по живому сравнению 09.10.2026 на реальных заказах: gemini (быстрый, большой лимит) ->
+# cloudflare gpt-oss-120b (лучшая детализация, 40/сутки) -> openrouter nemotron -> github (из РФ
+# не отвечает, проверить с сервера) -> провайдеры без бесплатного ключа
+PROVIDER_NAMES = ("gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral", "yandex")
 # yandex платный: в цепочку по умолчанию не входит, включается только явно
 DEFAULT_CHAIN = ",".join(n for n in PROVIDER_NAMES if n != "yandex")
 
@@ -177,15 +180,31 @@ OPENROUTER_RETRY_SEC = 600           # если /models не ответил - п
 
 # Признаки дневной квоты в тексте 429
 DAILY_MARKERS = ("per day", "per-day", "daily", "tokens per day", "requests per day",
-                 "(tpd)", "(rpd)", "free-models-per-day")
+                 "(tpd)", "(rpd)", "free-models-per-day",
+                 "byday", "86400")              # github: «... per 86400s exceeded for UserByModelByDay»
 
 # base_url, ключ/префикс env, модели по умолчанию, мин. интервал (с), потолок запросов в сутки.
 # Лимиты бесплатных тарифов (октябрь 2026):
 #  groq: 30 RPM, 1000 RPD на крупных моделях, ещё TPM/TPD (по ним приходит 429 с retry-after);
 #  cerebras: 5 RPM, 1M токенов в сутки на модель (~300 заказов по ~3 тыс. токенов);
 #  mistral (тариф Experiment): ~1 запрос/с, дневного лимита нет;
-#  openrouter: 50 запросов/сутки на бесплатные модели без пополнения (берём 45).
+#  openrouter: 50 запросов/сутки на бесплатные модели без пополнения (берём 45);
+#  github (GitHub Models, бесплатно с аккаунтом GitHub): mini-модели 15 RPM и 150 RPD на модель;
+#  cloudflare (Workers AI, бесплатный план): 10 000 нейронов в сутки на аккаунт; рассуждающая
+#    gpt-oss-120b тратит до ~250 нейронов на заказ, поэтому потолок 40 в сутки.
+#    URL содержит ID аккаунта (CLOUDFLARE_ACCOUNT_ID); без него провайдер выключен.
 PROVIDER_SPECS = {
+    "github": {
+        "url": "https://models.github.ai/inference", "prefix": "GITHUB",
+        "models": "openai/gpt-4.1-mini,openai/gpt-4o-mini",
+        "interval": 4.5, "per_day": 290, "shared_daily": False,
+    },
+    "cloudflare": {
+        "url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1", "prefix": "CLOUDFLARE",
+        "models": "@cf/openai/gpt-oss-120b,@cf/qwen/qwen3-30b-a3b-fp8",
+        # нейроны общие на аккаунт: дневной 429 паузит весь провайдер
+        "interval": 3.0, "per_day": 40, "shared_daily": True,
+    },
     "groq": {
         "url": "https://api.groq.com/openai/v1", "prefix": "GROQ",
         "models": "openai/gpt-oss-120b,llama-3.3-70b-versatile,llama-3.1-8b-instant",
@@ -203,8 +222,8 @@ PROVIDER_SPECS = {
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1", "prefix": "OPENROUTER",
-        "models": "nvidia/nemotron-3-super-120b-a12b:free,google/gemma-4-31b-it:free,"
-                  + OPENROUTER_FREE_ROUTER,
+        # google/gemma-4-31b-it:free убрана: на сравнении 09.10 отвечала только 429
+        "models": "nvidia/nemotron-3-super-120b-a12b:free," + OPENROUTER_FREE_ROUTER,
         # лимит 50/сутки общий на все :free-модели, поэтому 429 по дню паузит весь провайдер
         "interval": 3.5, "per_day": 45, "shared_daily": True,
     },
@@ -273,10 +292,19 @@ def _build_providers(environ) -> dict:
                 if m not in kept:
                     logging.warning(f"[AI] openrouter: модель {m} не бесплатная (нет :free), отброшена")
             models = kept
+        key = (environ.get(f"{prefix}_API_KEY") or "").strip()
+        base_url = spec["url"]
+        if "{account_id}" in base_url:
+            account = (environ.get(f"{prefix}_ACCOUNT_ID") or "").strip()
+            if not account.isalnum():
+                if key:
+                    logging.warning(f"[AI] {name}: нет {prefix}_ACCOUNT_ID, провайдер выключен")
+                key = ""                    # без аккаунта провайдер неактивен
+            base_url = base_url.format(account_id=account)
         providers[name] = _Provider(
             name=name,
-            base_url=spec["url"],
-            key=(environ.get(f"{prefix}_API_KEY") or "").strip(),
+            base_url=base_url,
+            key=key,
             models=models,
             min_interval=_env_number(environ, f"{prefix}_MIN_INTERVAL_SEC", spec["interval"], float),
             max_per_day=_env_number(environ, f"{prefix}_MAX_PER_DAY", spec["per_day"], int),

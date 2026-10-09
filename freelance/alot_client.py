@@ -66,6 +66,7 @@ class ScanResult:
     orders: list[FreelanceOrder] = field(default_factory=list)
     max_id: int = 0       # наибольший непустой id в просмотренном окне
     raw_count: int = 0    # сколько непустых заказов вернул API (для health)
+    partial: bool = False # скан оборван сбоем API: заказы до сбоя сохранены, дальше - в следующем цикле
 
 
 _session = requests.Session()
@@ -180,6 +181,9 @@ def fetch_new_orders(last_id: int, max_ahead: int = 300, look_back: int = 100) -
 
     Отступ назад подбирает заказы, появившиеся с задержкой. Останавливается,
     когда три пачки подряд выше last_id пустые (дошли до границы).
+    Сбой пачки (alot.pro при перегрузке отвечает responseCode=8) не выбрасывает уже
+    собранное: скан обрывается с partial=True, max_id - по собранному, и следующий цикл
+    продолжит с этого места. Если не собрано ничего - исключение, как раньше.
     """
     result = ScanResult()
     start = max(1, last_id - look_back)
@@ -190,7 +194,15 @@ def fetch_new_orders(last_id: int, max_ahead: int = 300, look_back: int = 100) -
         if not first:
             time.sleep(REQUEST_PAUSE_SEC)
         first = False
-        items = _fetch_items(list(range(start, start + BATCH_SIZE)))
+        try:
+            items = _fetch_items(list(range(start, start + BATCH_SIZE)))
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            if not result.orders:
+                raise
+            logging.warning(f"[ALOT] скан оборван на id {start} ({type(e).__name__}), "
+                            f"собранные {len(result.orders)} заказов сохраняем")
+            result.partial = True
+            break
         parsed = [o for o in (_parse_item(i) for i in items) if o]
         if parsed:
             empty_streak = 0

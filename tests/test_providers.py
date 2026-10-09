@@ -175,7 +175,7 @@ class ChainOrderTest(ProviderTestBase):
             chain = ai_scorer._parse_chain("mistral, bogus ,groq,mistral")
         self.assertEqual(chain, ["mistral", "groq"])
         self.assertEqual(ai_scorer._parse_chain(None),
-                         ["gemini", "groq", "cerebras", "mistral", "openrouter"])
+                         ["gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
 
     def test_order_follows_ai_providers(self):
         self.use(GROQ_MODELS="g1", CEREBRAS_MODELS="c1", MISTRAL_MODELS="s1")
@@ -295,8 +295,7 @@ class OpenRouterFreeOnlyTest(ProviderTestBase):
     def test_defaults_are_free(self):
         prov = self.use()
         self.assertEqual(prov["openrouter"].models, [
-            "nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-31b-it:free",
-            "openrouter/free"])
+            "nvidia/nemotron-3-super-120b-a12b:free", "openrouter/free"])
         self.assertEqual(prov["openrouter"].max_per_day, 45)
 
     def _models_payload(self):
@@ -369,7 +368,7 @@ class ChainResolveTest(ProviderTestBase):
         self.use()
         with self.assertLogs(level="ERROR"):
             chain = ai_scorer._resolve_chain("grokk,yandx")
-        self.assertEqual(chain, ["gemini", "groq", "cerebras", "mistral", "openrouter"])
+        self.assertEqual(chain, ["gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
 
     def test_chain_without_keys_falls_back(self):
         self.use()
@@ -567,6 +566,34 @@ class SafetyTest(ProviderTestBase):
             result = ai_scorer._ask_provider(prov["groq"], ORDER, deadline)
         self.assertIsNone(result)
         self.assertEqual(len(api.calls), 1)
+
+
+class NewProvidersTest(unittest.TestCase):
+    """GitHub Models и Cloudflare: URL, ключи, аккаунт Cloudflare."""
+
+    def test_github_spec(self):
+        p = ai_scorer._build_providers({"GITHUB_API_KEY": " tok "})["github"]
+        self.assertEqual(p.base_url, "https://models.github.ai/inference")
+        self.assertEqual(p.key, "tok")
+        self.assertEqual(p.models, ["openai/gpt-4.1-mini", "openai/gpt-4o-mini"])
+
+    def test_cloudflare_account_in_url(self):
+        p = ai_scorer._build_providers({"CLOUDFLARE_API_KEY": "tok",
+                                        "CLOUDFLARE_ACCOUNT_ID": "abc123"})["cloudflare"]
+        self.assertEqual(p.base_url, "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1")
+        self.assertEqual(p.key, "tok")
+        self.assertTrue(p.shared_daily)
+
+    def test_cloudflare_without_account_disabled(self):
+        for account in ("", "../evil", "a b"):
+            p = ai_scorer._build_providers({"CLOUDFLARE_API_KEY": "tok",
+                                            "CLOUDFLARE_ACCOUNT_ID": account})["cloudflare"]
+            self.assertEqual(p.key, "", account)
+            self.assertNotIn("{", p.base_url)
+
+    def test_default_chain_order(self):
+        self.assertEqual(ai_scorer._parse_chain(None)[:4], ["gemini", "cloudflare", "openrouter", "github"])
+        self.assertNotIn("yandex", ai_scorer._parse_chain(None))
 
 
 class HealthReportTest(unittest.TestCase):

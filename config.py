@@ -98,6 +98,12 @@ def _rate_per_hour() -> float:
     return value if math.isfinite(value) and value > 0 else 1000.0
 
 
+# Минимальная ставка, ₽/ч: ниже не опускается ни ставка по сделкам, ни рынок, ни бюджет заказчика
+def _min_rate_per_hour() -> float:
+    value = _env_float("FREELANCE_MIN_RATE_PER_HOUR", 775)
+    return value if math.isfinite(value) and value >= 0 else 775.0
+
+
 def _price_spread() -> float:
     value = _env_float("FREELANCE_PRICE_SPREAD", 0.15)
     return value if 0 <= value <= 0.5 else 0.15
@@ -108,7 +114,8 @@ def _min_price(cat: str, default: float) -> float:
     return value if math.isfinite(value) and value >= 0 else float(default)
 
 
-FREELANCE_RATE_PER_HOUR = _rate_per_hour()
+FREELANCE_MIN_RATE_PER_HOUR = _min_rate_per_hour()
+FREELANCE_RATE_PER_HOUR = max(_rate_per_hour(), FREELANCE_MIN_RATE_PER_HOUR)
 # Ширина вилки вокруг рекомендуемой цены (0.15 = ±15%)
 FREELANCE_PRICE_SPREAD = _price_spread()
 # Минимальная цена по категории, ₽ (ниже не работаем); env: FREELANCE_MIN_PRICE_<КАТЕГОРИЯ>

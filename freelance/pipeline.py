@@ -66,6 +66,7 @@ PENDING_BATCH = 100
 PREPARE_TIMEOUT_SEC = 1800
 # Если столько циклов подряд нет id выше last_id - перепроверяем границу (≈ 1 ч)
 STALE_CYCLES_LIMIT = 12
+PARTIAL_ALERT_CYCLES = 3   # столько циклов подряд скан обрывается, не продвигая курсор, - тревога
 # При первом запуске/застое отступаем от границы на столько id (~50 id/час * 24 ч с запасом)
 BOOTSTRAP_LOOKBACK = 1500
 LAST_ID_KEY = "alot_last_id"
@@ -248,12 +249,28 @@ def _prepare_cycle() -> CycleResult:
         res.error = f"{type(e).__name__}: {e}"
         return res
 
-    monitor.record("alot", scan.raw_count, label="Источник фриланс-заказов alot.pro")
+    # Скан, который раз за разом обрывается сбоем и не продвигает курсор, - не норма:
+    # новые заказы не загружаются. После PARTIAL_ALERT_CYCLES циклов - ошибка в health
+    # (оповещение) и счёт застоя, чтобы со временем пересчитать границу.
+    partial_streak = int(kv_get("freelance_partial", "0") or 0)
+    partial_streak = partial_streak + 1 if (scan.partial and scan.max_id <= last_id) else 0
+    kv_set("freelance_partial", partial_streak)
+    stuck = partial_streak >= PARTIAL_ALERT_CYCLES
+    if stuck:
+        monitor.record("alot", 0, RuntimeError(
+            f"скан обрывается сбоем alot.pro {partial_streak} циклов подряд, новые заказы не загружаются"),
+            label="Источник фриланс-заказов alot.pro")
+    else:
+        monitor.record("alot", scan.raw_count, label="Источник фриланс-заказов alot.pro")
     res.raw_count = scan.raw_count
     res.new_last_id = max(last_id, scan.max_id)  # курсор только вперёд
     kv_set("freelance_last_raw", scan.raw_count)
     stale = int(kv_get("freelance_stale", "0") or 0)
-    kv_set("freelance_stale", 0 if scan.max_id > last_id else stale + 1)
+    if scan.max_id > last_id:
+        kv_set("freelance_stale", 0)
+    elif not scan.partial or stuck:
+        # единичный оборванный скан не признак застоя: до границы просто не дошли
+        kv_set("freelance_stale", stale + 1)
 
     with _sent_lock:
         sent_now = set(_sent_ids)
@@ -359,12 +376,17 @@ def _prepare_cycle() -> CycleResult:
 
 def _ensure_price(sc: ScoredOrder) -> None:
     """Считает цену по оценке модели и кладёт price_* в sc.ai (уйдёт в ai_json).
-    Старые оценки без category (формат с price_rub) не трогаем."""
+    Старые оценки без category (формат с price_rub) не трогаем; цену, посчитанную
+    прежней формулой (price_v меньше текущей), пересчитываем."""
     ai = sc.ai
-    if not ai or "price_mid" in ai or "category" not in ai:
+    if not ai or "category" not in ai or ai.get("price_v") == pricing.PRICE_VERSION:
         return
     try:
-        ai.update(pricing.price_order(ai, sc.order.price_value))
+        price = pricing.price_order(ai, sc.order.price_value)
+        # старые price_*/market_*/budget_* не должны пережить пересчёт (например, устаревший рынок)
+        for key in [k for k in ai if k.startswith(("price_", "market_", "budget"))]:
+            del ai[key]
+        ai.update(price)
     except Exception:
         logging.exception(f"[FREELANCE] не удалось посчитать цену {sc.order.url}")
 
@@ -554,11 +576,18 @@ def _price_basis_line(ai: dict) -> str:
     if basis:
         parts.append(basis[:100])
     m_low, m_high = _num(ai.get("market_low")), _num(ai.get("market_high"))
+    name = pricing.CATEGORY_NAMES.get(str(ai.get("category") or ""), "заказов")
     if m_low > 0 and m_high > 0:
-        name = pricing.CATEGORY_NAMES.get(str(ai.get("category") or ""), "заказов")
-        parts.append(f"рынок {name}: {_thousands(m_low)}–{_thousands(m_high)} тыс.")
-    if _num(ai.get("budget")) > 0:
-        parts.append("бюджет занижен" if ai.get("budget_low") else "бюджет ок")
+        market = f"рынок {name}: {_thousands(m_low)}–{_thousands(m_high)} тыс."
+        verdict = str(ai.get("market_verdict") or "").strip()
+        parts.append(f"{market} — цена {verdict[:40]}" if verdict else market)
+    elif ai.get("market_n") is not None:
+        parts.append(f"рынок {name}: мало данных ({int(_num(ai.get('market_n')))} из {pricing.MIN_POINTS})")
+    budget = _num(ai.get("budget"))
+    if budget > 0:
+        b_rate = _num(ai.get("budget_rate"))
+        b_text = f"бюджет {_money(budget)} ₽" + (f" ≈ {_money(b_rate)} ₽/ч" if b_rate > 0 else "")
+        parts.append(f"{b_text}, занижен" if ai.get("budget_low") else f"{b_text}, ок")
     return " · ".join(parts)
 
 
