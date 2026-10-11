@@ -67,6 +67,9 @@ class ProviderTestBase(unittest.TestCase):
             mock.patch.object(ai_scorer, "_or_next_check", float("inf")),  # без похода в /models
             mock.patch.object(ai_scorer, "_or_paid", set()),
             mock.patch("time.sleep"),
+            # счётчики за сутки не должны трогать реальную БД
+            mock.patch.object(ai_scorer, "_load_count"),
+            mock.patch.object(ai_scorer, "_save_count"),
         ]
         for p in self._patches:
             p.start()
@@ -867,6 +870,99 @@ class ProbeTest(ProviderTestBase):
         self.assertIn("потолок", results["mistral"]["error"])
         self.assertFalse(results["openrouter"]["configured"])
         self.assertEqual(sorted(api.hosts()), ["api.cerebras.ai", "api.groq.com"])  # mistral не вызывался
+
+
+class SlotReturnTest(ProviderTestBase):
+    def count_after(self, response=None, exc=None):
+        prov = self.use(GROQ_MODELS="m1")
+        api = FakeApi({"groq.com": response}) if response is not None else None
+        with mock.patch("requests.post", side_effect=exc or api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        return prov["groq"].count
+
+    def test_returned_when_no_provider_answer(self):
+        self.assertEqual(self.count_after(resp(500)), 0)
+        self.assertEqual(self.count_after(resp(503)), 0)
+        self.assertEqual(self.count_after(exc=OSError("net")), 0)
+        bad = mock.Mock(status_code=200, headers={"content-type": "text/plain"}, text="oops")
+        bad.json.side_effect = ValueError("no json")
+        self.assertEqual(self.count_after(bad), 0)
+
+    def test_timeout_keeps_slot(self):
+        import requests
+        # при таймауте провайдер мог засчитать запрос: слот остаётся
+        self.assertEqual(self.count_after(exc=requests.Timeout("slow")), 1)
+
+    def test_kept_when_provider_answered(self):
+        self.assertEqual(self.count_after(resp(429, headers={"retry-after": "5"})), 1)
+        self.assertEqual(self.count_after(resp(400, text="bad")), 1)
+        self.assertEqual(self.count_after(resp(200, content="не json")), 1)   # ответ был, не разобран
+        self.assertEqual(self.count_after(resp(200)), 1)
+
+
+class CountPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.store = {}
+        for p in (mock.patch("database.kv_get", side_effect=lambda k, d=None: self.store.get(k, d)),
+                  mock.patch("database.kv_set", side_effect=lambda k, v: self.store.__setitem__(k, str(v))),
+                  mock.patch("time.sleep")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def ask(self, provider):
+        with mock.patch("requests.post", side_effect=FakeApi({"groq.com": resp(200)})):
+            ai_scorer._ask_provider_model(provider, "m1", ORDER)
+
+    def provider(self):
+        return ai_scorer._build_providers(env(GROQ_MODELS="m1"))["groq"]
+
+    def test_counter_survives_restart(self):
+        today = ai_scorer._today()
+        p = self.provider()
+        self.ask(p)
+        self.ask(p)
+        self.assertEqual(self.store["ai_count_groq"], f"{today}:2")
+        p2 = self.provider()                      # «рестарт»: новые объекты провайдеров
+        self.ask(p2)
+        self.assertEqual(p2.count, 3)
+        self.assertEqual(self.store["ai_count_groq"], f"{today}:3")
+
+    def test_load_blocks_concurrent_reserve(self):
+        import threading
+        today = ai_scorer._today()
+        self.store["ai_count_groq"] = f"{today}:7"
+        started = threading.Event()
+
+        def slow_get(key, default=None):
+            started.set()
+            threading.Event().wait(0.3)      # медленное чтение (time.sleep замокан)
+            return self.store.get(key, default)
+
+        p = self.provider()
+        with mock.patch("database.kv_get", side_effect=slow_get):
+            loader = threading.Thread(target=ai_scorer._load_count, args=(p,))
+            loader.start()
+            started.wait(2)
+            reserver = threading.Thread(target=ai_scorer._reserve_slot, args=(p,))
+            reserver.start()                 # должен дождаться загрузки, а не занять слот раньше
+            loader.join(5)
+            reserver.join(5)
+        self.assertEqual(p.count, 8)
+        self.assertEqual(self.store["ai_count_groq"], f"{today}:8")
+
+    def test_foreign_values_ignored(self):
+        for raw in ("garbage", "2020-01-01:5", f"{ai_scorer._today()}:abc", ":", ""):
+            self.store["ai_count_groq"] = raw
+            p = self.provider()
+            self.ask(p)
+            self.assertEqual(p.count, 1, raw)
+
+    def test_db_error_works_in_memory(self):
+        with mock.patch("database.kv_get", side_effect=OSError("db")), \
+                mock.patch("database.kv_set", side_effect=OSError("db")):
+            p = self.provider()
+            self.ask(p)
+        self.assertEqual(p.count, 1)
 
 
 if __name__ == "__main__":

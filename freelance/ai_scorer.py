@@ -265,6 +265,7 @@ class _Provider:
     paused: dict = field(default_factory=dict)    # модель -> конец паузы после 429
     disabled: set = field(default_factory=set)    # модели без доступа (404) - до рестарта
     no_json: set = field(default_factory=set)     # модели без response_format
+    count_loaded: bool = False          # дневной счётчик уже восстановлен из kv
     cap_logged_day: str = ""             # за какие сутки уже писали в лог об исчерпанном потолке
 
 
@@ -1002,10 +1003,60 @@ def _provider_pause(resp) -> tuple[int, bool]:
     return int(max(1, min(MAX_PROVIDER_PAUSE_SEC, math.ceil(pause)))), daily
 
 
+_count_load_lock = threading.Lock()   # загрузка счётчиков из kv (держим только на время чтения)
+_count_save_lock = threading.Lock()   # пара «снимок + запись» в kv: последняя запись - самая свежая
+
+
+def _load_count(p: _Provider) -> None:
+    """Один раз за процесс подтягивает дневной счётчик провайдера из kv (ключ
+    ai_count_<имя> = "YYYY-MM-DD:N"), чтобы рестарт не обнулял бесплатную квоту.
+    Остальные потоки ждут загрузку (иначе заняли бы слот до неё и потеряли сохранённое N).
+    Любая ошибка БД или чужое значение - работаем как раньше, только в памяти."""
+    with _count_load_lock:
+        if p.count_loaded:
+            return
+        try:
+            try:
+                from database import kv_get
+                raw = kv_get(f"ai_count_{p.name}")
+            except Exception as e:
+                logging.warning(f"[AI] {p.name}: счётчик за сутки не прочитан из БД: {type(e).__name__}")
+                return
+            day, sep, num = str(raw or "").partition(":")
+            if not (sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)):
+                return
+            with _lock:
+                if day == _today() and p.day in ("", day):
+                    p.day, p.count = day, max(p.count, int(num))
+        finally:
+            p.count_loaded = True
+
+
+def _save_count(p: _Provider) -> None:
+    """Записывает дневной счётчик провайдера в kv. Снимок и запись - под _count_save_lock,
+    чтобы старый снимок не перезаписал новый; сам _lock во время записи не держим."""
+    with _count_save_lock:
+        with _lock:
+            value = f"{p.day}:{p.count}"
+        try:
+            from database import kv_set
+            kv_set(f"ai_count_{p.name}", value)
+        except Exception as e:
+            logging.warning(f"[AI] {p.name}: счётчик за сутки не записан в БД: {type(e).__name__}")
+
+
+def _give_back_slot(p: _Provider) -> None:
+    """Запрос не дал ответа от провайдера (сеть, 5xx, не-JSON): слот дневного лимита возвращаем."""
+    with _lock:
+        p.count = max(0, p.count - 1)
+    _save_count(p)
+
+
 def _reserve_slot(p: _Provider) -> float | None:
     """Занимает слот запроса у провайдера: дневной потолок и свой интервал между запросами.
     Возвращает, сколько секунд ждать до запроса, или None - провайдер сейчас не годится
     (потолок за сутки или очередь длиннее PROVIDER_MAX_WAIT_SEC: заказ уйдёт дальше)."""
+    _load_count(p)
     with _lock:
         now = time.monotonic()
         if p.dead or now < p.blocked_until:
@@ -1026,6 +1077,7 @@ def _reserve_slot(p: _Provider) -> float | None:
             return None
         p.count += 1
         p.next_at = start + p.min_interval
+    _save_count(p)
     return start - now
 
 
@@ -1207,6 +1259,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 if state:
                     p.count = max(0, p.count - 1)  # запрос не ушёл - слот возвращаем
             if state:
+                _save_count(p)
                 return state
         sent_at = time.monotonic()
         try:
@@ -1219,6 +1272,8 @@ def _ask_provider_model(p: _Provider, model: str, order):
         except Exception as e:
             logging.warning(f"[AI] {label}: сбой запроса: {type(e).__name__}")
             _set_error(f"{label}: {type(e).__name__}", p)
+            if not isinstance(e, requests.Timeout):
+                _give_back_slot(p)   # запрос не дошёл - слот не тратим (при таймауте провайдер мог засчитать)
             return "next"
         if resp.status_code == 400 and use_json and attempt == 1:
             body = str(resp.text or "")[:600].lower()
@@ -1280,6 +1335,8 @@ def _ask_provider_model(p: _Provider, model: str, order):
     if code != 200:
         logging.warning(f"[AI] {label}: HTTP {code}: {str(resp.text or '')[:150]!r}")
         _set_error(f"{label}: HTTP {code}", p)
+        if code >= 500:
+            _give_back_slot(p)   # сбой на стороне провайдера - слот не тратим
         return "next"
 
     try:
@@ -1288,6 +1345,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
         ctype, snippet = _body_info(resp)
         logging.warning(f"[AI] {label}: ответ не JSON: {type(e).__name__} ({ctype}): {snippet[:200]!r}")
         _set_error(f"{label}: ответ не JSON ({ctype}): «{snippet[:80]}»", p)
+        _give_back_slot(p)       # настоящего ответа не было - слот не тратим
         html_page = "text/html" in ctype.lower()
         if html_page or not snippet:
             # HTML - скорее всего страница блокировки/прокси: пауза всего провайдера;

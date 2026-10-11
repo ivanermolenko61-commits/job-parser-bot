@@ -69,6 +69,9 @@ STALE_CYCLES_LIMIT = 12
 PARTIAL_ALERT_CYCLES = 3   # столько циклов подряд скан обрывается, не продвигая курсор, - тревога
 # При первом запуске/застое отступаем от границы на столько id (~50 id/час * 24 ч с запасом)
 BOOTSTRAP_LOOKBACK = 1500
+# Первый запуск (нет курсора, например БД стёрлась при деплое): берём только последние
+# ~50 id (≈1 ч), чтобы не оценивать и не присылать заново суточный поток
+FIRST_RUN_LOOKBACK = 50
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
 # Повторы записи отправленного заказа в БД
@@ -259,9 +262,10 @@ def _prepare_cycle() -> CycleResult:
                 kv_set("freelance_stale", 0)
         else:
             top = find_upper_bound(ALOT_SEED_ID)
-            last_id = top - BOOTSTRAP_LOOKBACK
-            max_ahead = BOOTSTRAP_LOOKBACK + 300
-            logging.info(f"[FREELANCE] первый запуск: граница id={top}")
+            last_id = top - FIRST_RUN_LOOKBACK
+            max_ahead = FIRST_RUN_LOOKBACK + 300
+            logging.info(f"[FREELANCE] первый запуск: граница id={top}, "
+                         f"берём последние {FIRST_RUN_LOOKBACK} id")
         scan = fetch_new_orders(last_id, max_ahead=max_ahead)
     except Exception as e:
         logging.exception("[FREELANCE] ошибка получения заказов")
@@ -358,6 +362,7 @@ def _prepare_cycle() -> CycleResult:
     scored = {id(sc): r for sc, r in zip(to_score, results)}
 
     for sc in candidates:
+        fresh_scored = False
         if sc.ai is None:
             if id(sc) not in scored:
                 # AI выключен (нет ключей): отправляем «без AI»
@@ -374,9 +379,14 @@ def _prepare_cycle() -> CycleResult:
                 continue
             res.ai_ok += 1
             sc.ai = r
+            fresh_scored = True
             res.models_used[r.get("model", "?")] = res.models_used.get(r.get("model", "?"), 0) + 1
         # оценка есть (новая или сохранённая раньше): цену считаем кодом, если её ещё нет
         _ensure_price(sc)
+        if fresh_scored:
+            # сразу в БД как pending: сбой/рестарт до finish_cycle не должен
+            # заставить тратить квоту на повторную оценку (finish_cycle перезапишет статус)
+            _save_retry(sc, "pending")
         fit = sc.fit
         if fit is not None and fit < FREELANCE_MIN_FIT:
             res.rejected.append(sc)
