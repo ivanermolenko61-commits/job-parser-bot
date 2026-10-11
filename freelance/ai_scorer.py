@@ -265,6 +265,7 @@ class _Provider:
     paused: dict = field(default_factory=dict)    # модель -> конец паузы после 429
     disabled: set = field(default_factory=set)    # модели без доступа (404) - до рестарта
     no_json: set = field(default_factory=set)     # модели без response_format
+    cap_logged_day: str = ""             # за какие сутки уже писали в лог об исчерпанном потолке
 
 
 def _is_free_openrouter_model(model: str) -> bool:
@@ -1013,7 +1014,11 @@ def _reserve_slot(p: _Provider) -> float | None:
         if p.day != today:
             p.day, p.count = today, 0
         if p.count >= p.max_per_day:
-            logging.debug(f"[AI] {p.name}: дневной потолок {p.max_per_day} исчерпан")
+            # warning раз в сутки: иначе провайдер молча пропадает из логов до 03:00 МСК
+            if p.cap_logged_day != today:
+                p.cap_logged_day = today
+                logging.warning(f"[AI] {p.name}: дневной потолок {p.max_per_day} запросов исчерпан, "
+                                f"пропускаем до 03:00 МСК")
             return None
         start = max(now, p.next_at)
         if start - now > PROVIDER_MAX_WAIT_SEC:
