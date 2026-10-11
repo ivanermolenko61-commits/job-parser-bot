@@ -34,7 +34,8 @@ class CycleTestBase(unittest.TestCase):
         self.addCleanup(setattr, database, "DB_PATH", self.old_path)
         for p in (mock.patch.object(pipeline.monitor, "record"),
                   mock.patch.object(pipeline, "_report_ai_health"),
-                  mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True)):
+                  mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True),
+                  mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=None)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -115,6 +116,59 @@ class SaveRightAfterScoringTest(CycleTestBase):
                 mock.patch("time.sleep"):
             res = pipeline._prepare_cycle()
         self.assertEqual([s.order.order_id for s in res.to_send], [104])
+
+
+class QuotaReserveTest(CycleTestBase):
+    def orders(self):
+        database.kv_set(pipeline.LAST_ID_KEY, 100)
+        o = []
+        for oid, title, cats in ((201, "Создать телеграм бота", ["PROG_OTHER"]),   # группа 1
+                                 (202, "Создать телеграм бота", []),               # группа 2
+                                 (203, "Специалист TapLink", [])):                 # группа 3 (бот в тексте)
+            order = make_order(oid, title)
+            order.categories = cats
+            order.body = f"нужен бот {oid}"   # разные ключи дублей
+            o.append(order)
+        return o
+
+    def run_cycle(self, capacity):
+        calls = []
+
+        def score(order):
+            calls.append(order.order_id)
+            return ai_result(8)
+
+        with mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan(self.orders())), \
+                mock.patch.object(pipeline, "AI_WORKERS", 1), \
+                mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=capacity), \
+                mock.patch.object(pipeline.ai_scorer, "score_order", side_effect=score):
+            res = pipeline._prepare_cycle()
+        return res, calls
+
+    def test_priority_order_when_quota_ample(self):
+        res, calls = self.run_cycle((90, 100))
+        self.assertEqual(calls, [201, 202, 203])     # группа 1 первой, хотя id новее у 203
+        self.assertEqual(res.reserved, 0)
+
+    def test_low_quota_skips_group_3(self):
+        res, calls = self.run_cycle((30, 100))
+        self.assertEqual(calls, [201, 202])
+        self.assertEqual(res.reserved, 1)
+        self.assertEqual([s.order.order_id for s in res.unscored], [203])
+        self.assertEqual(res.ai_attempted, 2)       # отложенный - не сбой AI
+
+    def test_very_low_quota_only_group_1(self):
+        res, calls = self.run_cycle((20, 100))
+        self.assertEqual(calls, [201])
+        self.assertEqual(res.reserved, 2)
+
+    def test_border_share_is_reserved(self):
+        res, calls = self.run_cycle((50, 100))       # ровно 50% - группа 3 уже ждёт
+        self.assertEqual(calls, [201, 202])
+
+    def test_no_capped_providers_no_reserve(self):
+        res, calls = self.run_cycle(None)
+        self.assertEqual(sorted(calls), [201, 202, 203])
 
 
 if __name__ == "__main__":

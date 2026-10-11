@@ -76,6 +76,21 @@ def is_candidate(order) -> bool:
     return bool(_INCLUDE_RE.search(f"{title}\n{(order.body or '')[:600]}"))
 
 
+def priority(order) -> int:
+    """Очередь AI-оценки, когда квоты мало (меньше - важнее):
+    1 - категория разработки и ключевое слово в названии,
+    2 - что-то одно из двух,
+    3 - заказ прошёл префильтр только по словам в тексте.
+    На 60 заказах с эталонной оценкой: в группе 1 - 10 из 17 подходящих (fit ≥ 5), в группе 3 - 1 из 17."""
+    dev = bool(DEV_CATEGORIES.intersection(order.categories))
+    in_title = bool(_INCLUDE_RE.search(order.title or ""))
+    if dev and in_title:
+        return 1
+    if dev or in_title:
+        return 2
+    return 3
+
+
 def norm_dedup_key(order) -> str:
     """Ключ дубля: сайт + название + начало текста (YouDo плодит одинаковые заказы)."""
     def n(s: str) -> str:

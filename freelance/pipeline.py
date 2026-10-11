@@ -48,7 +48,7 @@ from freelance.alot_client import (
     find_upper_bound,
     site_name,
 )
-from freelance.filters import is_candidate, norm_dedup_key
+from freelance.filters import is_candidate, norm_dedup_key, priority
 from health import monitor
 
 DEDUP_DAYS = 3
@@ -72,6 +72,11 @@ BOOTSTRAP_LOOKBACK = 1500
 # Первый запуск (нет курсора, например БД стёрлась при деплое): берём только последние
 # ~50 id (≈1 ч), чтобы не оценивать и не присылать заново суточный поток
 FIRST_RUN_LOOKBACK = 50
+# Резерв дневной квоты AI для заказов поважнее (группы filters.priority): группа 3
+# оценивается, пока осталось больше половины квоты, группа 2 - больше 20%, группа 1 - всегда.
+# Отложенный заказ ждёт в pending; квота сбрасывается в 03:00 МСК, а свежесть - 6 ч,
+# поэтому после сброса оценятся только недавние отложенные, остальные истекут.
+RESERVE_SHARE = {2: 0.2, 3: 0.5}
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
 # Повторы записи отправленного заказа в БД
@@ -102,6 +107,7 @@ def mark_sent_status(order_id: int, status: str) -> bool:
         return True
 
 _SKIPPED = object()  # заказ не оценивался (лимит цикла / дедлайн): попытку не считаем
+_RESERVED = object()  # не оценивался: квоты мало, она оставлена заказам поважнее
 
 
 @dataclass
@@ -137,6 +143,7 @@ class CycleResult:
     ai_ok: int = 0
     models_used: dict = field(default_factory=dict)  # модель -> сколько оценок
     pending_loaded: int = 0
+    reserved: int = 0        # отложено ради резерва квоты
 
 
 def prepare_cycle() -> CycleResult:
@@ -344,13 +351,17 @@ def _prepare_cycle() -> CycleResult:
     # сбой) остаётся pending и оценивается в следующих циклах, пока свежий: без
     # оценки в чат не уходит (иначе при исчерпанной квоте летит весь поток без фильтра).
     # «Без AI» отправляется только когда AI выключен совсем (нет ключей).
+    # Очередь: сначала группа приоритета 1 (см. filters.priority), внутри группы новые первыми.
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
+    to_score.sort(key=lambda sc: (priority(sc.order), -sc.order.order_id))
 
     def _score(item):
         idx, sc = item
         if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
             return _SKIPPED
+        if _quota_reserved(priority(sc.order)):
+            return _RESERVED
         try:
             return ai_scorer.score_order(sc.order)
         except Exception:
@@ -369,7 +380,9 @@ def _prepare_cycle() -> CycleResult:
                 res.to_send.append(sc)
                 continue
             r = scored[id(sc)]
-            if r is _SKIPPED:
+            if r is _SKIPPED or r is _RESERVED:
+                if r is _RESERVED:
+                    res.reserved += 1
                 res.unscored.append(sc)
                 continue
             res.ai_attempted += 1
@@ -398,10 +411,26 @@ def _prepare_cycle() -> CycleResult:
     logging.info(
         f"[FREELANCE] скан: {scan.raw_count}, pending: {res.pending_loaded}, "
         f"кандидатов: {len(candidates)}, к отправке: {len(res.to_send)}, "
-        f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)}, "
+        f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)} "
+        f"(из них в резерве квоты: {res.reserved}), "
         f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}"
     )
     return res
+
+
+def _quota_reserved(group: int) -> bool:
+    """True - квоты осталось мало, и заказ этой группы приоритета не оцениваем (RESERVE_SHARE).
+    Резерв не применяем, если daily_capacity() вернул None (доступен Gemini или нет
+    провайдеров с дневным потолком). Проверка и занятие слота не атомарны: у самого порога
+    4 потока могут пропустить пару лишних заказов - это допустимо."""
+    share = RESERVE_SHARE.get(group)
+    if share is None:
+        return False
+    cap = ai_scorer.daily_capacity()
+    if cap is None:
+        return False
+    left, total = cap
+    return left <= total * share
 
 
 def _ensure_price(sc: ScoredOrder) -> None:

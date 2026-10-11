@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 
 from freelance.alot_client import FreelanceOrder
-from freelance.filters import is_candidate, is_service_offer
+from freelance.filters import is_candidate, is_service_offer, priority
 
 
 def make(title):
@@ -37,6 +37,20 @@ class ServiceOfferTest(unittest.TestCase):
         for title in self.ORDERS:
             self.assertFalse(is_service_offer(title), title)
             self.assertTrue(is_candidate(make(title)), title)
+
+
+def make_cat(title, categories, body=""):
+    return FreelanceOrder(1, "youdoru", title, body, "", 0.0, categories,
+                          datetime.now(timezone.utc), "https://example.com/1")
+
+
+class PriorityTest(unittest.TestCase):
+    def test_groups(self):
+        # примеры из эталонной выборки (fit 7-8, кроме последнего)
+        self.assertEqual(priority(make_cat("Создать сайт на тильде", ["WEB"])), 1)
+        self.assertEqual(priority(make_cat("Написать макрос в excel", ["FINANCE"])), 2)
+        self.assertEqual(priority(make_cat("Создать миниапп", ["PROG_OTHER"])), 2)
+        self.assertEqual(priority(make_cat("Специалист TapLink", ["SEOSMM"], "нужен сайт")), 3)
 
 
 if __name__ == "__main__":

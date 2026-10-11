@@ -217,7 +217,8 @@ PROVIDER_SPECS = {
         "url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1", "prefix": "CLOUDFLARE",
         "models": "@cf/openai/gpt-oss-120b,@cf/qwen/qwen3-30b-a3b-fp8",
         # нейроны общие на аккаунт: дневной 429 паузит весь провайдер
-        "interval": 3.0, "per_day": 40, "shared_daily": True,
+        # 10 000 нейронов/сутки ≈ 50-55 оценок gpt-oss-120b (замер 11.10: ~185 нейронов на заказ)
+        "interval": 3.0, "per_day": 50, "shared_daily": True,
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1", "prefix": "GROQ",
@@ -1079,6 +1080,53 @@ def _reserve_slot(p: _Provider) -> float | None:
         p.next_at = start + p.min_interval
     _save_count(p)
     return start - now
+
+
+CAPACITY_PAUSE_SEC = 3600   # провайдер на паузе дольше этого - его остаток квоты сейчас не в счёт
+
+
+def _gemini_available() -> bool:
+    """Gemini может ответить прямо сейчас (под _lock): нет блокировки по ключу/региону
+    и есть модель не на паузе. Ошибка региона снимается только успешным ответом,
+    поэтому между повторами раз в 30 мин Gemini «доступным» не считается."""
+    now = time.monotonic()
+    if _region_error or now < _config_blocked_until:
+        return False
+    return any(m not in _disabled and now >= _paused_until.get(m, 0.0) for m in GEMINI_MODELS)
+
+
+def daily_capacity() -> tuple[int, int] | None:
+    """(осталось, всего) запросов на сегодня у провайдеров цепочки с дневным потолком
+    (с ключом и не выключенных из-за оплаты). None - резерв не нужен: таких провайдеров
+    нет или доступен Gemini (у него нет нашего потолка, лимиты он сообщает сам).
+    Yandex не считаем: платный и ограничен отдельно. Провайдер, который сейчас не ответит
+    (ключ отклонён, все модели выключены или на паузе дольше часа - например, дневной 429),
+    входит в «всего», но его остаток не считается."""
+    left = total = 0
+    found = False
+    active = _chain_active()
+    if "gemini" in active:
+        with _lock:
+            if _gemini_available():
+                return None
+    for name in active:
+        p = PROVIDERS.get(name)
+        if p is None:
+            continue
+        _load_count(p)
+        with _lock:
+            if p.dead:
+                continue
+            now = time.monotonic()
+            usable = now >= p.blocked_until and any(
+                m not in p.disabled and p.paused.get(m, 0.0) - now < CAPACITY_PAUSE_SEC
+                for m in p.models)
+            used = p.count if p.day == _today() else 0
+            total += p.max_per_day
+            if usable:
+                left += max(0, p.max_per_day - used)
+            found = True
+    return (left, total) if found else None
 
 
 def _is_paid(pricing) -> bool:

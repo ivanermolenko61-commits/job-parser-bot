@@ -3,6 +3,7 @@
 Запуск из корня проекта: python -m unittest tests.test_providers -v
 """
 import json
+import time
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -963,6 +964,51 @@ class CountPersistenceTest(unittest.TestCase):
             p = self.provider()
             self.ask(p)
         self.assertEqual(p.count, 1)
+
+
+class DailyCapacityTest(ProviderTestBase):
+    def test_sums_left_and_total(self):
+        prov = self.use(GROQ_MAX_PER_DAY="10", CEREBRAS_MAX_PER_DAY="20",
+                        MISTRAL_MAX_PER_DAY="30", OPENROUTER_MAX_PER_DAY="40")
+        today = ai_scorer._today()
+        prov["groq"].day, prov["groq"].count = today, 4
+        prov["cerebras"].day, prov["cerebras"].count = "2000-01-01", 20   # вчерашний счётчик не в счёт
+        prov["mistral"].dead = True                                        # выключен из-за оплаты
+        prov["openrouter"].day, prov["openrouter"].count = today, 99       # сверх потолка - не в минус
+        self.assertEqual(ai_scorer.daily_capacity(), (6 + 20 + 0, 10 + 20 + 40))
+
+    def test_none_without_capped_providers(self):
+        self.use()
+        with mock.patch.object(ai_scorer, "CHAIN", ["gemini"]), \
+                mock.patch.object(ai_scorer, "GEMINI_KEY", "k"):
+            self.assertIsNone(ai_scorer.daily_capacity())
+
+    def test_unavailable_provider_left_not_counted(self):
+        prov = self.use(GROQ_MAX_PER_DAY="10", CEREBRAS_MAX_PER_DAY="20",
+                        MISTRAL_MAX_PER_DAY="30", OPENROUTER_MAX_PER_DAY="40")
+        now = time.monotonic()
+        prov["groq"].blocked_until = now + 300                              # ключ отклонён
+        prov["cerebras"].paused = {m: now + 3 * 3600 for m in prov["cerebras"].models}  # дневной 429
+        prov["mistral"].paused = {m: now + 60 for m in prov["mistral"].models}          # короткая пауза
+        self.assertEqual(ai_scorer.daily_capacity(), (30 + 40, 100))
+
+    def test_gemini_available_disables_reserve(self):
+        self.use()
+        with mock.patch.object(ai_scorer, "CHAIN", ["gemini", "groq"]), \
+                mock.patch.object(ai_scorer, "GEMINI_KEY", "k"), \
+                mock.patch.object(ai_scorer, "_region_error", ""), \
+                mock.patch.object(ai_scorer, "_config_blocked_until", 0.0):
+            self.assertIsNone(ai_scorer.daily_capacity())
+            with mock.patch.object(ai_scorer, "_region_error", "регион"):
+                self.assertIsNotNone(ai_scorer.daily_capacity())
+
+    def test_provider_without_key_not_counted(self):
+        self.use(GROQ_API_KEY="", GROQ_MAX_PER_DAY="10")
+        self.assertEqual(ai_scorer.daily_capacity()[1], 300 + 1000 + 45)
+
+    def test_cloudflare_default_cap(self):
+        prov = ai_scorer._build_providers({"CLOUDFLARE_API_KEY": "k", "CLOUDFLARE_ACCOUNT_ID": "a1"})
+        self.assertEqual(prov["cloudflare"].max_per_day, 50)
 
 
 if __name__ == "__main__":
