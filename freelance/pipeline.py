@@ -158,6 +158,26 @@ def _parse_dt(value: str) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def scored_from_row(row: dict) -> ScoredOrder:
+    """ScoredOrder из строки freelance_orders (для кнопки «Подробнее»). Текста заказа
+    в БД нет (body пустой) - в AI-режиме он для карточки не нужен."""
+    ai = None
+    if row.get("ai_json"):
+        try:
+            loaded = json.loads(row["ai_json"])
+            if isinstance(loaded, dict) and "fit" in loaded:
+                ai = loaded
+        except ValueError:
+            ai = None
+    order = FreelanceOrder(
+        order_id=int(row["order_id"]), site=row.get("site") or "", title=row.get("title") or "",
+        body="", price_text=row.get("price_text") or "", price_value=0.0, categories=[],
+        published_at=_parse_dt(row.get("published_at")) or datetime.now(timezone.utc),
+        url=row.get("url") or "",
+    )
+    return ScoredOrder(order, ai, row.get("dedup_key") or "")
+
+
 def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOrder]:
     """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает по id."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
@@ -420,8 +440,9 @@ def _report_ai_health(res: CycleResult) -> None:
     if res.ai_ok == 0:
         streak = int(kv_get(AI_FAIL_STREAK_KEY, "0") or 0) + 1
         kv_set(AI_FAIL_STREAK_KEY, streak)
-        reason = st["last_error"] or "нет ответа от моделей"
-        monitor.record("gemini", 0, RuntimeError(reason), label=label)
+        reason = ai_scorer.failure_summary() or "нет ответа от моделей"
+        # reason= задаём явно: иначе в алерте был бы префикс «ошибка: RuntimeError:»
+        monitor.record("gemini", 0, RuntimeError(reason), label=label, reason=reason)
     else:
         kv_set(AI_FAIL_STREAK_KEY, 0)
         monitor.record("gemini", res.ai_ok, label=label)
@@ -556,14 +577,6 @@ def _money(value) -> str:
     return f"{int(_num(value)):,}".replace(",", " ")
 
 
-def _price_line(ai: dict) -> str:
-    low, mid, high = (_num(ai.get(k)) for k in ("price_low", "price_mid", "price_high"))
-    line = f"💵 Предложить: {_money(mid)} ₽"
-    if low > 0 and high > 0 and (low != mid or high != mid):
-        line += f" ({_money(low)}–{_money(high)})"
-    return line
-
-
 def _thousands(value: float) -> str:
     k = value / 1000
     return f"{k:.1f}".rstrip("0").rstrip(".")
@@ -615,22 +628,34 @@ def _components_line(ai: dict) -> str:
     return " · ".join(items)
 
 
-def format_order(sc: ScoredOrder, compact: bool = False) -> str:
-    """HTML-сообщение о заказе. Итог не длиннее MAX_MESSAGE_LEN (иначе упрощается)."""
+def _price_note(ai: dict) -> str:
+    """Одна пометка после цены; приоритет: бюджет занижен -> упёрлось в бюджет ->
+    поднято к бюджету -> вердикт рынка (если не «в рынке»)."""
+    if ai.get("budget_low"):
+        return "бюджет занижен"
+    if ai.get("budget_capped"):
+        return "упёрлось в бюджет"
+    if ai.get("budget_raised"):
+        return "бюджет выше расчёта"
+    verdict = str(ai.get("market_verdict") or "").strip()
+    if verdict and verdict != "в рынке":
+        return verdict[:40]
+    return ""
+
+
+def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False) -> str:
+    """HTML-сообщение о заказе. По умолчанию короткая карточка; detailed=True добавляет
+    вилку цены, расчёт, риск, компоненты и сложность (кнопка «Подробнее»).
+    Итог не длиннее MAX_MESSAGE_LEN: подробный упрощается до короткого, короткий - до plain."""
     o, ai = sc.order, sc.ai
     e = html.escape
     fit = sc.fit
     fire = "🔥 " if fit is not None and fit >= 9 else ""
     t = o.published_at.astimezone(MSK).strftime("%H:%M")
-    lines = [
-        f"{fire}💼 <b>{e((o.title or '')[:200])}</b>   [{e(site_name(o.site))}]",
-        f"💰 {e((o.price_text or 'не указана')[:100])} · 🕒 {t}",
-    ]
+    money = f"💰 {e((o.price_text or 'не указана')[:100])} · 🕒 {t}"
+    lines = [f"{fire}💼 <b>{e((o.title or '')[:200])}</b>   [{e(site_name(o.site))}]"]
     if ai and fit is not None:
-        parts = [f"{fit}/10"]
-        difficulty = str(ai.get("difficulty") or "")
-        if difficulty:
-            parts.append(difficulty[:20])
+        parts = [f"🤖 {fit}/10"]
         hours = _fmt_hours(ai.get("hours"))
         if hours:
             parts.append(f"~{hours} ч")
@@ -639,28 +664,41 @@ def format_order(sc: ScoredOrder, compact: bool = False) -> str:
             # старая запись без расчёта цены: прежний вывод
             price_rub = str(ai.get("price_rub") or "").strip()
             if price_rub:
-                parts.append(f"предложить {price_rub[:100]}")
-        lines.append("🤖 " + " · ".join(e(p) for p in parts))
+                parts.append(f"предложить {e(price_rub[:100])}")
+        lines.append(" · ".join([money] + parts))
         if price_mid > 0:
-            lines.append(_price_line(ai))
-            if not compact:
+            line = f"💵 Предложить: {_money(price_mid)} ₽"
+            note = _price_note(ai)
+            if note:
+                line += f" · {e(note)}"
+            lines.append(line)
+        summary = str(ai.get("summary") or "")
+        if detailed:
+            if price_mid > 0:
+                low, high = _num(ai.get("price_low")), _num(ai.get("price_high"))
+                if low > 0 and high > 0 and (low != price_mid or high != price_mid):
+                    lines.append(f"   вилка: {_money(low)}–{_money(high)} ₽")
                 basis = _price_basis_line(ai)
                 if basis:
                     lines.append(f"   {e(basis)}")
+            difficulty = str(ai.get("difficulty") or "")
+            if difficulty:
+                lines.append(f"⚙️ Сложность: {e(difficulty[:20])}")
         if not compact:
-            summary = str(ai.get("summary") or "")
-            risks = str(ai.get("risks") or "")
             if summary:
                 lines.append(f"📝 {e(summary[:300])}")
-            if risks:
-                lines.append(f"⚠️ Риск: {e(risks[:300])}")
-            comps = _components_line(ai)
-            if comps:
-                lines.append(f"🧩 {e(comps)}")
+            if detailed:
+                risks = str(ai.get("risks") or "")
+                if risks:
+                    lines.append(f"⚠️ Риск: {e(risks[:300])}")
+                comps = _components_line(ai)
+                if comps:
+                    lines.append(f"🧩 {e(comps)}")
             questions = ai.get("questions")
             if isinstance(questions, list) and questions and str(questions[0]).strip():
                 lines.append(f"❓ Уточнить: {e(str(questions[0]).strip()[:200])}")
     else:
+        lines.append(money)
         lines.append("🤖 без AI")
         if not compact:
             body = " ".join((o.body or "").split())
@@ -668,6 +706,8 @@ def format_order(sc: ScoredOrder, compact: bool = False) -> str:
                 lines.append(f"📝 {e(body[:300])}{'…' if len(body) > 300 else ''}")
     text = "\n".join(lines)
     if len(text) > MAX_MESSAGE_LEN:
+        if detailed:
+            return format_order(sc, compact=compact)
         if not compact:
             return format_order(sc, compact=True)
         return format_order_plain(sc)  # HTML резать нельзя: сломаются теги

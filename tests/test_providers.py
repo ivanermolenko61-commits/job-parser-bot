@@ -4,6 +4,7 @@
 """
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -637,6 +638,213 @@ class HealthReportTest(unittest.TestCase):
         monitor, out = self.run_report([{}], ai_ok=0, attempted=3)
         self.assertEqual(out[0], [])  # порог 3 цикла
         self.assertEqual(monitor.streak["gemini"], 1)
+
+
+def raw_resp(payload, status=200, text=None):
+    """Ответ 200 с произвольным JSON-телом (для content_filter и пустых choices)."""
+    r = mock.Mock()
+    r.status_code = status
+    r.headers = {}
+    r.text = text if text is not None else json.dumps(payload)
+    r.json.return_value = payload
+    return r
+
+
+class EmptyAnswerTest(ProviderTestBase):
+    def test_content_filter_goes_next(self):
+        prov = self.use(GROQ_MODELS="m1")
+        payload = {"choices": [{"finish_reason": "content_filter", "message": {"content": None}}]}
+        api = FakeApi({"groq.com": raw_resp(payload)})
+        with mock.patch("requests.post", side_effect=api):
+            outcome = ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(outcome, "next")
+        self.assertIn("отказ модерации", prov["groq"].last_error)
+        self.assertIn("отказ модерации", ai_scorer._last_error)
+
+    def test_empty_choices(self):
+        prov = self.use(GROQ_MODELS="m1")
+        api = FakeApi({"groq.com": raw_resp({"choices": []})})
+        with mock.patch("requests.post", side_effect=api):
+            outcome = ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(outcome, "next")
+        self.assertEqual(prov["groq"].last_error, "groq:m1: нет choices")
+
+    def test_empty_content_has_finish_reason(self):
+        prov = self.use(GROQ_MODELS="m1")
+        payload = {"choices": [{"finish_reason": "length", "message": {"content": None}}]}
+        api = FakeApi({"groq.com": raw_resp(payload)})
+        with mock.patch("requests.post", side_effect=api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(prov["groq"].last_error, "groq:m1: пустой ответ (finish_reason=length)")
+
+    def test_last_error_per_provider_and_cleared_by_success(self):
+        prov = self.use(GROQ_MODELS="m1", CEREBRAS_MODELS="c1")
+        api = FakeApi({"groq.com": resp(500), "cerebras.ai": resp(200)})
+        with mock.patch("requests.post", side_effect=api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+            self.assertEqual(prov["groq"].last_error, "groq:m1: HTTP 500")
+            self.assertEqual(prov["cerebras"].last_error, "")
+            self.assertEqual(ai_scorer.status()["providers"]["groq"]["last_error"],
+                             "groq:m1: HTTP 500")
+        api = FakeApi({"groq.com": resp(200)})
+        with mock.patch("requests.post", side_effect=api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(prov["groq"].last_error, "")
+
+
+class FailureSummaryTest(ProviderTestBase):
+    NOW = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)   # 13:00 МСК
+
+    def setUp(self):
+        super().setUp()
+        self.prov = self.use(GROQ_MODELS="m1", CEREBRAS_MODELS="c1", MISTRAL_MODELS="s1",
+                             OPENROUTER_MODELS="x:free")
+
+    def pause(self, name, seconds):
+        p = self.prov[name]
+        for m in p.models:
+            p.paused[m] = ai_scorer.time.monotonic() + seconds
+
+    def test_all_paused(self):
+        self.pause("groq", 3630)
+        self.pause("cerebras", 7230)
+        self.pause("mistral", 5430)
+        self.pause("openrouter", 3630)
+        text = ai_scorer.failure_summary(self.NOW)
+        self.assertTrue(text.startswith("кончились бесплатные квоты, оценка возобновится ~14:00 МСК"))
+        self.assertIn("cerebras: на паузе до 15:00 МСК", text)
+
+    def test_all_blocked_by_daily_cap(self):
+        for p in self.prov.values():
+            p.day, p.count = "2026-10-11", p.max_per_day
+        text = ai_scorer.failure_summary(self.NOW)
+        self.assertIn("оценка возобновится ~03:00 МСК", text)
+        self.assertIn("лимит 900/900 за сутки", text)
+
+    def test_mixed(self):
+        self.pause("groq", 3630)
+        self.prov["cerebras"].last_error = "cerebras:c1: HTTP 500"
+        self.prov["mistral"].key_error = "ключ mistral отклонён (HTTP 401)"
+        text = ai_scorer.failure_summary(self.NOW)
+        self.assertNotIn("кончились", text)
+        self.assertIn("groq: на паузе до 14:00 МСК", text)
+        self.assertIn("cerebras:c1: HTTP 500", text)
+        self.assertNotIn("cerebras: cerebras:", text)
+        self.assertIn("mistral: ключ mistral отклонён (HTTP 401)", text)
+        self.assertIn("openrouter: нет ответа", text)
+        self.assertIn(" · ", text)
+
+    def test_alert_has_no_runtime_error_prefix(self):
+        monitor = HealthMonitor()
+        res = pipeline.CycleResult(ai_attempted=3, ai_ok=0)
+        st = {"key_errors": {}, "paid_errors": {}, "providers": {}}
+        with mock.patch.object(pipeline, "monitor", monitor), \
+                mock.patch.object(pipeline.ai_scorer, "status", return_value=st), \
+                mock.patch.object(pipeline.ai_scorer, "failure_summary", return_value="groq: нет ответа"), \
+                mock.patch.object(pipeline, "kv_get", return_value="2"), \
+                mock.patch.object(pipeline, "kv_set"):
+            for _ in range(3):   # порог монитора - 3 плохих цикла подряд
+                pipeline._report_ai_health(res)
+        alerts = monitor.pop_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("groq: нет ответа", alerts[0])
+        self.assertNotIn("RuntimeError", alerts[0])
+
+
+class GeminiRegionTest(ProviderTestBase):
+    NOW = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("GEMINI_KEY", "k"), ("CHAIN", ["gemini"]), ("GEMINI_MODELS", ["g1", "g2"]),
+                            ("_config_blocked_until", 0.0), ("_config_error", ""),
+                            ("_region_error", ""), ("_paused_until", {}), ("_disabled", set())):
+            p = mock.patch.object(ai_scorer, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ai_scorer, "_throttle")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_region_blocks_all_gemini(self):
+        body = ('{"error": {"code": 400, "message": "User location is not supported for the API use.", '
+                '"status": "FAILED_PRECONDITION"}}')
+        api = FakeApi({"googleapis.com": resp(400, text=body)})
+        with mock.patch("requests.post", side_effect=api):
+            self.assertIsNone(ai_scorer.score_order(ORDER))
+            self.assertIsNone(ai_scorer.score_order(ORDER))   # блокировка: сети нет
+        self.assertEqual(len(api.calls), 1)                   # вторая модель не вызывалась
+        st = ai_scorer.status()
+        self.assertEqual(st["key_errors"], {})
+        self.assertIn("регион", st["region_error"])
+        text = ai_scorer.failure_summary(self.NOW)
+        self.assertIn("регион сервера не поддерживается, повтор в", text)
+        self.assertNotIn("кончились", text)   # регион - не квота
+
+    def test_success_clears_region(self):
+        ai_scorer._region_error = "x"
+        api = FakeApi({"googleapis.com": mock.Mock(
+            status_code=200, text="ok", headers={},
+            json=mock.Mock(return_value={"candidates": [{"content": {"parts": [{"text": GOOD}]}}]}))})
+        with mock.patch("requests.post", side_effect=api):
+            self.assertIsNotNone(ai_scorer.score_order(ORDER))
+        self.assertEqual(ai_scorer._region_error, "")
+
+
+class NonJsonTest(ProviderTestBase):
+    def non_json(self, ctype, text):
+        r = mock.Mock()
+        r.status_code = 200
+        r.headers = {"content-type": ctype}
+        r.text = text
+        r.json.side_effect = ValueError("no json")
+        return r
+
+    def test_html_pauses_all_models(self):
+        prov = self.use(GROQ_MODELS="m1,m2")
+        api = FakeApi({"groq.com": self.non_json("text/html; charset=utf-8", "<html>\nblocked</html>")})
+        with mock.patch("requests.post", side_effect=api):
+            outcome = ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(outcome, "next")
+        self.assertEqual(set(prov["groq"].paused), {"m1", "m2"})
+        self.assertIn("ответ не JSON (text/html; charset=utf-8): «<html> blocked</html>»",
+                      prov["groq"].last_error)
+
+    def test_plain_text_no_pause(self):
+        prov = self.use(GROQ_MODELS="m1,m2")
+        api = FakeApi({"groq.com": self.non_json("text/plain", "oops")})
+        with mock.patch("requests.post", side_effect=api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertFalse(prov["groq"].paused)
+        self.assertIn("(text/plain)", prov["groq"].last_error)
+
+    def test_empty_body_pauses(self):
+        prov = self.use(GROQ_MODELS="m1,m2")
+        api = FakeApi({"groq.com": self.non_json("application/json", "")})
+        with mock.patch("requests.post", side_effect=api):
+            ai_scorer._ask_provider_model(prov["groq"], "m1", ORDER)
+        self.assertEqual(set(prov["groq"].paused), {"m1"})   # пустое тело - только эта модель
+
+
+class ScoredFromRowTest(unittest.TestCase):
+    ROW = {"order_id": 7, "site": "kworkru", "title": "Бот", "url": "https://e.com/7",
+           "price_text": "5000 ₽", "published_at": "2026-10-11T10:00:00+00:00",
+           "dedup_key": "k7", "ai_json": json.dumps({"fit": 8, "summary": "s"})}
+
+    def test_restores_order_and_ai(self):
+        sc = pipeline.scored_from_row(self.ROW)
+        self.assertEqual(sc.order.order_id, 7)
+        self.assertEqual(sc.order.title, "Бот")
+        self.assertEqual(sc.order.url, "https://e.com/7")
+        self.assertEqual(sc.order.published_at.hour, 10)
+        self.assertEqual(sc.fit, 8)
+        self.assertEqual(sc.dedup, "k7")
+
+    def test_broken_ai_json(self):
+        for bad in ("{oops", "", None, "[1]"):
+            sc = pipeline.scored_from_row(dict(self.ROW, ai_json=bad))
+            self.assertIsNone(sc.ai, bad)
+            self.assertIsNone(sc.fit)
 
 
 if __name__ == "__main__":

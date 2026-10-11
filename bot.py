@@ -35,6 +35,7 @@ from database import (
     cleanup_old,
     freelance_deal_rows,
     freelance_expired_messages,
+    freelance_get,
     freelance_recent,
     freelance_set_deal_price,
     freelance_set_status,
@@ -58,6 +59,7 @@ from freelance.pipeline import (
     mark_sent_status,
     prepare_cycle,
     save_sent,
+    scored_from_row,
 )
 import memwatch
 from health import monitor
@@ -293,12 +295,21 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _order_kb(order_id: int, url: str | None, taken: bool = False) -> InlineKeyboardMarkup:
-    """Кнопки заказа: открыть, «Взял» / «Не подходит» (после «Взял» - «В работе»)."""
-    rows = []
+def _order_kb(order_id: int, url: str | None, taken: bool = False,
+              detailed: bool = False, actions: bool = True) -> InlineKeyboardMarkup:
+    """Кнопки заказа: открыть + «Подробнее»/«Свернуть», «Взял» / «Не подходит»
+    (после «Взял» - «В работе»)."""
+    if detailed:
+        more = InlineKeyboardButton(text="🔼 Свернуть", callback_data=f"fl_less:{order_id}")
+    else:
+        more = InlineKeyboardButton(text="ℹ️ Подробнее", callback_data=f"fl_more:{order_id}")
+    top = [more]
     if url:
-        rows.append([InlineKeyboardButton(text="🔗 Открыть", url=url)])
-    if taken:
+        top.insert(0, InlineKeyboardButton(text="🔗 Открыть", url=url))
+    rows = [top]
+    if not actions:
+        pass                         # закрытый заказ (dismissed/expired/rejected): без «Взял»
+    elif taken:
         rows.append([InlineKeyboardButton(text="✅ В работе", callback_data=f"fl_noop:{order_id}")])
     else:
         rows.append([
@@ -733,12 +744,16 @@ async def cb_fl_take(call: CallbackQuery):
         await call.answer("Отмечено: в работе")
         # url берём из кнопки «Открыть» исходного сообщения
         url = None
+        detailed = False   # карточка развёрнута, если на ней кнопка «Свернуть»
         markup = call.message.reply_markup if call.message else None
         for row in (markup.inline_keyboard if markup else []):
             for btn in row:
                 if btn.url:
                     url = btn.url
-        await call.message.edit_reply_markup(reply_markup=_order_kb(order_id, url, taken=True))
+                if (btn.callback_data or "").startswith("fl_less:"):
+                    detailed = True
+        await call.message.edit_reply_markup(
+            reply_markup=_order_kb(order_id, url, taken=True, detailed=detailed))
         # спрашиваем итоговую цену (для ставки и точности оценок)
         deal_wait.purge(_pending_deals)
         first = ((call.message.text or "").splitlines() or [""])[0]
@@ -778,6 +793,49 @@ async def cb_fl_skip(call: CallbackQuery):
             await call.answer("Ошибка, см. лог")
         except Exception:
             pass
+
+
+async def _toggle_order_detail(call: CallbackQuery, detailed: bool):
+    """Разворачивает/сворачивает карточку заказа (заказ читаем из БД)."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        row = await asyncio.to_thread(freelance_get, order_id)
+        if row is None:
+            await call.answer("Заказ не найден", show_alert=False)
+            return
+        sc = scored_from_row(row)
+        text = format_order(sc, detailed=detailed)
+        # plain-формат (откат при слишком длинном тексте) - без HTML-разметки
+        parse_mode = None if text == format_order_plain(sc) else "HTML"
+        status = row.get("status")
+        kb = _order_kb(order_id, sc.order.url or None, taken=status == "taken",
+                       detailed=detailed, actions=status in ("pending", "sent", "taken"))
+        await call.answer()
+        try:
+            await call.message.edit_text(text, parse_mode=parse_mode, reply_markup=kb,
+                                         disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+    except Exception:
+        logging.exception("[FREELANCE] fl_more/fl_less")
+        try:
+            await call.answer("Ошибка, см. лог")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("fl_more:"))
+async def cb_fl_more(call: CallbackQuery):
+    await _toggle_order_detail(call, True)
+
+
+@dp.callback_query(F.data.startswith("fl_less:"))
+async def cb_fl_less(call: CallbackQuery):
+    await _toggle_order_detail(call, False)
 
 
 @dp.callback_query(F.data.startswith("fl_noop:"))

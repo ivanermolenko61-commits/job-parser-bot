@@ -527,6 +527,15 @@ def freelance_save(
         )
 
 
+def freelance_get(order_id: int) -> dict | None:
+    """Заказ из БД по id (None, если нет)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def freelance_set_status(order_id: int, status: str) -> bool:
     """Меняет статус заказа. True, если заказ найден."""
     with _connect() as conn:

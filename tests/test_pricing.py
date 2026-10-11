@@ -289,7 +289,7 @@ class FormatOrderTest(unittest.TestCase):
         a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=6000,
                                     market={"median": 5500, "p25": 4000, "p75": 7000, "n": 6},
                                     rate=1000))
-        text = format_order(ScoredOrder(make_order(6000), a))
+        text = format_order(ScoredOrder(make_order(6000), a), detailed=True)
         self.assertIn("💵 Предложить:", text)
         self.assertIn("рынок ботов: 4–7 тыс.", text)
         self.assertIn("рынок ботов: 4–7 тыс. — цена в рынке", text)
@@ -297,7 +297,7 @@ class FormatOrderTest(unittest.TestCase):
         self.assertIn("🧩 меню &lt;b&gt; 2 ч", text)
         self.assertIn("❓ Уточнить: есть таблица?", text)
         self.assertIn("Бот &lt;для&gt;", text)
-        compact = format_order(ScoredOrder(make_order(6000), a), compact=True)
+        compact = format_order(ScoredOrder(make_order(6000), a), compact=True, detailed=True)
         self.assertIn("💵 Предложить:", compact)
         self.assertNotIn("🧩", compact)
         self.assertLessEqual(len(text), 4000)
@@ -307,8 +307,70 @@ class FormatOrderTest(unittest.TestCase):
              "summary": "s", "risks": "r"}
         a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=["a", "b", "c"]),
                                     budget=5000, rate=1000))
-        text = format_order(ScoredOrder(make_order(5000), a))
+        text = format_order(ScoredOrder(make_order(5000), a), detailed=True)
         self.assertIn("бюджет 5 000 ₽ ≈ 1 000 ₽/ч · упёрлось в бюджет +10% (по расчёту 7 300 ₽)", text)
+
+
+    def card(self, **extra):
+        a = {"fit": 9, "difficulty": "средне", "hours": 9, "category": "landing",
+             "components": [{"name": "блок", "hours": 2}], "questions": ["есть макет?"],
+             "summary": "суть", "risks": "риск"}
+        budget = extra.pop("budget", 6000)
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=budget,
+                                    market={"median": 5500, "p25": 4000, "p75": 7000, "n": 6},
+                                    rate=1000))
+        a.update(extra)
+        return ScoredOrder(make_order(), a)
+
+    def test_short_card(self):
+        text = format_order(self.card())
+        for bad in ("×", "₽/ч", "🧩", "⚠️", "Сложность"):
+            self.assertNotIn(bad, text)
+        self.assertIn("💰 до 15 000 ₽ · 🕒", text)
+        self.assertIn("🤖 9/10 · ~9 ч", text)
+        self.assertIn("💵 Предложить:", text)
+        self.assertIn("📝 суть", text)
+        self.assertIn("❓ Уточнить: есть макет?", text)
+        self.assertTrue(text.startswith("🔥 💼"))
+
+    def test_note_priority(self):
+        base = dict(budget_low=False, budget_capped=False, budget_raised=False,
+                    market_verdict="ниже рынка на 16%")
+        cases = [
+            (dict(base, budget_low=True, budget_capped=True, budget_raised=True), "бюджет занижен"),
+            (dict(base, budget_capped=True, budget_raised=True), "упёрлось в бюджет"),
+            (dict(base, budget_raised=True), "бюджет выше расчёта"),
+            (base, "ниже рынка на 16%"),
+            (dict(base, market_verdict="в рынке"), ""),
+        ]
+        for extra, note in cases:
+            line = [x for x in format_order(self.card(**extra)).splitlines() if x.startswith("💵")][0]
+            if note:
+                self.assertTrue(line.endswith(f" · {note}"), line)
+            else:
+                self.assertNotIn(" · ", line)
+
+    def test_detailed_card(self):
+        text = format_order(self.card(), detailed=True)
+        for good in ("🧩", "⚠️ Риск: риск", "Сложность: средне", "×", "₽/ч", "вилка:"):
+            self.assertIn(good, text)
+
+    def test_escape_and_length(self):
+        sc = self.card()
+        sc.order.title = "<i>&" * 50
+        for detailed in (False, True):
+            text = format_order(sc, detailed=detailed)
+            self.assertNotIn("<i>", text)
+            self.assertIn("&lt;i&gt;&amp;", text)
+            self.assertLess(len(text), 4000)
+
+    def test_too_long_detailed_falls_back(self):
+        sc = self.card()
+        sc.ai["components"] = [{"name": "н" * 50, "hours": 1}] * 8
+        with mock.patch("freelance.pipeline.MAX_MESSAGE_LEN", 400):
+            text = format_order(sc, detailed=True)
+        self.assertLessEqual(len(text), 400)
+        self.assertNotIn("🧩", text)
 
 
 class DatabaseTest(unittest.TestCase):

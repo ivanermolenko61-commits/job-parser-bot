@@ -47,6 +47,18 @@ EXCLUDE_WORDS = [
 _INCLUDE_RE = _compile(INCLUDE_WORDS)
 _EXCLUDE_RE = _compile(EXCLUDE_WORDS)
 
+# Объявление исполнителя о своих услугах: глагол 1-го лица ед.ч. в начале названия
+_SERVICE_OFFER_RE = re.compile(
+    r"^[^a-zа-я0-9]*(?:создам|сделаю|разработаю|настрою|напишу|выполню|"
+    r"сверстаю|помогу|доработаю|запущу)(?![a-zа-я])"
+)
+
+
+def is_service_offer(title: str) -> bool:
+    """Название — реклама исполнителя («Создам бота…»), а не заказ клиента."""
+    t = (title or "").lower().replace("ё", "е")
+    return bool(_SERVICE_OFFER_RE.match(t))
+
 
 def is_candidate(order) -> bool:
     """Проходит ли заказ префильтр (бюджет не фильтруем)."""
@@ -55,6 +67,8 @@ def is_candidate(order) -> bool:
     if order.is_suspicious:
         return False
     title = order.title or ""
+    if is_service_offer(title):
+        return False
     if _EXCLUDE_RE.search(title):
         return False
     if DEV_CATEGORIES.intersection(order.categories):

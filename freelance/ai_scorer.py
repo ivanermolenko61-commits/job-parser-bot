@@ -64,6 +64,9 @@ GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "4.5"))
 GEMINI_COOLDOWN_SEC = 120          # пауза после 429, если Google не назвал срок
 MAX_QUOTA_PAUSE_SEC = 24 * 3600    # потолок паузы по retryDelay (дневная квота)
 CONFIG_ERROR_COOLDOWN_SEC = 300  # после ошибки ключа Gemini не долбим 5 минут
+REGION_BLOCK_COOLDOWN_SEC = 1800  # сервер в неподдерживаемом регионе: Gemini не пробуем 30 минут
+NON_JSON_PAUSE_SEC = 1800         # 200 без JSON (страница блокировки/прокси): провайдера не долбим
+REGION_ERROR_TEXT = "Gemini недоступен из региона сервера (User location is not supported)"
 
 _lock = threading.Lock()
 _next_at = 0.0                        # не раньше (monotonic) - следующий запрос к Gemini
@@ -71,7 +74,9 @@ _paused_until: dict[str, float] = {}  # модель -> конец паузы п
 _disabled: set[str] = set()           # модели, которых нет (404) - до рестарта
 _config_blocked_until = 0.0
 _config_error = ""
+_region_error = ""                    # Gemini не поддерживает регион сервера (не ошибка ключа)
 _last_error = ""
+_gemini_last_error = ""             # последняя ошибка именно Gemini
 _last_ok: dict | None = None          # {"model": ..., "at": iso}
 
 # YandexGPT ПЛАТНЫЙ (бесплатен только стартовый грант): по умолчанию выключен, не вызывается
@@ -109,8 +114,12 @@ SYSTEM_PROMPT = (
     "бюджет явно мал или не указан, а задача неясна;\n"
     "3-4: сложно или рискованно: высоконагруженная система, мобильное "
     "приложение, игра, интернет-магазин с нуля, работа на чужом сервере "
-    "без доступов;\n"
-    "0-2: не наш профиль (дизайн, тексты, офлайн, 1С, обучение, ручной труд).\n"
+    "без доступов. "
+    "Лечение взлома или вирусов и работа на чужом сервере: fit не выше 5, не меньше 3 ч "
+    "на диагностику, доступы впиши в unknowns;\n"
+    "0-2: не наш профиль (дизайн, тексты, офлайн, 1С, обучение, ручной труд), "
+    "а также объявление исполнителя о своих услугах (от первого лица: «создам», "
+    "«сделаю для вас»), а не заказ клиента - fit 0.\n"
     "Бюджет: небольшой, но реальный (3-15 тыс. за бота, парсер, лендинг, "
     "правки сайта) нормален, не снижай за него оценку. Снижай fit до 4 и "
     "ниже только если бюджет абсурдно мал (меньше 1000 ₽ за сайт, бота или "
@@ -252,6 +261,7 @@ class _Provider:
     key_error: str = ""
     key_error_at: float = 0.0            # monotonic: когда поставлена блокировка по ключу
     paid_reason: str = ""                # признак платного вызова (402 или платная модель)
+    last_error: str = ""                 # последняя ошибка этого провайдера (успех очищает)
     paused: dict = field(default_factory=dict)    # модель -> конец паузы после 429
     disabled: set = field(default_factory=set)    # модели без доступа (404) - до рестарта
     no_json: set = field(default_factory=set)     # модели без response_format
@@ -414,6 +424,7 @@ def status() -> dict:
                 "today": p.count if p.day == today else 0,
                 "limit": p.max_per_day,
                 "key_error": p.key_error,
+                "last_error": p.last_error,
             }
             if p.key_error:
                 key_errors[name] = p.key_error
@@ -432,8 +443,84 @@ def status() -> dict:
             "yandex": YANDEX_ENABLED,
             "last_ok": dict(_last_ok) if _last_ok else None,
             "config_error": _config_error,
+            "region_error": _region_error,
             "last_error": _last_error,
+            "gemini_last_error": _gemini_last_error,
         }
+
+
+def failure_summary(now: datetime | None = None) -> str:
+    """Почему не ответил никто из цепочки: короткая строка на каждого активного провайдера
+    (для алерта «AI-оценка заказов»). now - aware datetime, по умолчанию текущее время."""
+    from zoneinfo import ZoneInfo
+    msk = ZoneInfo("Europe/Moscow")
+    now = now or datetime.now(timezone.utc)
+    mono = time.monotonic()
+    today = now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    # сброс дневных потолков - полночь UTC (03:00 МСК)
+    midnight = (now.astimezone(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+
+    def at_msk(dt: datetime) -> str:
+        return dt.astimezone(msk).strftime("%H:%M")
+
+    def wall(t: float) -> datetime:
+        # monotonic -> настенное время (через now, чтобы не зависеть от time.time())
+        return datetime.fromtimestamp(now.timestamp() + (t - mono), timezone.utc)
+
+    parts: list[str] = []
+    resumes: list[datetime] = []       # когда вернётся каждый провайдер, остановленный квотой
+    blocked_count = 0
+    active = _chain_active()
+    with _lock:
+        for name in active:
+            if name == "gemini":
+                live = [m for m in GEMINI_MODELS if m not in _disabled]
+                ends = [_paused_until.get(m, 0.0) for m in live]
+                if _region_error and mono < _config_blocked_until:
+                    # регион - не квота: ни в resumes, ни в blocked_count
+                    parts.append("gemini: регион сервера не поддерживается, "
+                                 f"повтор в {at_msk(wall(_config_blocked_until))} МСК")
+                elif _config_error:
+                    parts.append(f"gemini: {_config_error}")
+                elif live and all(t > mono for t in ends):
+                    resumes.append(wall(min(ends)))
+                    blocked_count += 1
+                    parts.append(f"gemini: на паузе до {at_msk(wall(max(ends)))} МСК")
+                else:
+                    parts.append(f"gemini: {_gemini_last_error or 'нет ответа'}")
+                continue
+            if name == "yandex":
+                if _yandex_day == today and _yandex_count >= YANDEX_MAX_PER_DAY:
+                    resumes.append(midnight)
+                    blocked_count += 1
+                    parts.append(f"yandex: лимит {YANDEX_MAX_PER_DAY}/{YANDEX_MAX_PER_DAY} за сутки")
+                else:
+                    parts.append("yandex: нет ответа")
+                continue
+            p = PROVIDERS[name]
+            live = [m for m in p.models if m not in p.disabled]
+            ends = [p.paused.get(m, 0.0) for m in live]
+            if p.dead:
+                parts.append(f"{name}: {p.paid_reason or 'выключен'}")
+            elif p.key_error:
+                parts.append(f"{name}: {p.key_error}")
+            elif p.day == today and p.count >= p.max_per_day:
+                resumes.append(midnight)
+                blocked_count += 1
+                parts.append(f"{name}: лимит {p.max_per_day}/{p.max_per_day} за сутки")
+            elif live and all(t > mono for t in ends):
+                resumes.append(wall(min(ends)))
+                blocked_count += 1
+                parts.append(f"{name}: на паузе до {at_msk(wall(max(ends)))} МСК")
+            else:
+                err = p.last_error or "нет ответа"
+                parts.append(err if err.startswith(f"{name}:") else f"{name}: {err}")
+    text = " · ".join(parts)
+    if active and blocked_count == len(active) and resumes:
+        text = (f"кончились бесплатные квоты, оценка возобновится ~{at_msk(min(resumes))} МСК "
+                f"(ближайший срок): {text}")
+    return text
 
 
 def _clean_float(value) -> float:
@@ -613,21 +700,33 @@ def _user_prompt(order) -> str:
     )
 
 
-def _mark_ok(model: str, gemini: bool = True) -> None:
-    """Запоминает удачную оценку. Успех Yandex не снимает ошибку ключа Gemini."""
-    global _last_ok, _config_error, _config_blocked_until, _last_error
+def _mark_ok(model: str, gemini: bool = True, provider=None) -> None:
+    """Запоминает удачную оценку. Успех Yandex не снимает ошибку ключа Gemini.
+    provider - _Provider, чья ошибка очищается (для gemini очищается _gemini_last_error)."""
+    global _last_ok, _config_error, _config_blocked_until, _last_error, _gemini_last_error
+    global _region_error
     with _lock:
         _last_ok = {"model": model, "at": datetime.now(timezone.utc).isoformat()}
         if gemini:
             _config_error = ""
+            _region_error = ""
             _config_blocked_until = 0.0
             _last_error = ""
+            _gemini_last_error = ""
+        if provider is not None:
+            provider.last_error = ""
 
 
-def _set_error(text: str) -> None:
-    global _last_error
+def _set_error(text: str, provider=None) -> None:
+    """Пишет глобальную _last_error (её читают bot.py и тесты) и ошибку конкретного
+    провайдера: _Provider или строка "gemini"."""
+    global _last_error, _gemini_last_error
     with _lock:
         _last_error = text
+        if provider == "gemini":
+            _gemini_last_error = text
+        elif provider is not None:
+            provider.last_error = text
 
 
 def _is_gemma(model: str) -> bool:
@@ -703,6 +802,16 @@ def _until_quota_reset() -> int:
     return min(MAX_QUOTA_PAUSE_SEC, int(delta.total_seconds()) + 60)
 
 
+def _body_info(resp) -> tuple[str, str]:
+    """content-type и начало тела ответа одной строкой (для логов; без заголовков)."""
+    try:
+        ctype = str((resp.headers or {}).get("content-type") or (resp.headers or {}).get("Content-Type") or "")
+    except Exception:
+        ctype = ""
+    text = " ".join(str(resp.text or "").split())
+    return ctype or "?", text
+
+
 def _ask_gemini_chain(order, deadline: float | None = None) -> dict | None:
     with _lock:
         if time.monotonic() < _config_blocked_until:
@@ -725,7 +834,7 @@ def _ask_gemini_model(model: str, order):
     """Один запрос к одной модели. dict - успех; "next" - пробуем следующую;
     "config" - ошибка ключа (цепочку Gemini прерываем)."""
     import requests
-    global _config_error, _config_blocked_until
+    global _config_error, _config_blocked_until, _region_error
     try:
         _throttle()
         resp = requests.post(
@@ -737,7 +846,7 @@ def _ask_gemini_model(model: str, order):
         )
     except Exception as e:
         logging.warning(f"[AI] {model}: сбой запроса: {type(e).__name__}")
-        _set_error(f"{model}: {type(e).__name__}")
+        _set_error(f"{model}: {type(e).__name__}", "gemini")
         return "next"
 
     code = resp.status_code
@@ -748,26 +857,35 @@ def _ask_gemini_model(model: str, order):
             _paused_until[model] = max(_paused_until.get(model, 0.0), time.monotonic() + pause)
         kind = "дневная квота исчерпана" if daily else "лимит запросов"
         logging.warning(f"[AI] {model}: {kind}, пауза {pause} с, берём следующую")
-        _set_error(f"{model}: HTTP 429 ({kind})")
+        _set_error(f"{model}: HTTP 429 ({kind})", "gemini")
         return "next"
     if code != 200:
         body = resp.text[:400]
+        if code == 400 and "User location is not supported" in body:
+            # регион сервера не поддерживается - это не ключ: блокируем весь Gemini на время
+            with _lock:
+                _region_error = REGION_ERROR_TEXT
+                _config_blocked_until = time.monotonic() + REGION_BLOCK_COOLDOWN_SEC
+            logging.warning(f"[AI] {REGION_ERROR_TEXT}, Gemini отключён на "
+                            f"{REGION_BLOCK_COOLDOWN_SEC // 60} мин")
+            _set_error(REGION_ERROR_TEXT, "gemini")
+            return "config"
         if code in (400, 401, 403) and any(m in body for m in KEY_ERROR_MARKERS):
             reason = f"ключ Gemini отклонён (HTTP {code})"
             with _lock:
                 _config_error = reason
                 _config_blocked_until = time.monotonic() + CONFIG_ERROR_COOLDOWN_SEC
             logging.error(f"[AI] {reason}")
-            _set_error(reason)
+            _set_error(reason, "gemini")
             return "config"
         if code == 404 or "is not found" in body or "no longer available" in body:
             with _lock:
                 _disabled.add(model)
             logging.warning(f"[AI] модель {model} недоступна (HTTP {code}), выключена до рестарта")
-            _set_error(f"{model}: недоступна (HTTP {code})")
+            _set_error(f"{model}: недоступна (HTTP {code})", "gemini")
             return "next"
         logging.warning(f"[AI] {model}: HTTP {code}: {body[:150]!r}")
-        _set_error(f"{model}: HTTP {code}")
+        _set_error(f"{model}: HTTP {code}", "gemini")
         return "next"
 
     try:
@@ -776,20 +894,22 @@ def _ask_gemini_model(model: str, order):
         parts = (cand.get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     except Exception as e:
-        logging.warning(f"[AI] {model}: не разобран ответ: {type(e).__name__}")
-        _set_error(f"{model}: нечитаемый ответ")
+        ctype, snippet = _body_info(resp)
+        logging.warning(f"[AI] {model}: не разобран ответ: {type(e).__name__} "
+                        f"({ctype}): {snippet[:200]!r}")
+        _set_error(f"{model}: нечитаемый ответ", "gemini")
         return "next"
     if not text:
         # safety-блок (promptFeedback.blockReason) или пустой ответ: следующая модель
         reason = (cand.get("finishReason")
                   or (payload.get("promptFeedback") or {}).get("blockReason") or "пусто")
         logging.warning(f"[AI] {model}: пустой ответ ({reason})")
-        _set_error(f"{model}: пустой ответ ({reason})")
+        _set_error(f"{model}: пустой ответ ({reason})", "gemini")
         return "next"
     parsed = parse_ai_json(text)
     if parsed is None:
         logging.warning(f"[AI] {model}: ответ не JSON: {text[:150]!r}")
-        _set_error(f"{model}: ответ не JSON")
+        _set_error(f"{model}: ответ не JSON", "gemini")
         return "next"
     parsed["model"] = model
     _mark_ok(model)
@@ -1059,7 +1179,7 @@ def _mark_paid(p: _Provider, reason: str) -> None:
         p.dead = True
         p.paid_reason = reason
     logging.error(f"[AI] {reason}: платные вызовы недопустимы, провайдер выключен до рестарта")
-    _set_error(reason)
+    _set_error(reason, p)
 
 
 def _ask_provider_model(p: _Provider, model: str, order):
@@ -1093,7 +1213,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
             )
         except Exception as e:
             logging.warning(f"[AI] {label}: сбой запроса: {type(e).__name__}")
-            _set_error(f"{label}: {type(e).__name__}")
+            _set_error(f"{label}: {type(e).__name__}", p)
             return "next"
         if resp.status_code == 400 and use_json and attempt == 1:
             body = str(resp.text or "")[:600].lower()
@@ -1125,7 +1245,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 p.paused[m] = max(p.paused.get(m, 0.0), until)
         kind = "дневная квота исчерпана" if daily else "лимит запросов"
         logging.warning(f"[AI] {label}: {kind}, пауза {pause} с, берём следующую")
-        _set_error(f"{label}: HTTP 429 ({kind})")
+        _set_error(f"{label}: HTTP 429 ({kind})", p)
         return "next"
     if code == PAYMENT_REQUIRED:
         _mark_paid(p, f"{p.name}: HTTP 402 (требуется оплата)")
@@ -1136,7 +1256,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
                                                     "content_policy")):
             # отказ по содержанию заказа, а не по ключу
             logging.warning(f"[AI] {label}: HTTP 403 (модерация), берём следующую")
-            _set_error(f"{label}: HTTP 403 (модерация)")
+            _set_error(f"{label}: HTTP 403 (модерация)", p)
             return "next"
         reason = f"ключ {p.name} отклонён (HTTP {code})"
         with _lock:
@@ -1144,46 +1264,67 @@ def _ask_provider_model(p: _Provider, model: str, order):
             p.key_error_at = time.monotonic()
             p.blocked_until = p.key_error_at + CONFIG_ERROR_COOLDOWN_SEC
         logging.error(f"[AI] {reason}")
-        _set_error(reason)
+        _set_error(reason, p)
         return "stop"
     if code == 404:
         with _lock:
             p.disabled.add(model)
         logging.warning(f"[AI] {label}: модель недоступна (HTTP 404), выключена до рестарта")
-        _set_error(f"{label}: недоступна (HTTP 404)")
+        _set_error(f"{label}: недоступна (HTTP 404)", p)
         return "next"
     if code != 200:
         logging.warning(f"[AI] {label}: HTTP {code}: {str(resp.text or '')[:150]!r}")
-        _set_error(f"{label}: HTTP {code}")
+        _set_error(f"{label}: HTTP {code}", p)
         return "next"
 
     try:
         payload = resp.json()
     except Exception as e:
-        logging.warning(f"[AI] {label}: не разобран ответ: {type(e).__name__}")
-        _set_error(f"{label}: нечитаемый ответ")
+        ctype, snippet = _body_info(resp)
+        logging.warning(f"[AI] {label}: ответ не JSON: {type(e).__name__} ({ctype}): {snippet[:200]!r}")
+        _set_error(f"{label}: ответ не JSON ({ctype}): «{snippet[:80]}»", p)
+        html_page = "text/html" in ctype.lower()
+        if html_page or not snippet:
+            # HTML - скорее всего страница блокировки/прокси: пауза всего провайдера;
+            # пустое тело - только этой модели
+            until = time.monotonic() + NON_JSON_PAUSE_SEC
+            with _lock:
+                for m in (p.models if html_page else [model]):
+                    p.paused[m] = max(p.paused.get(m, 0.0), until)
+            logging.warning(f"[AI] {label}: пустой/HTML-ответ, пауза {NON_JSON_PAUSE_SEC} с")
         return "next"
     # платность - до разбора choices: платный ответ с кривой структурой тоже должен выключить провайдера
     if p.name == "openrouter" and _openrouter_response_is_paid(payload):
         _mark_paid(p, f"{label}: ответ платной модели ({str(payload.get('model'))[:60]})")
         return "stop"
     try:
-        text = _content_text(payload["choices"][0]["message"]["content"])
-    except Exception as e:
-        logging.warning(f"[AI] {label}: не разобран ответ: {type(e).__name__}")
-        _set_error(f"{label}: нечитаемый ответ")
+        choice = payload["choices"][0]
+    except Exception:
+        choice = None
+    if not isinstance(choice, dict):
+        logging.warning(f"[AI] {label}: нет choices в ответе: {str(resp.text or '')[:200]!r}")
+        _set_error(f"{label}: нет choices", p)
         return "next"
+    finish = choice.get("finish_reason")
+    message = choice.get("message")
+    text = _content_text(message.get("content")) if isinstance(message, dict) else None
     if text is None:
-        logging.warning(f"[AI] {label}: content не текст")
-        _set_error(f"{label}: нечитаемый ответ")
+        # GitHub Models/Azure: сработал content filter - content: null, finish_reason: content_filter
+        if finish == "content_filter" or "content_filter" in str(resp.text or "")[:2000]:
+            logging.warning(f"[AI] {label}: отказ модерации (content_filter)")
+            _set_error(f"{label}: отказ модерации", p)
+            return "next"
+        logging.warning(f"[AI] {label}: пустой ответ (finish_reason={finish}): "
+                        f"{str(resp.text or '')[:200]!r}")
+        _set_error(f"{label}: пустой ответ (finish_reason={finish})", p)
         return "next"
     parsed = parse_ai_json(text)
     if parsed is None:
         logging.warning(f"[AI] {label}: ответ не JSON: {text[:150]!r}")
-        _set_error(f"{label}: ответ не JSON")
+        _set_error(f"{label}: ответ не JSON", p)
         return "next"
     parsed["model"] = label
-    _mark_ok(label, gemini=False)
+    _mark_ok(label, gemini=False, provider=p)
     return parsed
 
 
@@ -1269,6 +1410,10 @@ if __name__ == "__main__":
         mk(3, "Сделать сайт под ключ",
            "Сайт-визитка для строительной компании, 5 страниц, форма заявки.", "по договоренности"),
         mk(4, "Нарисовать логотип для кофейни", "Нужен логотип в векторе.", "до 2 000 ₽"),
+        mk(6, "Создам вашего персонального телеграм бота за 10 минут",
+           "Быстро и недорого создам бота под ваши задачи.", "1 499 ₽"),
+        mk(7, "Восстановить сайт после заражения вирусами",
+           "Сайт на Joomla заражён, редиректы на левые сайты. Нужно вылечить.", "по договорённости"),
         mk(5, "Спарсить гостиницы и хостелы Москвы",
            "Собрать название, адрес, телефон, сайт с Яндекс.Карт в Excel.", "2 500 ₽"),
     ]
