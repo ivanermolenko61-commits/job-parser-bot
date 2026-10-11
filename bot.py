@@ -958,6 +958,7 @@ async def cmd_start(message: Message):
         f"/list 50 — только первые 50\n"
         f"/status — статистика\n"
         f"/check — проверить сейчас\n"
+        f"/aitest — проверка AI-провайдеров\n"
         f"/reset — очистить базу и загрузить заново\n"
         f"/stop — приостановить\n\n"
         f"Пользуйся кнопками внизу 👇",
@@ -976,6 +977,29 @@ async def cmd_stop(message: Message):
         "⏸ Уведомления приостановлены.\n\nНажмите «▶️ Возобновить» или /start.",
         reply_markup=main_reply_kb(),
     )
+
+
+@dp.message(Command("aitest"))
+async def cmd_aitest(message: Message):
+    """Проверка AI-провайдеров: каждый оценивает один тестовый заказ (1 запрос на провайдера).
+    Доступ только у MY_CHAT_ID - через whitelist-middleware, как у остальных команд."""
+    await message.answer("🧪 Проверяю AI-провайдеры, это может занять пару минут…")
+    try:
+        results = await asyncio.to_thread(ai_scorer.probe)
+    except Exception:
+        logging.exception("[AI] /aitest упал")
+        await message.answer("❌ Не удалось выполнить проверку, подробности в логе.")
+        return
+    lines = ["🧪 <b>Проверка AI</b>\n"]
+    for r in results:
+        name = html.escape(r["provider"])
+        if not r["configured"]:
+            lines.append(f"➖ {name} — {html.escape(r['error'])}")
+        elif r["ok"]:
+            lines.append(f"✅ {html.escape(r['model'])} — {r['seconds']:.1f} с, fit {r['fit']}")
+        else:
+            lines.append(f"❌ {html.escape(r['model'] or name)} — {html.escape(r['error'][:300])}")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("status"))

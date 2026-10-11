@@ -847,5 +847,27 @@ class ScoredFromRowTest(unittest.TestCase):
             self.assertIsNone(sc.fit)
 
 
+class ProbeTest(ProviderTestBase):
+    """/aitest: по одному запросу на провайдера, понятная причина у каждого."""
+
+    def test_probe_reports_each_provider(self):
+        providers = self.use(OPENROUTER_API_KEY="")
+        mistral = providers["mistral"]
+        mistral.day, mistral.count = ai_scorer._today(), mistral.max_per_day
+        providers["groq"].paused[providers["groq"].models[0]] = float("inf")  # пауза обходится
+        html_page = resp(200, text="<html>blocked</html>", headers={"content-type": "text/html"})
+        html_page.json.side_effect = ValueError("not json")
+        api = FakeApi({"groq.com": resp(), "cerebras.ai": html_page})
+        with mock.patch("requests.post", side_effect=api):
+            results = {r["provider"]: r for r in ai_scorer.probe()}
+        self.assertTrue(results["groq"]["ok"])
+        self.assertEqual(results["groq"]["fit"], 8)
+        self.assertFalse(results["cerebras"]["ok"])
+        self.assertIn("не JSON", results["cerebras"]["error"])
+        self.assertIn("потолок", results["mistral"]["error"])
+        self.assertFalse(results["openrouter"]["configured"])
+        self.assertEqual(sorted(api.hosts()), ["api.cerebras.ai", "api.groq.com"])  # mistral не вызывался
+
+
 if __name__ == "__main__":
     unittest.main()

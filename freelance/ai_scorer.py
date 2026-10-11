@@ -1392,6 +1392,75 @@ def _ask(model_name: str, order) -> dict | None:
     return parsed
 
 
+def _probe_order():
+    from freelance.alot_client import FreelanceOrder
+    return FreelanceOrder(0, "youdoru", "Создать Telegram-бота для записи клиентов",
+                          "Бот для салона: выбор мастера и времени, напоминание за день.",
+                          "до 10 000 ₽", 10000.0, [], datetime.now(timezone.utc), "")
+
+
+def probe() -> list[dict]:
+    """Для /aitest: по одному тестовому запросу к первой доступной модели каждого
+    провайдера цепочки, прямо с сервера. Паузы после 429 обходятся (иначе не увидим,
+    что отвечает провайдер сейчас), дневной потолок - нет (он защищает бесплатную квоту).
+    Возвращает [{provider, configured, ok, model, seconds, fit, error}]."""
+    order = _probe_order()
+    active = set(_chain_active())
+    results = []
+    for name in CHAIN:
+        r = {"provider": name, "configured": name in active, "ok": False,
+             "model": "", "seconds": 0.0, "fit": None, "error": ""}
+        results.append(r)
+        if not r["configured"]:
+            r["error"] = "нет ключа" if name != "yandex" else "выключен (платный)"
+            continue
+        if name == "yandex":
+            r["error"] = "платный, не проверяем"
+            continue
+        if name == "gemini":
+            models = [m for m in GEMINI_MODELS if m not in _disabled]
+        else:
+            p = PROVIDERS[name]
+            models = [m for m in _provider_models(p) if m not in p.disabled]
+        if not models:
+            r["error"] = "нет доступных моделей"
+            continue
+        model = models[0]
+        r["model"] = f"{name}:{model}" if name != "gemini" else model
+        if name != "gemini":
+            with _lock:
+                capped = p.day == _today() and p.count >= p.max_per_day
+            if capped:
+                r["error"] = f"дневной потолок {p.max_per_day} исчерпан (сброс в 03:00 МСК)"
+                continue
+        started = time.monotonic()
+        try:
+            if name == "gemini":
+                outcome = _ask_gemini_model(model, order)
+            else:
+                with _lock:
+                    p.paused.pop(model, None)
+                    p.last_error = ""   # в отчёт - только ошибка этой проверки, не старая
+                outcome = _ask_provider_model(p, model, order)
+                if outcome == "stop" and not (p.last_error or p.key_error or p.paid_reason):
+                    r["error"] = "провайдер на блокировке или очередь запросов занята"
+        except Exception as e:
+            logging.exception(f"[AI] /aitest: {name} упал")
+            outcome, r["error"] = None, type(e).__name__
+        r["seconds"] = time.monotonic() - started
+        if isinstance(outcome, dict):
+            r["ok"], r["fit"] = True, outcome.get("fit")
+            continue
+        if not r["error"]:
+            with _lock:
+                if name == "gemini":
+                    r["error"] = _region_error if outcome == "config" and _region_error else _gemini_last_error
+                else:
+                    r["error"] = p.key_error or p.paid_reason or p.last_error
+        r["error"] = r["error"] or "нет ответа"
+    return results
+
+
 if __name__ == "__main__":
     # Ручной прогон: типовые заказы
     from datetime import datetime, timezone
