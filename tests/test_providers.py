@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
-from freelance import ai_scorer, pipeline
+from freelance import ai_scorer, pipeline, yandex_budget
 from health import HealthMonitor
 
 GOOD = json.dumps({"fit": 8, "category": "tg_bot",
@@ -63,7 +63,6 @@ class ProviderTestBase(unittest.TestCase):
         self.env = env()
         self._patches = [
             mock.patch.object(ai_scorer, "GEMINI_KEY", ""),
-            mock.patch.object(ai_scorer, "YANDEX_ENABLED", False),
             mock.patch.object(ai_scorer, "CHAIN", ["groq", "cerebras", "mistral", "openrouter"]),
             mock.patch.object(ai_scorer, "_or_next_check", float("inf")),  # без похода в /models
             mock.patch.object(ai_scorer, "_or_paid", set()),
@@ -342,30 +341,141 @@ class OpenRouterFreeOnlyTest(ProviderTestBase):
         self.assertEqual(api.calls[0][1]["headers"]["X-Title"], "job-parser-bot")
 
 
+YANDEX_USAGE = {"usage": {"prompt_tokens": 3000, "completion_tokens": 400,
+                          "prompt_tokens_details": {"cached_tokens": 1000}}}
+
+
 class YandexPaidTest(ProviderTestBase):
+    def setUp(self):
+        super().setUp()
+        # учёт гранта - в памяти, без БД; дата - задолго до отключения
+        for p in (mock.patch.object(yandex_budget, "_state", {"total": 0.0, "day": "", "day_spent": 0.0}),
+                  mock.patch.object(yandex_budget, "_pending", 0.0),
+                  mock.patch.object(yandex_budget, "_save"),
+                  mock.patch.object(yandex_budget, "today_msk",
+                                    return_value=datetime(2026, 10, 11).date())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def use_yandex(self, **extra):
+        return self.use(YANDEX_API_KEY="ya-key", YANDEX_FOLDER_ID="b1gfolder", YANDEX_ENABLED="1",
+                        YANDEX_MIN_INTERVAL_SEC="0", **extra)
+
     def test_default_chain_has_no_yandex(self):
         self.assertNotIn("yandex", ai_scorer.DEFAULT_CHAIN.split(","))
 
-    def test_yandex_not_called_without_enabled(self):
-        # ключи есть, yandex в цепочке, но YANDEX_ENABLED выключен - не вызывается
-        self.use()
-        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]), \
-                mock.patch.object(ai_scorer, "API_KEY", "k"), \
-                mock.patch.object(ai_scorer, "FOLDER_ID", "f"), \
-                mock.patch.object(ai_scorer, "_ask_yandex_lite") as ya, \
-                mock.patch.object(ai_scorer, "_ask") as ask:
+    def test_not_active_without_enabled(self):
+        # ключ и каталог есть, yandex в цепочке, но нет YANDEX_ENABLED=1 - не вызывается
+        prov = self.use(YANDEX_API_KEY="ya-key", YANDEX_FOLDER_ID="b1gfolder")
+        self.assertEqual(prov["yandex"].key, "")
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
             self.assertFalse(ai_scorer.is_enabled())
-            self.assertIsNone(ai_scorer.score_order(ORDER))
-        ya.assert_not_called()
-        ask.assert_not_called()
+            result, api = self.run_order({})
+        self.assertIsNone(result)
+        self.assertEqual(api.calls, [])
 
-    def test_yandex_called_when_enabled_and_in_chain(self):
-        self.use()
+    def test_not_active_without_folder(self):
+        prov = self.use(YANDEX_API_KEY="ya-key", YANDEX_ENABLED="1")
+        self.assertEqual(prov["yandex"].key, "")
+
+    def test_model_without_price_dropped(self):
+        prov = self.use_yandex(YANDEX_MODELS="gpt-oss-120b,aliceai-llm")
+        self.assertEqual(prov["yandex"].models, ["aliceai-llm"])
+
+    def test_request_format_and_cost(self):
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            result, api = self.run_order({"yandex.net": resp(200, extra=YANDEX_USAGE)})
+        self.assertEqual(result["model"], "yandex:aliceai-llm-flash")
+        url, kwargs = api.calls[0]
+        self.assertEqual(url, "https://ai.api.cloud.yandex.net/v1/chat/completions")
+        self.assertEqual(kwargs["headers"]["OpenAI-Project"], "b1gfolder")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer ya-key")
+        self.assertEqual(kwargs["json"]["model"], "gpt://b1gfolder/aliceai-llm-flash")
+        # 2000 вход * 0.1 + 1000 кеш * 0.025 + 400 выход * 0.2 = 0.305 ₽
+        self.assertAlmostEqual(yandex_budget._state["total"], 0.305)
+        self.assertEqual(yandex_budget._pending, 0.0)
+
+    def test_error_is_not_charged(self):
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            self.run_order({"yandex.net": resp(500, text="oops")})
+        self.assertEqual(yandex_budget._state["total"], 0.0)
+        self.assertEqual(yandex_budget._pending, 0.0)
+
+    def test_timeout_charged_by_worst_price(self):
+        import requests
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]),                 mock.patch("requests.post", side_effect=requests.Timeout()):
+            self.assertIsNone(ai_scorer.score_order(ORDER))
+        worst = yandex_budget.worst_cost("aliceai-llm-flash", ai_scorer.PROVIDER_MAX_TOKENS)
+        self.assertAlmostEqual(yandex_budget._state["total"], worst)
+        self.assertEqual(yandex_budget._pending, 0.0)
+
+    def test_maybe_sent(self):
+        import requests
+        self.assertFalse(ai_scorer._maybe_sent(requests.ConnectTimeout()))
+        self.assertFalse(ai_scorer._maybe_sent(requests.ConnectionError("NameResolutionError: x")))
+        self.assertTrue(ai_scorer._maybe_sent(requests.ConnectionError("Connection reset by peer")))
+        self.assertTrue(ai_scorer._maybe_sent(requests.ReadTimeout()))
+
+    def test_retry_without_response_format_reserves_again(self):
+        self.use_yandex()
+        bad = resp(400, text="response_format is not supported")
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            result, api = self.run_order({"yandex.net": [bad, resp(200, extra=YANDEX_USAGE)]})
+        self.assertEqual(len(api.calls), 2)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(yandex_budget._state["total"], 0.305)   # первая попытка не списана
+        self.assertEqual(yandex_budget._pending, 0.0)
+
+    def test_total_budget_spent_not_a_quota_pause(self):
+        self.use_yandex()
+        yandex_budget._state.update(day="2026-10-10", day_spent=0.0, total=3299.5)
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            summary = ai_scorer.failure_summary()
+            probe = ai_scorer.probe()[0]["error"]
+        self.assertIn("весь бюджет гранта исчерпан", summary)
+        self.assertNotIn("возобновится", summary)
+        self.assertIn("весь бюджет", probe)
+
+    def test_no_usage_charged_by_worst_price(self):
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            self.run_order({"yandex.net": resp(200)})
+        worst = yandex_budget.worst_cost("aliceai-llm-flash", ai_scorer.PROVIDER_MAX_TOKENS)
+        self.assertAlmostEqual(yandex_budget._state["total"], worst)
+
+    def test_daily_budget_exhausted_goes_to_next_provider(self):
+        self.use_yandex()
+        yandex_budget._state.update(day="2026-10-11", day_spent=500.0, total=500.0)
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex", "groq"]):
+            result, api = self.run_order({"groq.com": resp(200)})
+            summary = ai_scorer.failure_summary()
+        self.assertEqual(result["model"].split(":")[0], "groq")
+        self.assertNotIn("ai.api.cloud.yandex.net", api.hosts())
+        self.assertIn("дневной бюджет", summary)
+
+    def test_expired_not_active(self):
+        self.use_yandex()
         with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]), \
-                mock.patch.object(ai_scorer, "YANDEX_ENABLED", True), \
-                mock.patch.object(ai_scorer, "_ask_yandex_lite", return_value={"fit": 5}) as ya:
-            self.assertEqual(ai_scorer.score_order(ORDER), {"fit": 5})
-        ya.assert_called_once()
+                mock.patch.object(yandex_budget, "today_msk",
+                                  return_value=datetime(2026, 11, 20).date()):
+            self.assertFalse(ai_scorer.is_enabled())
+            self.assertIn("срок гранта вышел", ai_scorer.probe()[0]["error"])
+
+    def test_budget_today_disables_quota_reserve(self):
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex", "groq"]):
+            self.assertIsNone(ai_scorer.daily_capacity())
+            yandex_budget._state.update(day="2026-10-11", day_spent=500.0, total=500.0)
+            self.assertIsNotNone(ai_scorer.daily_capacity())
+
+    def test_status_has_budget(self):
+        self.use_yandex()
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            st = ai_scorer.status()
+        self.assertEqual(st["providers"]["yandex"]["budget"]["until"], "2026-11-20")
 
 
 class ChainResolveTest(ProviderTestBase):
@@ -377,7 +487,7 @@ class ChainResolveTest(ProviderTestBase):
 
     def test_chain_without_keys_falls_back(self):
         self.use()
-        # yandex без YANDEX_ENABLED ключей не даёт, а у groq и др. они есть
+        # yandex без YANDEX_ENABLED неактивен, а у groq и др. ключи есть
         with self.assertLogs(level="ERROR"):
             chain = ai_scorer._resolve_chain("yandex")
         self.assertIn("groq", chain)

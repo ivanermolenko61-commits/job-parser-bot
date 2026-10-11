@@ -5,7 +5,8 @@ cerebras,mistral; платный yandex - только явно). Провайд
 ключ отклонён или ответ не JSON - заказ сразу уходит следующему, а провайдер/модель
 на паузе пропускаются до её окончания. Gemini - свои модели GEMINI_MODELS; groq,
 cerebras, mistral, openrouter - общий OpenAI-совместимый клиент (только бесплатные
-тарифы и модели); yandexgpt-lite - запасной с лимитом YANDEX_MAX_PER_DAY в сутки.
+тарифы и модели); yandex - тот же клиент, но платный из гранта: только при YANDEX_ENABLED=1,
+до даты YANDEX_UNTIL и в рамках рублёвого бюджета (freelance/yandex_budget.py).
 Если никто не ответил, score_order() возвращает None, и бот повторит оценку в
 следующем цикле (заказ ждёт оценки, пока свежий; без оценки в чат не уходит).
 """
@@ -23,10 +24,9 @@ from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
-load_dotenv()
+from freelance import yandex_budget
 
-API_KEY = os.getenv("YANDEX_API_KEY")
-FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
+load_dotenv()
 
 # Gemini (бесплатный тариф AI Studio) - основной оценщик. Цепочка моделей: следующая
 # берётся, если предыдущая на паузе (429), недоступна (404) или не дала разбираемый ответ.
@@ -79,15 +79,6 @@ _last_error = ""
 _gemini_last_error = ""             # последняя ошибка именно Gemini
 _last_ok: dict | None = None          # {"model": ..., "at": iso}
 
-# YandexGPT ПЛАТНЫЙ (бесплатен только стартовый грант): по умолчанию выключен, не вызывается
-# никогда, пока нет YANDEX_ENABLED=1 (плюс yandex в AI_PROVIDERS и оба ключа).
-YANDEX_ENABLED = os.getenv("YANDEX_ENABLED") == "1" and bool(API_KEY and FOLDER_ID)
-YANDEX_MAX_PER_DAY = int(os.getenv("YANDEX_MAX_PER_DAY", "60"))
-YANDEX_MODEL = "yandexgpt-lite"
-_yandex_day = ""
-_yandex_count = 0
-
-REFUSAL_RE = re.compile(r"не могу (обсуждать|ответить|помочь)", re.IGNORECASE)
 REQUEST_TIMEOUT_SEC = 30
 GEMMA_TIMEOUT_SEC = 90
 BODY_LIMIT = 3000
@@ -163,10 +154,6 @@ SYSTEM_PROMPT = (
     '"questions": ["вопрос заказчику"]}'
 )
 
-YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-YANDEX_MAX_TOKENS = "1000"
-
-
 # ---------------------------------------------------------------------------
 # Бесплатные OpenAI-совместимые провайдеры: groq, cerebras, mistral, openrouter
 # ---------------------------------------------------------------------------
@@ -207,6 +194,9 @@ DAILY_MARKERS = ("per day", "per-day", "daily", "tokens per day", "requests per 
 #  cloudflare (Workers AI, бесплатный план): 10 000 нейронов в сутки на аккаунт; рассуждающая
 #    gpt-oss-120b тратит до ~250 нейронов на заказ, поэтому потолок 40 в сутки.
 #    URL содержит ID аккаунта (CLOUDFLARE_ACCOUNT_ID); без него провайдер выключен.
+#  yandex (Yandex AI Studio, ПЛАТНЫЙ из гранта): включается только YANDEX_ENABLED=1 + YANDEX_API_KEY +
+#    YANDEX_FOLDER_ID; деньги ограничивает yandex_budget (дата отключения, бюджет в сутки и всего),
+#    per_day - лишь запасной потолок числа запросов. Модель - короткое имя из yandex_budget.PRICES.
 PROVIDER_SPECS = {
     "github": {
         "url": "https://models.github.ai/inference", "prefix": "GITHUB",
@@ -242,6 +232,11 @@ PROVIDER_SPECS = {
         # лимит 50/сутки общий на все :free-модели, поэтому 429 по дню паузит весь провайдер
         "interval": 3.5, "per_day": 45, "shared_daily": True,
     },
+    "yandex": {
+        "url": "https://ai.api.cloud.yandex.net/v1", "prefix": "YANDEX",
+        "models": "aliceai-llm-flash",
+        "interval": 1.0, "per_day": 400, "shared_daily": False,
+    },
 }
 
 
@@ -267,6 +262,7 @@ class _Provider:
     disabled: set = field(default_factory=set)    # модели без доступа (404) - до рестарта
     no_json: set = field(default_factory=set)     # модели без response_format
     count_loaded: bool = False          # дневной счётчик уже восстановлен из kv
+    folder: str = ""                     # yandex: каталог Yandex Cloud (часть URI модели)
     cap_logged_day: str = ""             # за какие сутки уже писали в лог об исчерпанном потолке
 
 
@@ -319,6 +315,16 @@ def _build_providers(environ) -> dict:
                     logging.warning(f"[AI] {name}: нет {prefix}_ACCOUNT_ID, провайдер выключен")
                 key = ""                    # без аккаунта провайдер неактивен
             base_url = base_url.format(account_id=account)
+        folder = ""
+        if name == "yandex":
+            # платный: без явного YANDEX_ENABLED=1 и каталога провайдер неактивен, даже с ключом
+            folder = (environ.get("YANDEX_FOLDER_ID") or "").strip()
+            if environ.get("YANDEX_ENABLED") != "1" or not folder:
+                key = ""
+            for m in models:
+                if m not in yandex_budget.PRICES:
+                    logging.warning(f"[AI] yandex: у модели {m} нет цены в yandex_budget.PRICES, отброшена")
+            models = [m for m in models if m in yandex_budget.PRICES]
         providers[name] = _Provider(
             name=name,
             base_url=base_url,
@@ -327,6 +333,7 @@ def _build_providers(environ) -> dict:
             min_interval=_env_number(environ, f"{prefix}_MIN_INTERVAL_SEC", spec["interval"], float),
             max_per_day=_env_number(environ, f"{prefix}_MAX_PER_DAY", spec["per_day"], int),
             shared_daily=spec["shared_daily"],
+            folder=folder,
         )
     return providers
 
@@ -364,16 +371,16 @@ _or_paid: set[str] = set()           # модели OpenRouter с ненулев
 
 
 def _chain_active(chain=None) -> list[str]:
-    """Провайдеры цепочки, у которых есть ключи (yandex - ещё и YANDEX_ENABLED=1)."""
+    """Провайдеры цепочки, у которых есть ключи (yandex - ещё YANDEX_ENABLED=1 и срок гранта)."""
     active = []
     for name in (CHAIN if chain is None else chain):
         if name == "gemini":
             ok = bool(GEMINI_KEY)
-        elif name == "yandex":
-            ok = YANDEX_ENABLED
         else:
             p = PROVIDERS.get(name)
             ok = bool(p and p.key)
+            if ok and name == "yandex" and yandex_budget.expired():
+                ok = False
         if ok:
             active.append(name)
     return active
@@ -384,12 +391,6 @@ def is_enabled() -> bool:
 
 
 CHAIN = _resolve_chain(os.getenv("AI_PROVIDERS"))
-
-
-def _yandex_headers() -> dict:
-    # IAM-токены начинаются с "t1." (Bearer), остальное - API-ключ сервисного аккаунта
-    scheme = "Bearer" if (API_KEY or "").startswith("t1.") else "Api-Key"
-    return {"Authorization": f"{scheme} {API_KEY}", "x-folder-id": FOLDER_ID or ""}
 
 
 def _expire_key_error(p, now: float) -> None:
@@ -429,11 +430,13 @@ def status() -> dict:
                 "key_error": p.key_error,
                 "last_error": p.last_error,
             }
+            if name == "yandex":
+                providers[name]["budget"] = None   # заполняется ниже, вне _lock
             if p.key_error:
                 key_errors[name] = p.key_error
             if p.paid_reason:
                 paid_errors[name] = p.paid_reason
-        return {
+        result = {
             "enabled": is_enabled(),
             "chain": list(CHAIN),
             "providers": providers,
@@ -443,13 +446,16 @@ def status() -> dict:
             "models": [m for m in GEMINI_MODELS if m not in _disabled],
             "paused": paused,
             "disabled": [m for m in GEMINI_MODELS if m in _disabled],
-            "yandex": YANDEX_ENABLED,
             "last_ok": dict(_last_ok) if _last_ok else None,
             "config_error": _config_error,
             "region_error": _region_error,
             "last_error": _last_error,
             "gemini_last_error": _gemini_last_error,
         }
+    if "yandex" in providers and providers["yandex"]["has_key"]:
+        providers["yandex"]["budget"] = yandex_budget.summary(
+            max_tokens=PROVIDER_MAX_TOKENS, models=providers["yandex"]["models"])
+    return result
 
 
 def failure_summary(now: datetime | None = None) -> str:
@@ -475,6 +481,7 @@ def failure_summary(now: datetime | None = None) -> str:
     resumes: list[datetime] = []       # когда вернётся каждый провайдер, остановленный квотой
     blocked_count = 0
     active = _chain_active()
+    yandex_note = _yandex_budget_note() if "yandex" in active else ""
     with _lock:
         for name in active:
             if name == "gemini":
@@ -493,15 +500,16 @@ def failure_summary(now: datetime | None = None) -> str:
                 else:
                     parts.append(f"gemini: {_gemini_last_error or 'нет ответа'}")
                 continue
-            if name == "yandex":
-                if _yandex_day == today and _yandex_count >= YANDEX_MAX_PER_DAY:
-                    resumes.append(midnight)
-                    blocked_count += 1
-                    parts.append(f"yandex: лимит {YANDEX_MAX_PER_DAY}/{YANDEX_MAX_PER_DAY} за сутки")
-                else:
-                    parts.append("yandex: нет ответа")
-                continue
             p = PROVIDERS[name]
+            if name == "yandex" and yandex_note and not p.dead and not p.key_error:
+                parts.append(f"yandex: {yandex_note}")
+                if yandex_note == YANDEX_DAY_SPENT:
+                    # сутки бюджета - по МСК: сброс в 00:00 МСК; весь бюджет/сбой учёта - не квота
+                    resumes.append(datetime.combine(
+                        yandex_budget.today_msk(now) + timedelta(days=1), datetime.min.time(),
+                        tzinfo=msk))
+                    blocked_count += 1
+                continue
             live = [m for m in p.models if m not in p.disabled]
             ends = [p.paused.get(m, 0.0) for m in live]
             if p.dead:
@@ -524,6 +532,24 @@ def failure_summary(now: datetime | None = None) -> str:
         text = (f"кончились бесплатные квоты, оценка возобновится ~{at_msk(min(resumes))} МСК "
                 f"(ближайший срок): {text}")
     return text
+
+
+YANDEX_DAY_SPENT = "дневной бюджет гранта исчерпан, продолжит в 00:00 МСК"
+
+
+def _yandex_budget_note() -> str:
+    """Почему Яндекс сейчас не тратит грант ("" - может). Вызывать вне _lock: читает БД."""
+    p = PROVIDERS["yandex"]
+    with _lock:
+        live = [m for m in p.models if m not in p.disabled]
+    if not live or yandex_budget.can_spend_today(live[0], PROVIDER_MAX_TOKENS):
+        return ""
+    info = yandex_budget.summary(max_tokens=PROVIDER_MAX_TOKENS, models=live)
+    if info["unknown"]:
+        return "учёт трат гранта не прочитан из БД, Яндекс не вызывается"
+    if info["exhausted"]:
+        return f"весь бюджет гранта исчерпан ({info['total']:.0f} из {info['budget']:.0f} ₽), выключен"
+    return YANDEX_DAY_SPENT
 
 
 def _clean_float(value) -> float:
@@ -666,8 +692,6 @@ def score_order(order) -> dict | None:
         try:
             if name == "gemini":
                 result = _ask_gemini_chain(order, deadline)
-            elif name == "yandex":
-                result = _ask_yandex_lite(order) if YANDEX_ENABLED else None
             else:
                 result = _ask_provider(PROVIDERS[name], order, deadline)
         except Exception:
@@ -676,23 +700,6 @@ def score_order(order) -> dict | None:
         if result is not None:
             return result
     return None
-
-
-def _ask_yandex_lite(order) -> dict | None:
-    """Запасной путь: самая простая модель, не больше YANDEX_MAX_PER_DAY в сутки."""
-    global _yandex_day, _yandex_count
-    today = time.strftime("%Y-%m-%d")
-    with _lock:
-        if _yandex_day != today:
-            _yandex_day, _yandex_count = today, 0
-        if _yandex_count >= YANDEX_MAX_PER_DAY:
-            return None
-        _yandex_count += 1
-    result = _ask(YANDEX_MODEL, order)
-    if result is not None:
-        _mark_ok(YANDEX_MODEL, gemini=False)
-        result["model"] = YANDEX_MODEL
-    return result
 
 
 def _user_prompt(order) -> str:
@@ -704,7 +711,7 @@ def _user_prompt(order) -> str:
 
 
 def _mark_ok(model: str, gemini: bool = True, provider=None) -> None:
-    """Запоминает удачную оценку. Успех Yandex не снимает ошибку ключа Gemini.
+    """Запоминает удачную оценку. Успех других провайдеров не снимает ошибку ключа Gemini.
     provider - _Provider, чья ошибка очищается (для gemini очищается _gemini_last_error)."""
     global _last_ok, _config_error, _config_blocked_until, _last_error, _gemini_last_error
     global _region_error
@@ -1099,7 +1106,8 @@ def daily_capacity() -> tuple[int, int] | None:
     """(осталось, всего) запросов на сегодня у провайдеров цепочки с дневным потолком
     (с ключом и не выключенных из-за оплаты). None - резерв не нужен: таких провайдеров
     нет или доступен Gemini (у него нет нашего потолка, лимиты он сообщает сам).
-    Yandex не считаем: платный и ограничен отдельно. Провайдер, который сейчас не ответит
+    Yandex в сумму не входит: его ограничивает рублёвый бюджет; пока бюджет на сегодня есть,
+    резерв тоже не нужен (None). Провайдер, который сейчас не ответит
     (ключ отклонён, все модели выключены или на паузе дольше часа - например, дневной 429),
     входит в «всего», но его остаток не считается."""
     left = total = 0
@@ -1109,9 +1117,15 @@ def daily_capacity() -> tuple[int, int] | None:
         with _lock:
             if _gemini_available():
                 return None
+    if "yandex" in active:
+        p = PROVIDERS["yandex"]
+        with _lock:
+            live = [m for m in p.models if m not in p.disabled] if not p.dead else []
+        if live and yandex_budget.can_spend_today(live[0], PROVIDER_MAX_TOKENS):
+            return None
     for name in active:
         p = PROVIDERS.get(name)
-        if p is None:
+        if p is None or name == "yandex":
             continue
         _load_count(p)
         with _lock:
@@ -1183,6 +1197,8 @@ def _provider_models(p: _Provider) -> list[str]:
 
 def _provider_headers(p: _Provider) -> dict:
     headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
+    if p.name == "yandex":
+        headers["OpenAI-Project"] = p.folder   # каталог Yandex Cloud, в котором выдан ключ
     if p.name == "openrouter":
         # только название бота; никаких личных данных
         headers["X-Title"] = "job-parser-bot"
@@ -1190,6 +1206,11 @@ def _provider_headers(p: _Provider) -> dict:
         if referer:
             headers["HTTP-Referer"] = referer
     return headers
+
+
+def _provider_model_id(p: _Provider, model: str) -> str:
+    """Имя модели в запросе: у Яндекса - полный URI с каталогом, у остальных - как есть."""
+    return f"gpt://{p.folder}/{model}" if p.name == "yandex" else model
 
 
 def _provider_body(model: str, order, use_json: bool, openrouter: bool = False) -> dict:
@@ -1287,6 +1308,53 @@ def _mark_paid(p: _Provider, reason: str) -> None:
     _set_error(reason, p)
 
 
+def _maybe_sent(e: Exception) -> bool:
+    """Мог ли запрос дойти до провайдера (и тарифицироваться). Нет - только сбой соединения
+    до отправки: таймаут подключения, DNS, «не удалось установить соединение»."""
+    import requests
+    if isinstance(e, requests.ConnectTimeout):
+        return False
+    if isinstance(e, requests.ConnectionError):
+        text = str(e)
+        return not any(m in text for m in ("NameResolution", "Failed to establish a new connection",
+                                           "getaddrinfo"))
+    return True
+
+
+def _usage_of(resp):
+    """usage из ответа (для цены Яндекса); None - не JSON или нет usage."""
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    return payload.get("usage") if isinstance(payload, dict) else None
+
+
+_yandex_stop_logged = ""   # день (МСК), за который уже писали об исчерпанном бюджете
+
+
+def _log_yandex_budget_stop(p: _Provider) -> None:
+    """Бюджет гранта на сегодня (или весь) исчерпан: warning раз в сутки, с цифрами."""
+    global _yandex_stop_logged
+    info = yandex_budget.summary()
+    day = yandex_budget.today_msk().isoformat()
+    with _lock:
+        if _yandex_stop_logged == day:
+            return
+        _yandex_stop_logged = day
+    if info["expired"]:
+        logging.warning(f"[AI] yandex: срок гранта вышел ({info['until']}), Яндекс выключен")
+    elif info["unknown"]:
+        return   # причину (ошибку БД) уже записал yandex_budget._load
+    elif info["exhausted"]:
+        logging.warning(f"[AI] yandex: весь бюджет гранта исчерпан ({info['total']:.2f} из "
+                        f"{info['budget']:.0f} ₽), Яндекс больше не вызывается")
+    else:
+        logging.warning(f"[AI] yandex: бюджет на сегодня исчерпан ({info['today']:.2f} из "
+                        f"{info['allowance']:.2f} ₽, всего {info['total']:.2f} из {info['budget']:.0f} ₽), "
+                        f"продолжит в 00:00 МСК")
+
+
 def _ask_provider_model(p: _Provider, model: str, order):
     """Один заказ - одна модель. dict - успех; "next" - следующая модель;
     "stop" - провайдер для этого заказа не годится (ключ, 402, потолок, очередь)."""
@@ -1309,12 +1377,20 @@ def _ask_provider_model(p: _Provider, model: str, order):
             if state:
                 _save_count(p)
                 return state
+        reserved = None
+        if p.name == "yandex":
+            # платный: перед запросом резервируем его худшую цену в бюджете гранта
+            reserved = yandex_budget.reserve(model, PROVIDER_MAX_TOKENS)
+            if reserved is None:
+                _give_back_slot(p)
+                _log_yandex_budget_stop(p)
+                return "stop"
         sent_at = time.monotonic()
         try:
             resp = requests.post(
                 f"{p.base_url}/chat/completions",
                 headers=_provider_headers(p),
-                json=_provider_body(model, order, use_json, p.name == "openrouter"),
+                json=_provider_body(_provider_model_id(p, model), order, use_json, p.name == "openrouter"),
                 timeout=PROVIDER_TIMEOUT_SEC,
             )
         except Exception as e:
@@ -1322,7 +1398,17 @@ def _ask_provider_model(p: _Provider, model: str, order):
             _set_error(f"{label}: {type(e).__name__}", p)
             if not isinstance(e, requests.Timeout):
                 _give_back_slot(p)   # запрос не дошёл - слот не тратим (при таймауте провайдер мог засчитать)
+            if reserved is not None:
+                if _maybe_sent(e):
+                    yandex_budget.settle(model, reserved, None)   # мог тарифицироваться: по худшей цене
+                else:
+                    yandex_budget.release(reserved)
             return "next"
+        if reserved is not None:
+            if resp.status_code == 200:
+                yandex_budget.settle(model, reserved, _usage_of(resp))
+            else:
+                yandex_budget.release(reserved)   # ошибки (4xx/5xx) не тарифицируются
         if resp.status_code == 400 and use_json and attempt == 1:
             body = str(resp.text or "")[:600].lower()
             # json_validate_failed - модель дала кривой JSON, а не "формат не поддержан"
@@ -1439,65 +1525,6 @@ def _ask_provider_model(p: _Provider, model: str, order):
     return parsed
 
 
-def _ask(model_name: str, order) -> dict | None:
-    """Один запрос к YandexGPT по REST. dict - оценка, None - не вышло."""
-    import requests
-    body = {
-        "modelUri": f"gpt://{FOLDER_ID}/{model_name}/latest",
-        "completionOptions": {
-            "stream": False,
-            "temperature": 0.2,
-            "maxTokens": YANDEX_MAX_TOKENS,
-        },
-        "messages": [
-            {"role": "system", "text": SYSTEM_PROMPT},
-            {"role": "user", "text": _user_prompt(order)},
-        ],
-    }
-    # Ошибки Yandex только логируются (как при SDK): причина в оповещении
-    # «AI-оценка заказов» остаётся от Gemini. Сетевой сбой и 5xx - один повтор.
-    resp = None
-    for attempt in (1, 2):
-        try:
-            resp = requests.post(YANDEX_URL, headers=_yandex_headers(), json=body,
-                                 timeout=REQUEST_TIMEOUT_SEC)
-        except Exception as e:
-            logging.warning(f"[AI] YandexGPT: сбой запроса (попытка {attempt}): {type(e).__name__}")
-            resp = None
-        if resp is not None and resp.status_code < 500:
-            break
-        if attempt == 1:
-            time.sleep(2)
-    if resp is None:
-        return None
-
-    code = resp.status_code
-    if code != 200:
-        if code == 429:
-            logging.warning("[AI] YandexGPT: лимит запросов (HTTP 429)")
-        elif code in (401, 403):
-            logging.error(f"[AI] YandexGPT: ключ или права отклонены (HTTP {code})")
-        else:
-            logging.warning(f"[AI] YandexGPT: HTTP {code}: {resp.text[:150]!r}")
-        return None
-
-    try:
-        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
-    except Exception as e:
-        logging.warning(f"[AI] YandexGPT: не разобран ответ: {type(e).__name__}")
-        return None
-    parsed = parse_ai_json(text)
-    if parsed is None:
-        logging.warning(f"[AI] ответ не JSON: {text[:150]!r}")
-        if REFUSAL_RE.search(text or ""):
-            # фильтр модели отказался: заказ не наш, не переоцениваем вечно
-            return {"fit": 0, "difficulty": "", "hours": 0.0, "category": "other",
-                    "components": [], "unknowns": [], "clarity": "",
-                    "client_budget_ok": None, "price_rub": "",
-                    "summary": "отказ модели", "risks": "", "questions": []}
-    return parsed
-
-
 def _probe_order():
     from freelance.alot_client import FreelanceOrder
     return FreelanceOrder(0, "youdoru", "Создать Telegram-бота для записи клиентов",
@@ -1518,10 +1545,12 @@ def probe() -> list[dict]:
              "model": "", "seconds": 0.0, "fit": None, "error": ""}
         results.append(r)
         if not r["configured"]:
-            r["error"] = "нет ключа" if name != "yandex" else "выключен (платный)"
-            continue
-        if name == "yandex":
-            r["error"] = "платный, не проверяем"
+            if name != "yandex":
+                r["error"] = "нет ключа"
+            elif PROVIDERS["yandex"].key and yandex_budget.expired():
+                r["error"] = f"срок гранта вышел ({yandex_budget.until():%d.%m.%Y}), выключен"
+            else:
+                r["error"] = "выключен (нужны YANDEX_ENABLED=1, YANDEX_API_KEY, YANDEX_FOLDER_ID)"
             continue
         if name == "gemini":
             models = [m for m in GEMINI_MODELS if m not in _disabled]
@@ -1539,6 +1568,11 @@ def probe() -> list[dict]:
             if capped:
                 r["error"] = f"дневной потолок {p.max_per_day} исчерпан (сброс в 03:00 МСК)"
                 continue
+            if name == "yandex":
+                note = _yandex_budget_note()
+                if note:
+                    r["error"] = note
+                    continue
         started = time.monotonic()
         try:
             if name == "gemini":

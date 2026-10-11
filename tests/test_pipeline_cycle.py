@@ -171,5 +171,34 @@ class QuotaReserveTest(CycleTestBase):
         self.assertEqual(sorted(calls), [201, 202, 203])
 
 
+class YandexGrantAlertTest(CycleTestBase):
+    def status(self, **budget):
+        info = {"until": "2026-11-20", "days_left": 30, "expired": False, "budget": 3300.0,
+                "total": 100.0, "today": 5.0, "allowance": 80.0, "exhausted": False, "unknown": False}
+        info.update(budget)
+        return {"providers": {"yandex": {"budget": info}}}
+
+    def test_soon_alert_sent_once(self):
+        with mock.patch.object(pipeline.monitor, "record") as record:
+            pipeline._report_yandex_grant(self.status(days_left=3))
+            pipeline._report_yandex_grant(self.status(days_left=2))
+        self.assertEqual(record.call_count, 1)
+        self.assertEqual(record.call_args.args[0], "yandex_grant_soon")
+        self.assertIn("20.11.2026", record.call_args.kwargs["reason"])
+
+    def test_expired_and_spent_alerts(self):
+        with mock.patch.object(pipeline.monitor, "record") as record:
+            pipeline._report_yandex_grant(self.status(expired=True, days_left=0))
+            pipeline._report_yandex_grant(self.status(exhausted=True))
+        self.assertEqual([c.args[0] for c in record.call_args_list], ["yandex_grant_off", "yandex_grant_spent"])
+
+    def test_quiet_when_far_or_unknown(self):
+        with mock.patch.object(pipeline.monitor, "record") as record:
+            pipeline._report_yandex_grant(self.status())
+            pipeline._report_yandex_grant(self.status(days_left=1, unknown=True))
+            pipeline._report_yandex_grant({"providers": {}})
+        record.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

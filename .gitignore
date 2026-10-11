@@ -12,3 +12,7 @@ Thumbs.db
 .vscode/
 *.db-wal
 *.db-shm
+# Сравнение моделей: заказы с alot.pro (тексты заказчиков) и результаты - только локально
+tools/eval_orders.json
+tools/eval_reference.json
+tools/eval_results/

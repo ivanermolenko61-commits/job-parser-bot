@@ -514,7 +514,7 @@ async def _check_freelance_impl(manual: bool = False) -> dict | None:
 
 
 def _ai_state_text(st: dict) -> str:
-    """Строка статуса AI: активная Gemini-модель, запасные, Yandex, последняя оценка."""
+    """Строка статуса AI: активная Gemini-модель, запасные, провайдеры, грант Яндекса, последняя оценка."""
     if not st["enabled"]:
         return "выключен (нет ключей), заказы идут без оценки"
     def fmt_sec(sec: int) -> str:
@@ -522,7 +522,7 @@ def _ai_state_text(st: dict) -> str:
 
     providers = st.get("providers", {})
     lines = []
-    for name in st.get("chain", ["gemini", "yandex"]):
+    for name in st.get("chain", ["gemini"]):
         if name == "gemini":
             if not st["gemini"]:
                 continue
@@ -534,10 +534,6 @@ def _ai_state_text(st: dict) -> str:
             if st["paused"]:
                 paused = ", ".join(f"{html.escape(m)} {fmt_sec(sec)}" for m, sec in st["paused"].items())
                 line += f"; на паузе (лимит): {paused}"
-        elif name == "yandex":
-            if not st["yandex"]:
-                continue
-            line = "Yandex lite"
         else:
             p = providers.get(name)
             if not p or not p["has_key"]:
@@ -554,6 +550,16 @@ def _ai_state_text(st: dict) -> str:
                     line += f"; на паузе: {paused}"
                 if p["disabled"]:
                     line += f"; недоступны: {html.escape(', '.join(p['disabled']))}"
+            budget = p.get("budget")
+            if budget:
+                until = datetime.fromisoformat(budget["until"]).strftime("%d.%m")
+                if budget["expired"]:
+                    line += f"; грант: срок вышел {until}, выключен"
+                elif budget.get("unknown"):
+                    line += "; грант: учёт трат не прочитан из БД, Яндекс выключен"
+                else:
+                    line += (f"; грант: сегодня {budget['today']:.0f}/{budget['allowance']:.0f} ₽, "
+                             f"всего {budget['total']:.0f}/{budget['budget']:.0f} ₽, до {until}")
         lines.append(line)
     text = "\n  • ".join([""] + lines) if lines else "нет активных провайдеров"
     last = st["last_ok"]
@@ -1022,7 +1028,7 @@ async def cmd_status(message: Message):
     mem = memwatch.mem_used_mb()
     if mem is not None:
         lines.append(f"🧠 Память: {mem} МБ из {memwatch.MEM_LIMIT_MB} (пик {memwatch.peak_mb()})")
-    parsers ={k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES and not k.startswith(("ai_key_", "ai_paid_"))}
+    parsers ={k: v for k, v in monitor.streaks().items() if k not in FREELANCE_HEALTH_SOURCES and not k.startswith(("ai_key_", "ai_paid_", "yandex_grant_"))}
     if parsers:
         lines.append("\n<b>Парсеры:</b>")
         for source, streak in sorted(parsers.items()):

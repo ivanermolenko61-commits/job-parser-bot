@@ -39,7 +39,7 @@ from database import (
     kv_get,
     kv_set,
 )
-from freelance import ai_scorer, pricing
+from freelance import ai_scorer, pricing, yandex_budget
 from freelance.alot_client import (
     FreelanceOrder,
     _fetch_items,
@@ -474,6 +474,7 @@ def _report_ai_health(res: CycleResult) -> None:
             monitor.record(f"ai_paid_{name}", 0, RuntimeError(reason),
                            label=f"AI-провайдер {name}", immediate=True,
                            bad_text="платный вызов, провайдер выключен до рестарта", reason=reason)
+    _report_yandex_grant(st)
     if res.ai_attempted == 0:
         return
     if res.ai_ok == 0:
@@ -485,6 +486,38 @@ def _report_ai_health(res: CycleResult) -> None:
     else:
         kv_set(AI_FAIL_STREAK_KEY, 0)
         monitor.record("gemini", res.ai_ok, label=label)
+
+
+def _report_yandex_grant(st: dict) -> None:
+    """Грант Яндекса: по одному сообщению в Telegram за WARN_DAYS дней до отключения,
+    при отключении по дате и при исчерпании всего бюджета. Отметка «уже сообщали» - в kv,
+    чтобы рестарт не повторял сообщения."""
+    info = (st.get("providers", {}).get("yandex") or {}).get("budget")
+    if not info or info.get("unknown"):
+        return   # Яндекс не настроен (нет YANDEX_ENABLED=1 / ключа / каталога) или учёт не прочитан
+    until = datetime.fromisoformat(info["until"]).strftime("%d.%m.%Y")
+    spent = f"потрачено {info['total']:.0f} из {info['budget']:.0f} ₽"
+    if info["expired"]:
+        key, text = "yandex_grant_off", (
+            f"срок гранта вышел ({until}), Яндекс больше не вызывается; {spent}. "
+            f"Убери yandex из AI_PROVIDERS и YANDEX_ENABLED на BotHost")
+    elif info["exhausted"]:
+        key, text = "yandex_grant_spent", f"бюджет гранта исчерпан ({spent}), Яндекс больше не вызывается"
+    elif info["days_left"] <= yandex_budget.WARN_DAYS:
+        key, text = "yandex_grant_soon", (
+            f"Яндекс отключится {until} (осталось дней: {info['days_left']}); {spent}")
+    else:
+        return
+    try:
+        if kv_get(key):
+            return
+        kv_set(key, datetime.now(timezone.utc).isoformat())
+    except Exception as e:
+        # без отметки в БД не шлём: иначе сообщение повторялось бы каждый цикл
+        logging.warning(f"[FREELANCE] оповещение о гранте Яндекса отложено: БД недоступна ({type(e).__name__})")
+        return
+    monitor.record(key, 0, RuntimeError(text), label="Грант Yandex Cloud", immediate=True,
+                   bad_text="внимание", reason=text)
 
 
 def save_order(sc: ScoredOrder, status: str, message_id: int | None = None) -> None:

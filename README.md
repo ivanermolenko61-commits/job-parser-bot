@@ -99,7 +99,7 @@ MY_CHAT_ID=your_chat_id_from_userinfobot
 GEMINI_API_KEY=your_gemini_api_key  # aistudio.google.com/apikey
 # Опционально: цепочка бесплатных моделей Gemini (по умолчанию встроена)
 # GEMINI_MODELS=gemini-3.5-flash-lite,gemini-3.1-flash-lite,...
-# Опционально: YandexGPT ПЛАТНЫЙ, выключен по умолчанию (нужны YANDEX_ENABLED=1 и yandex в AI_PROVIDERS)
+# Опционально: Yandex AI Studio ПЛАТНЫЙ (грант), выключен по умолчанию (нужны YANDEX_ENABLED=1 и yandex в AI_PROVIDERS)
 YANDEX_API_KEY=
 YANDEX_FOLDER_ID=
 ```
@@ -108,7 +108,12 @@ YANDEX_FOLDER_ID=
 - `MY_CHAT_ID` — ваш ID в Telegram (используйте [@userinfobot](https://t.me/userinfobot))
 - `GEMINI_API_KEY` — ключ Gemini API (бесплатный, [aistudio.google.com/apikey](https://aistudio.google.com/apikey)); обязателен для AI-оценки; без него заказы приходят с пометкой «без AI»
 - `GEMINI_MODELS` — цепочка моделей (опционально; встроена по умолчанию): `gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.1-flash-lite-preview,gemma-4-31b-it,gemma-4-26b-a4b-it`. При лимите одной модели (429) берётся следующая. Бесплатный дневной лимит: flash-lite — 500 запросов, gemma — 14 400 (у каждой модели свой)
-- `YANDEX_API_KEY`, `YANDEX_FOLDER_ID` — YandexGPT-lite **платный** (бесплатен только стартовый грант), поэтому **по умолчанию выключен**: вызывается только при `YANDEX_ENABLED=1` И `yandex` в `AI_PROVIDERS`, не более `YANDEX_MAX_PER_DAY` (60) запросов в сутки. Без `YANDEX_ENABLED=1` не вызывается никогда, даже если ключи заданы.
+- `YANDEX_API_KEY`, `YANDEX_FOLDER_ID` — Yandex AI Studio **платный** (тратится стартовый грант), поэтому **по умолчанию выключен**: вызывается только при `YANDEX_ENABLED=1` И `yandex` в `AI_PROVIDERS`. Без `YANDEX_ENABLED=1` не вызывается никогда, даже если ключи заданы. Деньги ограничивает `freelance/yandex_budget.py`:
+  - с даты `YANDEX_UNTIL` (по умолчанию и не позже `2026-11-20`, за день до конца гранта) Яндекс не вызывается никогда; за 3 дня и в день отключения приходит сообщение в Telegram;
+  - всего не больше `YANDEX_BUDGET_RUB` (по умолчанию и не больше 3300 ₽);
+  - в сутки (МСК) — не больше «остаток бюджета / дней до отключения»: грант тратится равномерно, недотраченное переходит на следующие дни; когда дневной лимит исчерпан, оценивают бесплатные провайдеры;
+  - цена каждого ответа считается по `usage` (токены × цены из `PRICES`), перед запросом резервируется худшая цена; учёт хранится в базе (kv `yandex_spent`) и переживает рестарт;
+  - модель — `YANDEX_MODELS` (по умолчанию `aliceai-llm-flash`); модель без цены в `PRICES` не вызывается. Выбор модели: `python -m tools.yandex_eval` (платно, ~180 ₽, сравнение с эталоном на 60 заказах; файлы набора только локальные).
 
 ### AI-провайдеры (бесплатные, взаимозаменяемые)
 
@@ -123,13 +128,13 @@ YANDEX_FOLDER_ID=
 | Cerebras | [cloud.cerebras.ai](https://cloud.cerebras.ai) | сейчас ключ только с картой; 5 запросов/мин, 1M токенов/сутки на модель | `CEREBRAS_MODELS=gpt-oss-120b,qwen-3.8-27b` |
 | Mistral | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | сейчас ключ только на платном тарифе; был тариф **Experiment**; **данные запросов на нём могут использоваться для обучения** | `MISTRAL_MODELS=mistral-small-latest,ministral-8b-latest` |
 | OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | только модели `:free` / `openrouter/free`; без пополнения баланса 50 запросов/сутки на все вместе | `OPENROUTER_MODELS=nvidia/nemotron-3-super-120b-a12b:free,openrouter/free` |
-| YandexGPT | см. выше | **платный**, по умолчанию выключен (нужны `YANDEX_ENABLED=1` и `yandex` в `AI_PROVIDERS`) | `yandexgpt-lite` |
+| Yandex AI Studio | см. выше | **платный** (грант), по умолчанию выключен (нужны `YANDEX_ENABLED=1` и `yandex` в `AI_PROVIDERS`); бюджет и дата отключения в коде | `YANDEX_MODELS=aliceai-llm-flash` |
 
 - Порядок: `AI_PROVIDERS=gemini,cloudflare,openrouter,github` (неизвестные имена пропускаются с предупреждением в логе; если после разбора цепочка пуста или в ней нет провайдеров с ключами — ERROR в лог и берётся цепочка по умолчанию, чтобы опечатка не отключила AI). Модели внутри провайдера берутся по порядку списка. На один заказ отводится не больше `AI_ORDER_DEADLINE_SEC` (120 с): после этого новые модели и провайдеры не пробуются.
-- У каждого провайдера свой минимальный интервал между запросами (`CLOUDFLARE_MIN_INTERVAL_SEC` 3, `OPENROUTER_MIN_INTERVAL_SEC` 3.5, `GITHUB_MIN_INTERVAL_SEC` 4.5, `GROQ_MIN_INTERVAL_SEC` 2.5, `CEREBRAS_MIN_INTERVAL_SEC` 12.5, `MISTRAL_MIN_INTERVAL_SEC` 1.2) и свой дневной потолок запросов (`CLOUDFLARE_MAX_PER_DAY` 50, `OPENROUTER_MAX_PER_DAY` 45, `GITHUB_MAX_PER_DAY` 290, `GROQ_MAX_PER_DAY` 900, `CEREBRAS_MAX_PER_DAY` 300, `MISTRAL_MAX_PER_DAY` 1000); дневной счётчик идёт по UTC. Если очередь к провайдеру длиннее `AI_PROVIDER_MAX_WAIT_SEC` (20 с), заказ уходит следующему.
+- У каждого провайдера свой минимальный интервал между запросами (`CLOUDFLARE_MIN_INTERVAL_SEC` 3, `OPENROUTER_MIN_INTERVAL_SEC` 3.5, `GITHUB_MIN_INTERVAL_SEC` 4.5, `GROQ_MIN_INTERVAL_SEC` 2.5, `CEREBRAS_MIN_INTERVAL_SEC` 12.5, `MISTRAL_MIN_INTERVAL_SEC` 1.2) и свой дневной потолок запросов (`CLOUDFLARE_MAX_PER_DAY` 50, `OPENROUTER_MAX_PER_DAY` 45, `YANDEX_MAX_PER_DAY` 400 — запасной потолок к рублёвому бюджету, `GITHUB_MAX_PER_DAY` 290, `GROQ_MAX_PER_DAY` 900, `CEREBRAS_MAX_PER_DAY` 300, `MISTRAL_MAX_PER_DAY` 1000); дневной счётчик идёт по UTC. Если очередь к провайдеру длиннее `AI_PROVIDER_MAX_WAIT_SEC` (20 с), заказ уходит следующему.
 - 429: пауза модели по `Retry-After` / `x-ratelimit-reset-*`; при дневной квоте — от 1 до 6 часов. 401/403: провайдер выключается на 5 минут (остальные не затрагиваются). 404: модель выключается до рестарта. **402 (требуется оплата) или ответ платной модели OpenRouter (`model` без `:free` и ненулевой `usage.cost`): провайдер выключается до рестарта, в логе ERROR и сразу приходит оповещение в Telegram.** 403 с признаками модерации — отказ по заказу, ключ не блокируется.
 - OpenRouter: из `OPENROUTER_MODELS` отбрасываются модели без `:free` (кроме `openrouter/free`); раз в 6 часов список сверяется с публичным `/models`, модели с ненулевой ценой исключаются. Платные функции (web search и т.п.) в запросах не используются.
-- Резерв квоты: заказы оцениваются по группам (`freelance/filters.py: priority`): 1 — категория разработки и ключевое слово в названии, 2 — что-то одно, 3 — только слова в тексте. Пока у провайдеров с дневным потолком осталось ≤50% квоты, группа 3 не оценивается, при ≤20% — и группа 2 (`RESERVE_SHARE` в `freelance/pipeline.py`). Отложенные заказы ждут в pending; квота сбрасывается в 03:00 МСК, а свежесть заказа — 6 ч, поэтому после сброса оценятся только недавние, остальные истекут. Пока доступен Gemini (у него нет нашего потолка), резерв не включается.
+- Резерв квоты: заказы оцениваются по группам (`freelance/filters.py: priority`): 1 — категория разработки и ключевое слово в названии, 2 — что-то одно, 3 — только слова в тексте. Пока у провайдеров с дневным потолком осталось ≤50% квоты, группа 3 не оценивается, при ≤20% — и группа 2 (`RESERVE_SHARE` в `freelance/pipeline.py`). Отложенные заказы ждут в pending; квота сбрасывается в 03:00 МСК, а свежесть заказа — 6 ч, поэтому после сброса оценятся только недавние, остальные истекут. Пока доступен Gemini (у него нет нашего потолка) или у Яндекса есть бюджет на сегодня, резерв не включается.
 - Статус AI (кнопка статуса фриланса) показывает все провайдеры: модели, паузы, счётчик за сутки.
 - Лимиты и список моделей бесплатных тарифов меняются: если модель пропала (404), она выключается до рестарта — обновите `*_MODELS`.
 
@@ -231,7 +236,8 @@ job-parser-bot/
 ├── freelance/               # Фриланс-модуль (alot.pro)
 │   ├── pipeline.py          # Цикл: скан, префильтр, дедуп, AI-оценка
 │   ├── alot_client.py       # API alot.pro
-│   ├── ai_scorer.py         # цепочка бесплатных AI: Gemini, GitHub Models, Cloudflare, OpenRouter, Groq, Cerebras, Mistral, YandexGPT
+│   ├── ai_scorer.py         # цепочка AI: Gemini, GitHub Models, Cloudflare, OpenRouter, Groq, Cerebras, Mistral, Yandex (платный)
+│   ├── yandex_budget.py     # бюджет гранта Yandex: дата отключения, лимит в сутки и всего
 │   └── filters.py           # Префильтры по категориям, словам
 │
 ├── requirements.txt         # Python-зависимости
