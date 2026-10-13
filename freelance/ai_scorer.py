@@ -407,7 +407,6 @@ def status() -> dict:
     with _lock:
         paused = {m: int(t - now) for m, t in _paused_until.items()
                   if t > now and m not in _disabled}
-        today = _today()
         providers = {}
         key_errors = {}
         paid_errors = {}
@@ -425,7 +424,7 @@ def status() -> dict:
                 "blocked_sec": max(0, int(p.blocked_until - now)),
                 "dead": p.dead,
                 "paid_reason": p.paid_reason,
-                "today": p.count if p.day == today else 0,
+                "today": p.count if p.day == _today(p) else 0,
                 "limit": p.max_per_day,
                 "key_error": p.key_error,
                 "last_error": p.last_error,
@@ -469,6 +468,9 @@ def failure_summary(now: datetime | None = None) -> str:
     # сброс дневных потолков - полночь UTC (03:00 МСК)
     midnight = (now.astimezone(timezone.utc) + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0)
+    # у Yandex сутки (и бюджет, и счётчик вызовов) - по МСК: сброс в 00:00 МСК
+    yandex_today = yandex_budget.today_msk(now)
+    yandex_midnight = datetime.combine(yandex_today + timedelta(days=1), datetime.min.time(), tzinfo=msk)
 
     def at_msk(dt: datetime) -> str:
         return dt.astimezone(msk).strftime("%H:%M")
@@ -505,9 +507,7 @@ def failure_summary(now: datetime | None = None) -> str:
                 parts.append(f"yandex: {yandex_note}")
                 if yandex_note == YANDEX_DAY_SPENT:
                     # сутки бюджета - по МСК: сброс в 00:00 МСК; весь бюджет/сбой учёта - не квота
-                    resumes.append(datetime.combine(
-                        yandex_budget.today_msk(now) + timedelta(days=1), datetime.min.time(),
-                        tzinfo=msk))
+                    resumes.append(yandex_midnight)
                     blocked_count += 1
                 continue
             live = [m for m in p.models if m not in p.disabled]
@@ -516,8 +516,8 @@ def failure_summary(now: datetime | None = None) -> str:
                 parts.append(f"{name}: {p.paid_reason or 'выключен'}")
             elif p.key_error:
                 parts.append(f"{name}: {p.key_error}")
-            elif p.day == today and p.count >= p.max_per_day:
-                resumes.append(midnight)
+            elif p.day == (yandex_today.isoformat() if name == "yandex" else today)                     and p.count >= p.max_per_day:
+                resumes.append(yandex_midnight if name == "yandex" else midnight)
                 blocked_count += 1
                 parts.append(f"{name}: лимит {p.max_per_day}/{p.max_per_day} за сутки")
             elif live and all(t > mono for t in ends):
@@ -926,8 +926,17 @@ def _ask_gemini_model(model: str, order):
     return parsed
 
 
-def _today() -> str:
+def _today(p=None) -> str:
+    """День дневного счётчика провайдера. Бесплатные лимиты сбрасываются по UTC (03:00 МСК),
+    а Yandex считаем по МСК - как его рублёвый бюджет, иначе «вызовов сегодня» и «₽ сегодня»
+    в статусе были бы за разные сутки."""
+    if p is not None and p.name == "yandex":
+        return yandex_budget.today_msk().isoformat()
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _reset_time(p) -> str:
+    return "00:00 МСК" if p.name == "yandex" else "03:00 МСК"
 
 
 def _parse_duration(value) -> float | None:
@@ -1034,7 +1043,7 @@ def _load_count(p: _Provider) -> None:
             if not (sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)):
                 return
             with _lock:
-                if day == _today() and p.day in ("", day):
+                if day == _today(p) and p.day in ("", day):
                     p.day, p.count = day, max(p.count, int(num))
         finally:
             p.count_loaded = True
@@ -1069,7 +1078,7 @@ def _reserve_slot(p: _Provider) -> float | None:
         now = time.monotonic()
         if p.dead or now < p.blocked_until:
             return None
-        today = _today()
+        today = _today(p)
         if p.day != today:
             p.day, p.count = today, 0
         if p.count >= p.max_per_day:
@@ -1077,7 +1086,7 @@ def _reserve_slot(p: _Provider) -> float | None:
             if p.cap_logged_day != today:
                 p.cap_logged_day = today
                 logging.warning(f"[AI] {p.name}: дневной потолок {p.max_per_day} запросов исчерпан, "
-                                f"пропускаем до 03:00 МСК")
+                                f"пропускаем до {_reset_time(p)}")
             return None
         start = max(now, p.next_at)
         if start - now > PROVIDER_MAX_WAIT_SEC:
@@ -1135,7 +1144,7 @@ def daily_capacity() -> tuple[int, int] | None:
             usable = now >= p.blocked_until and any(
                 m not in p.disabled and p.paused.get(m, 0.0) - now < CAPACITY_PAUSE_SEC
                 for m in p.models)
-            used = p.count if p.day == _today() else 0
+            used = p.count if p.day == _today(p) else 0
             total += p.max_per_day
             if usable:
                 left += max(0, p.max_per_day - used)
@@ -1355,6 +1364,16 @@ def _log_yandex_budget_stop(p: _Provider) -> None:
                         f"продолжит в 00:00 МСК")
 
 
+def _log_yandex_cost(model: str, usage, spent: float) -> None:
+    """Цена каждого вызова Yandex в логе: по ней видно среднюю цену оценки."""
+    tokens = "нет usage, списано по худшей цене"
+    if isinstance(usage, dict):
+        tokens = f"{usage.get('prompt_tokens') or 0}+{usage.get('completion_tokens') or 0} ток."
+    info = yandex_budget.summary()
+    day = "" if info["unknown"] else f" (сегодня {info['today']:.2f} из {info['allowance']:.2f} ₽)"
+    logging.info(f"[AI] yandex:{model}: {tokens}, {spent:.2f} ₽{day}")
+
+
 def _ask_provider_model(p: _Provider, model: str, order):
     """Один заказ - одна модель. dict - успех; "next" - следующая модель;
     "stop" - провайдер для этого заказа не годится (ключ, 402, потолок, очередь)."""
@@ -1400,13 +1419,15 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 _give_back_slot(p)   # запрос не дошёл - слот не тратим (при таймауте провайдер мог засчитать)
             if reserved is not None:
                 if _maybe_sent(e):
-                    yandex_budget.settle(model, reserved, None)   # мог тарифицироваться: по худшей цене
+                    spent = yandex_budget.settle(model, reserved, None)   # мог тарифицироваться: по худшей цене
+                    _log_yandex_cost(model, None, spent)
                 else:
                     yandex_budget.release(reserved)
             return "next"
         if reserved is not None:
             if resp.status_code == 200:
-                yandex_budget.settle(model, reserved, _usage_of(resp))
+                usage = _usage_of(resp)
+                _log_yandex_cost(model, usage, yandex_budget.settle(model, reserved, usage))
             else:
                 yandex_budget.release(reserved)   # ошибки (4xx/5xx) не тарифицируются
         if resp.status_code == 400 and use_json and attempt == 1:
@@ -1564,9 +1585,9 @@ def probe() -> list[dict]:
         r["model"] = f"{name}:{model}" if name != "gemini" else model
         if name != "gemini":
             with _lock:
-                capped = p.day == _today() and p.count >= p.max_per_day
+                capped = p.day == _today(p) and p.count >= p.max_per_day
             if capped:
-                r["error"] = f"дневной потолок {p.max_per_day} исчерпан (сброс в 03:00 МСК)"
+                r["error"] = f"дневной потолок {p.max_per_day} исчерпан (сброс в {_reset_time(p)})"
                 continue
             if name == "yandex":
                 note = _yandex_budget_note()

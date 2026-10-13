@@ -429,6 +429,17 @@ class YandexPaidTest(ProviderTestBase):
         self.assertAlmostEqual(yandex_budget._state["total"], 0.305)   # первая попытка не списана
         self.assertEqual(yandex_budget._pending, 0.0)
 
+    def test_call_cap_uses_msk_day(self):
+        # 01:30 МСК 11.10 (22:30 UTC 10.10; today_msk в классе - 11.10): счётчик Yandex уже за 11.10 по МСК
+        prov = self.use_yandex()
+        p = prov["yandex"]
+        p.day, p.count = "2026-10-11", p.max_per_day
+        night = datetime(2026, 10, 10, 22, 30, tzinfo=timezone.utc)
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]):
+            text = ai_scorer.failure_summary(night)
+        self.assertIn(f"yandex: лимит {p.max_per_day}/{p.max_per_day} за сутки", text)
+        self.assertIn("возобновится ~00:00 МСК", text)
+
     def test_total_budget_spent_not_a_quota_pause(self):
         self.use_yandex()
         yandex_budget._state.update(day="2026-10-10", day_spent=0.0, total=3299.5)
@@ -1037,6 +1048,21 @@ class CountPersistenceTest(unittest.TestCase):
         self.ask(p2)
         self.assertEqual(p2.count, 3)
         self.assertEqual(self.store["ai_count_groq"], f"{today}:3")
+
+    def test_yandex_day_is_msk(self):
+        # 22:30 UTC 12.10 = 01:30 МСК 13.10: Yandex уже в новых сутках (как его бюджет), остальные - нет
+        night = datetime(2026, 10, 12, 22, 30, tzinfo=timezone.utc)
+        yandex = SimpleNamespace(name="yandex")
+        groq = SimpleNamespace(name="groq")
+        with (mock.patch.object(yandex_budget, "datetime") as dt_yb,
+              mock.patch.object(ai_scorer, "datetime") as dt_ai):
+            dt_yb.now.side_effect = lambda tz=None: night.astimezone(tz)
+            dt_ai.now.side_effect = lambda tz=None: night.astimezone(tz)
+            self.assertEqual(ai_scorer._today(yandex), "2026-10-13")
+            self.assertEqual(ai_scorer._today(groq), "2026-10-12")
+            self.assertEqual(ai_scorer._today(), "2026-10-12")
+        self.assertEqual(ai_scorer._reset_time(yandex), "00:00 МСК")
+        self.assertEqual(ai_scorer._reset_time(groq), "03:00 МСК")
 
     def test_load_blocks_concurrent_reserve(self):
         import threading
