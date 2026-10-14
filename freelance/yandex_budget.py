@@ -220,6 +220,20 @@ def settle(model: str, reserved: float, usage, now: datetime | None = None) -> f
     return spent
 
 
+def today_left(now: datetime | None = None) -> tuple[float, float] | None:
+    """(осталось ₽ на сегодня, лимит дня ₽) для резерва квоты. None - учёт не прочитан."""
+    if expired(now):
+        return None
+    with _lock:
+        st = _load()
+        if st is None:
+            return None
+        _roll_day(st, now)
+        allowance = _allowance(st, now)
+        left = min(allowance - st["day_spent"], budget() - st["total"]) - _pending
+        return max(0.0, left), allowance
+
+
 def can_spend_today(model: str, max_tokens: int, now: datetime | None = None) -> bool:
     """Хватит ли сегодняшнего лимита ещё хотя бы на один худший запрос (без резерва)."""
     if model not in PRICES or expired(now):

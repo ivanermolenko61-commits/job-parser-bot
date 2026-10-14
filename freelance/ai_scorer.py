@@ -285,7 +285,7 @@ def _env_number(environ, name: str, default, cast):
         return default
     try:
         value = cast(raw)
-        if value < 0:
+        if value < 0 or not math.isfinite(value):
             raise ValueError
         return value
     except ValueError:
@@ -457,9 +457,15 @@ def status() -> dict:
     return result
 
 
-def failure_summary(now: datetime | None = None) -> str:
-    """Почему не ответил никто из цепочки: короткая строка на каждого активного провайдера
-    (для алерта «AI-оценка заказов»). now - aware datetime, по умолчанию текущее время."""
+def _at_msk(dt: datetime) -> str:
+    from zoneinfo import ZoneInfo
+    return dt.astimezone(ZoneInfo("Europe/Moscow")).strftime("%H:%M")
+
+
+def _failure_state(now: datetime | None = None) -> tuple[list[str], list[datetime], int, int, int]:
+    """Состояние каждого активного провайдера: (строки причин, когда вернётся каждый
+    остановленный квотой, сколько остановлено квотой, сколько недоступны насовсем
+    (регион, выключен, ключ отклонён), сколько активных)."""
     from zoneinfo import ZoneInfo
     msk = ZoneInfo("Europe/Moscow")
     now = now or datetime.now(timezone.utc)
@@ -472,9 +478,6 @@ def failure_summary(now: datetime | None = None) -> str:
     yandex_today = yandex_budget.today_msk(now)
     yandex_midnight = datetime.combine(yandex_today + timedelta(days=1), datetime.min.time(), tzinfo=msk)
 
-    def at_msk(dt: datetime) -> str:
-        return dt.astimezone(msk).strftime("%H:%M")
-
     def wall(t: float) -> datetime:
         # monotonic -> настенное время (через now, чтобы не зависеть от time.time())
         return datetime.fromtimestamp(now.timestamp() + (t - mono), timezone.utc)
@@ -482,6 +485,7 @@ def failure_summary(now: datetime | None = None) -> str:
     parts: list[str] = []
     resumes: list[datetime] = []       # когда вернётся каждый провайдер, остановленный квотой
     blocked_count = 0
+    gone_count = 0                     # не ответят до вмешательства человека - не квота и не сбой
     active = _chain_active()
     yandex_note = _yandex_budget_note() if "yandex" in active else ""
     with _lock:
@@ -489,16 +493,20 @@ def failure_summary(now: datetime | None = None) -> str:
             if name == "gemini":
                 live = [m for m in GEMINI_MODELS if m not in _disabled]
                 ends = [_paused_until.get(m, 0.0) for m in live]
-                if _region_error and mono < _config_blocked_until:
-                    # регион - не квота: ни в resumes, ни в blocked_count
-                    parts.append("gemini: регион сервера не поддерживается, "
-                                 f"повтор в {at_msk(wall(_config_blocked_until))} МСК")
+                if _region_error:
+                    # регион - не квота: ни в resumes, ни в blocked_count. Насовсем и после
+                    # 30-минутной паузы: снимается только успешным ответом
+                    gone_count += 1
+                    retry = (f", повтор в {_at_msk(wall(_config_blocked_until))} МСК"
+                             if mono < _config_blocked_until else "")
+                    parts.append(f"gemini: регион сервера не поддерживается{retry}")
                 elif _config_error:
+                    gone_count += 1
                     parts.append(f"gemini: {_config_error}")
                 elif live and all(t > mono for t in ends):
                     resumes.append(wall(min(ends)))
                     blocked_count += 1
-                    parts.append(f"gemini: на паузе до {at_msk(wall(max(ends)))} МСК")
+                    parts.append(f"gemini: на паузе до {_at_msk(wall(max(ends)))} МСК")
                 else:
                     parts.append(f"gemini: {_gemini_last_error or 'нет ответа'}")
                 continue
@@ -509,28 +517,55 @@ def failure_summary(now: datetime | None = None) -> str:
                     # сутки бюджета - по МСК: сброс в 00:00 МСК; весь бюджет/сбой учёта - не квота
                     resumes.append(yandex_midnight)
                     blocked_count += 1
+                elif yandex_note.startswith("весь бюджет"):
+                    gone_count += 1
                 continue
             live = [m for m in p.models if m not in p.disabled]
             ends = [p.paused.get(m, 0.0) for m in live]
             if p.dead:
+                gone_count += 1
                 parts.append(f"{name}: {p.paid_reason or 'выключен'}")
             elif p.key_error:
+                gone_count += 1
                 parts.append(f"{name}: {p.key_error}")
-            elif p.day == (yandex_today.isoformat() if name == "yandex" else today)                     and p.count >= p.max_per_day:
+            elif (p.day == (yandex_today.isoformat() if name == "yandex" else today)
+                  and p.count >= p.max_per_day):
                 resumes.append(yandex_midnight if name == "yandex" else midnight)
                 blocked_count += 1
                 parts.append(f"{name}: лимит {p.max_per_day}/{p.max_per_day} за сутки")
             elif live and all(t > mono for t in ends):
                 resumes.append(wall(min(ends)))
                 blocked_count += 1
-                parts.append(f"{name}: на паузе до {at_msk(wall(max(ends)))} МСК")
+                parts.append(f"{name}: на паузе до {_at_msk(wall(max(ends)))} МСК")
             else:
                 err = p.last_error or "нет ответа"
                 parts.append(err if err.startswith(f"{name}:") else f"{name}: {err}")
+    return parts, resumes, blocked_count, gone_count, len(active)
+
+
+def _quota_resume(resumes, blocked: int, gone: int, total: int) -> datetime | None:
+    """Ближайший возврат, если все, кто вообще может ответить, остановлены квотой/паузой."""
+    if total and blocked and blocked + gone == total and resumes:
+        return min(resumes)
+    return None
+
+
+def quota_exhausted(now: datetime | None = None) -> datetime | None:
+    """Когда вернётся первый провайдер, если квоты (или паузы после 429) сейчас у всех,
+    кто вообще может ответить (недоступные насовсем, как Gemini по региону, не в счёт);
+    иначе None. Тогда оценивать бессмысленно: это не сбой, а пустая квота."""
+    _parts, *state = _failure_state(now)
+    return _quota_resume(*state)
+
+
+def failure_summary(now: datetime | None = None) -> str:
+    """Почему не ответил никто из цепочки: короткая строка на каждого активного провайдера
+    (для алерта «AI-оценка заказов»). now - aware datetime, по умолчанию текущее время."""
+    parts, *state = _failure_state(now)
     text = " · ".join(parts)
-    if active and blocked_count == len(active) and resumes:
-        text = (f"кончились бесплатные квоты, оценка возобновится ~{at_msk(min(resumes))} МСК "
-                f"(ближайший срок): {text}")
+    back = _quota_resume(*state)
+    if back:
+        text = f"кончились бесплатные квоты, оценка возобновится ~{_at_msk(back)} МСК (ближайший срок): {text}"
     return text
 
 
@@ -1098,6 +1133,9 @@ def _reserve_slot(p: _Provider) -> float | None:
     return start - now
 
 
+# Средняя цена одной оценки Яндексом, ₽ (для резерва квоты: рубли дня -> заказы).
+# yandex_eval: 0,86 ₽; по тратам на сервере выходило ~2 ₽ - берём с запасом.
+YANDEX_ORDER_COST_RUB = max(0.1, _env_number(os.environ, "YANDEX_ORDER_COST_RUB", 2.0, float))
 CAPACITY_PAUSE_SEC = 3600   # провайдер на паузе дольше этого - его остаток квоты сейчас не в счёт
 
 
@@ -1115,8 +1153,9 @@ def daily_capacity() -> tuple[int, int] | None:
     """(осталось, всего) запросов на сегодня у провайдеров цепочки с дневным потолком
     (с ключом и не выключенных из-за оплаты). None - резерв не нужен: таких провайдеров
     нет или доступен Gemini (у него нет нашего потолка, лимиты он сообщает сам).
-    Yandex в сумму не входит: его ограничивает рублёвый бюджет; пока бюджет на сегодня есть,
-    резерв тоже не нужен (None). Провайдер, который сейчас не ответит
+    Yandex входит в сумму по рублям дня, переведённым в заказы (YANDEX_ORDER_COST_RUB):
+    без этого утром грант уходил на слабые заказы и к вечеру квоты не было ни у кого.
+    Провайдер, который сейчас не ответит
     (ключ отклонён, все модели выключены или на паузе дольше часа - например, дневной 429),
     входит в «всего», но его остаток не считается."""
     left = total = 0
@@ -1129,9 +1168,16 @@ def daily_capacity() -> tuple[int, int] | None:
     if "yandex" in active:
         p = PROVIDERS["yandex"]
         with _lock:
-            live = [m for m in p.models if m not in p.disabled] if not p.dead else []
-        if live and yandex_budget.can_spend_today(live[0], PROVIDER_MAX_TOKENS):
-            return None
+            now = time.monotonic()
+            live = [m for m in p.models if m not in p.disabled] if not p.dead and not p.key_error else []
+            usable = now >= p.blocked_until and any(p.paused.get(m, 0.0) - now < CAPACITY_PAUSE_SEC for m in live)
+        day = yandex_budget.today_left() if live else None
+        if day is not None and int(day[1] / YANDEX_ORDER_COST_RUB) > 0:
+            rub_left, allowance = day
+            total += int(allowance / YANDEX_ORDER_COST_RUB)
+            if usable and yandex_budget.can_spend_today(live[0], PROVIDER_MAX_TOKENS):
+                left += int(rub_left / YANDEX_ORDER_COST_RUB)
+            found = True
     for name in active:
         p = PROVIDERS.get(name)
         if p is None or name == "yandex":
@@ -1149,7 +1195,8 @@ def daily_capacity() -> tuple[int, int] | None:
             if usable:
                 left += max(0, p.max_per_day - used)
             found = True
-    return (left, total) if found else None
+    # total 0 (например, лимит Яндекса на день меньше цены заказа) - резерв считать не из чего
+    return (left, total) if found and total else None
 
 
 def _is_paid(pricing) -> bool:

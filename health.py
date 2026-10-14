@@ -90,6 +90,17 @@ class HealthMonitor:
         with self._lock:
             return dict(self.streak)
 
+    def notify(self, text: str) -> None:
+        """Разовое сообщение (готовый HTML) без счётчика сбоев и сообщения о восстановлении."""
+        with self._lock:
+            self._pending.append(text)
+
+    def reset_streak(self, source: str) -> None:
+        """Обнуляет серию плохих прогонов без сообщений (пауза, которая не считается сбоем).
+        Если о поломке уже сообщили, «восстановление» придёт с первым хорошим прогоном."""
+        with self._lock:
+            self.streak[source] = 0
+
     def pop_alerts(self) -> list[str]:
         """Забирает накопленные сообщения (и очищает очередь)."""
         with self._lock:

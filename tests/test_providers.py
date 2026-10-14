@@ -475,12 +475,29 @@ class YandexPaidTest(ProviderTestBase):
             self.assertFalse(ai_scorer.is_enabled())
             self.assertIn("срок гранта вышел", ai_scorer.probe()[0]["error"])
 
-    def test_budget_today_disables_quota_reserve(self):
+    def test_budget_today_counts_in_quota_reserve(self):
+        # рубли дня Яндекса входят в квоту как заказы (YANDEX_ORDER_COST_RUB), а не отключают резерв
         self.use_yandex()
-        with mock.patch.object(ai_scorer, "CHAIN", ["yandex", "groq"]):
-            self.assertIsNone(ai_scorer.daily_capacity())
+        with mock.patch.object(ai_scorer, "CHAIN", ["yandex"]), \
+                mock.patch.object(ai_scorer, "YANDEX_ORDER_COST_RUB", 2.0):
+            left, total = ai_scorer.daily_capacity()
+            self.assertEqual(left, total)
+            self.assertGreater(total, 0)
+            yandex_budget._state.update(day="2026-10-11", day_spent=10.0, total=10.0)
+            rub_left, _allowance = yandex_budget.today_left()
+            self.assertEqual(ai_scorer.daily_capacity(), (int(rub_left / 2.0), total))
+            self.assertLess(int(rub_left / 2.0), total)
+            # дневной 429: рубли есть, но Яндекс сейчас не ответит - остаток не в счёт
+            yandex_budget._state.update(day="2026-10-11", day_spent=0.0, total=0.0)
+            p = ai_scorer.PROVIDERS["yandex"]
+            p.paused = {m: ai_scorer.time.monotonic() + 3 * 3600 for m in p.models}
+            self.assertEqual(ai_scorer.daily_capacity(), (0, total))
+            p.paused = {}
             yandex_budget._state.update(day="2026-10-11", day_spent=500.0, total=500.0)
-            self.assertIsNotNone(ai_scorer.daily_capacity())
+            self.assertEqual(ai_scorer.daily_capacity(), (0, total))
+            # лимит дня меньше цены одного заказа - резерв считать не из чего
+            with mock.patch.object(ai_scorer, "YANDEX_ORDER_COST_RUB", 10_000.0):
+                self.assertIsNone(ai_scorer.daily_capacity())
 
     def test_status_has_budget(self):
         self.use_yandex()
@@ -858,6 +875,31 @@ class FailureSummaryTest(ProviderTestBase):
         self.assertIn("mistral: ключ mistral отклонён (HTTP 401)", text)
         self.assertIn("openrouter: нет ответа", text)
         self.assertIn(" · ", text)
+
+    def region_and_capped(self, blocked_for):
+        # как на BotHost 14.10: Gemini отрезан по региону, у остальных лимит за сутки
+        for p in self.prov.values():
+            p.day, p.count = "2026-10-11", p.max_per_day
+        with mock.patch.object(ai_scorer, "CHAIN", ["gemini", "groq", "cerebras", "mistral", "openrouter"]),                 mock.patch.object(ai_scorer, "GEMINI_KEY", "k"),                 mock.patch.object(ai_scorer, "GEMINI_MODELS", ["g1"]),                 mock.patch.object(ai_scorer, "_region_error", "регион"),                 mock.patch.object(ai_scorer, "_config_blocked_until", ai_scorer.time.monotonic() + blocked_for):
+            return ai_scorer.failure_summary(self.NOW), ai_scorer.quota_exhausted(self.NOW)
+
+    def test_gemini_region_does_not_hide_quota_out(self):
+        text, back = self.region_and_capped(1800)
+        self.assertTrue(text.startswith("кончились бесплатные квоты, оценка возобновится ~03:00 МСК"))
+        self.assertIn("gemini: регион сервера не поддерживается, повтор в", text)
+        self.assertEqual(back, datetime(2026, 10, 12, 0, 0, tzinfo=timezone.utc))
+
+    def test_gemini_region_after_cooldown_still_not_failure(self):
+        # 30-минутная пауза Gemini прошла, но регион снимается только успешным ответом
+        text, back = self.region_and_capped(-60)
+        self.assertIn("gemini: регион сервера не поддерживается ·", text)
+        self.assertEqual(back, datetime(2026, 10, 12, 0, 0, tzinfo=timezone.utc))
+
+    def test_quota_not_exhausted_while_someone_errs(self):
+        for name in ("groq", "cerebras", "mistral"):
+            self.prov[name].day, self.prov[name].count = "2026-10-11", self.prov[name].max_per_day
+        self.prov["openrouter"].last_error = "openrouter: HTTP 500"
+        self.assertIsNone(ai_scorer.quota_exhausted(self.NOW))
 
     def test_alert_has_no_runtime_error_prefix(self):
         monitor = HealthMonitor()

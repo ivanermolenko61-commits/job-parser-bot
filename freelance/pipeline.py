@@ -79,6 +79,8 @@ FIRST_RUN_LOOKBACK = 50
 RESERVE_SHARE = {2: 0.2, 3: 0.5}
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
+QUOTA_OUT_DAY_KEY = "ai_quota_out_day"   # день МСК, за который уже сообщили «квота кончилась»
+QUOTA_OUT_MIN_SEC = 3600                  # о паузе короче часа не сообщаем
 # Повторы записи отправленного заказа в БД
 SAVE_RETRIES = 3
 SAVE_RETRY_PAUSE_SEC = 0.5
@@ -144,6 +146,7 @@ class CycleResult:
     models_used: dict = field(default_factory=dict)  # модель -> сколько оценок
     pending_loaded: int = 0
     reserved: int = 0        # отложено ради резерва квоты
+    quota_out: datetime | None = None   # квоты нет ни у кого: когда вернётся первый провайдер
 
 
 def prepare_cycle() -> CycleResult:
@@ -355,11 +358,16 @@ def _prepare_cycle() -> CycleResult:
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
     to_score.sort(key=lambda sc: (priority(sc.order), -sc.order.order_id))
+    # Квоты нет ни у кого: не дёргаем провайдеров (каждая попытка была бы «сбоем» и
+    # через 3 цикла - ложным «AI не работает»), заказы ждут в pending
+    res.quota_out = ai_scorer.quota_exhausted() if to_score else None
 
     def _score(item):
         idx, sc = item
         if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
             return _SKIPPED
+        if res.quota_out:
+            return _RESERVED
         if _quota_reserved(priority(sc.order)):
             return _RESERVED
         try:
@@ -408,11 +416,12 @@ def _prepare_cycle() -> CycleResult:
 
     _report_ai_health(res)
 
+    quota_note = f", квота пуста до {res.quota_out.astimezone(MSK):%H:%M}" if res.quota_out else ""
     logging.info(
         f"[FREELANCE] скан: {scan.raw_count}, pending: {res.pending_loaded}, "
         f"кандидатов: {len(candidates)}, к отправке: {len(res.to_send)}, "
         f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)} "
-        f"(из них в резерве квоты: {res.reserved}), "
+        f"(из них в резерве квоты: {res.reserved}{quota_note}), "
         f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}"
     )
     return res
@@ -475,6 +484,11 @@ def _report_ai_health(res: CycleResult) -> None:
                            label=f"AI-провайдер {name}", immediate=True,
                            bad_text="платный вызов, провайдер выключен до рестарта", reason=reason)
     _report_yandex_grant(st)
+    if res.quota_out:
+        # пустая квота - не сбой: серия «AI не работает» начинается заново
+        kv_set(AI_FAIL_STREAK_KEY, 0)
+        monitor.reset_streak("gemini")
+        _report_quota_out(res)
     if res.ai_attempted == 0:
         return
     if res.ai_ok == 0:
@@ -486,6 +500,28 @@ def _report_ai_health(res: CycleResult) -> None:
     else:
         kv_set(AI_FAIL_STREAK_KEY, 0)
         monitor.record("gemini", res.ai_ok, label=label)
+
+
+def _report_quota_out(res: CycleResult) -> None:
+    """Квоты AI кончились у всех: одно спокойное сообщение за сутки (МСК) вместо
+    «AI не работает». Отметка в kv, чтобы рестарт не повторял его. Короткая пауза
+    (минутный лимит, до возврата меньше QUOTA_OUT_MIN_SEC) - молча ждём."""
+    now = datetime.now(MSK)
+    if (res.quota_out - now).total_seconds() < QUOTA_OUT_MIN_SEC:
+        return
+    day = now.date().isoformat()
+    try:
+        if kv_get(QUOTA_OUT_DAY_KEY) == day:
+            return
+        kv_set(QUOTA_OUT_DAY_KEY, day)
+    except Exception as e:
+        logging.warning(f"[FREELANCE] сообщение о квоте отложено: БД недоступна ({type(e).__name__})")
+        return
+    monitor.notify(
+        f"⏸ <b>AI-квота на сегодня кончилась</b> ({now:%H:%M} МСК)\n"
+        f"Оценка продолжится ~{res.quota_out.astimezone(MSK):%H:%M} МСК. Заказы ждут оценки "
+        f"{FREELANCE_MAX_AGE_HOURS} ч, сейчас в очереди: {len(res.unscored)}."
+    )
 
 
 def _report_yandex_grant(st: dict) -> None:

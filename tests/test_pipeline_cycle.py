@@ -5,11 +5,14 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import database
 from freelance import alot_client, pipeline
+from health import HealthMonitor
+
+REAL_REPORT = pipeline._report_ai_health   # до подмены в CycleTestBase
 
 
 def make_order(oid, title="Создать телеграм бота"):
@@ -35,7 +38,8 @@ class CycleTestBase(unittest.TestCase):
         for p in (mock.patch.object(pipeline.monitor, "record"),
                   mock.patch.object(pipeline, "_report_ai_health"),
                   mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True),
-                  mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=None)):
+                  mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=None),
+                  mock.patch.object(pipeline.ai_scorer, "quota_exhausted", return_value=None)):
             p.start()
             self.addCleanup(p.stop)
 
@@ -169,6 +173,49 @@ class QuotaReserveTest(CycleTestBase):
     def test_no_capped_providers_no_reserve(self):
         res, calls = self.run_cycle(None)
         self.assertEqual(sorted(calls), [201, 202, 203])
+
+
+class QuotaOutTest(QuotaReserveTest):
+    """Квоты нет ни у кого: провайдеров не дёргаем, сбоем не считаем, сообщаем раз в сутки."""
+
+    def run_out(self, back_in_sec):
+        back = datetime.now(timezone.utc) + timedelta(seconds=back_in_sec)
+        with mock.patch.object(pipeline.ai_scorer, "quota_exhausted", return_value=back):
+            return self.run_cycle((0, 100))
+
+    def test_no_attempts_when_quota_out(self):
+        res, calls = self.run_out(5 * 3600)
+        self.assertEqual(calls, [])
+        self.assertEqual(res.ai_attempted, 0)
+        self.assertEqual(res.reserved, 3)
+        self.assertEqual(len(res.unscored), 3)
+
+    def test_notice_once_per_day(self):
+        res, _ = self.run_out(5 * 3600)
+        with mock.patch.object(pipeline.monitor, "notify") as notify:
+            pipeline._report_quota_out(res)
+            pipeline._report_quota_out(res)
+        self.assertEqual(notify.call_count, 1)
+        self.assertIn("AI-квота на сегодня кончилась", notify.call_args.args[0])
+        self.assertIn("в очереди: 3", notify.call_args.args[0])
+
+    def test_quota_out_resets_fail_streak(self):
+        res, _ = self.run_out(5 * 3600)
+        monitor = HealthMonitor()
+        monitor.streak["gemini"] = 2
+        database.kv_set(pipeline.AI_FAIL_STREAK_KEY, 2)
+        st = {"key_errors": {}, "paid_errors": {}, "providers": {}}
+        with mock.patch.object(pipeline, "monitor", monitor),                 mock.patch.object(pipeline.ai_scorer, "status", return_value=st):
+            REAL_REPORT(res)   # в CycleTestBase _report_ai_health подменён заглушкой
+        self.assertEqual(database.kv_get(pipeline.AI_FAIL_STREAK_KEY), "0")
+        self.assertEqual(monitor.streak["gemini"], 0)
+        self.assertEqual(len(monitor.pop_alerts()), 1)   # только «квота кончилась»
+
+    def test_short_pause_is_silent(self):
+        res, _ = self.run_out(120)
+        with mock.patch.object(pipeline.monitor, "notify") as notify:
+            pipeline._report_quota_out(res)
+        notify.assert_not_called()
 
 
 class YandexGrantAlertTest(CycleTestBase):
