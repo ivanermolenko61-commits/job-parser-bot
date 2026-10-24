@@ -747,7 +747,10 @@ def score_order(order) -> dict | None:
 # телефоны, email и похожие на ключи длинные токены заменяем метками. Ссылки и @ники
 # оставляем: «бот @name» или «сайт example.com» - часть задачи.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
-_PHONE_RE = re.compile(r"(?<![\w.])(?:\+\s*\d|8|7)(?:[\s\-().]*\d){9,10}(?![\w]|[.,]?\d)")
+# российские 8/7 + 10 цифр и любые номера с «+» (международные: 9-15 цифр)
+_PHONE_RE = re.compile(
+    r"(?<![\w.])(?:\+\s*\d(?:[\s\-().]*\d){8,14}|[87](?:[\s\-().]*\d){9,10})(?![\w]|[.,]?\d)"
+)
 _TOKEN_RE = re.compile(
     r"(?<![\w-])(?:sk-|ghp_|AKIA|xox[bap]-)[A-Za-z0-9_-]{16,}|(?<![\w-])[A-Za-z0-9_-]{32,}(?![\w-])"
 )
@@ -764,7 +767,8 @@ def _user_prompt(order) -> str:
     return (
         f"Название: {mask_contacts(order.title)}\n"
         f"Цена: {mask_contacts(order.price_text) or 'не указана'}\n"
-        f"Описание:\n{mask_contacts((order.body or '')[:BODY_LIMIT])}"
+        # сначала маскируем весь текст, потом режем: контакт на границе обрезки не просочится
+        f"Описание:\n{mask_contacts(order.body or '')[:BODY_LIMIT]}"
     )
 
 

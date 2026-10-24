@@ -427,7 +427,7 @@ def _prepare_cycle() -> CycleResult:
     # Что именно отсеял AI: чтобы по логу было видно, не режется ли нужное
     for sc in res.rejected:
         logging.info(f"[FREELANCE] отсеян AI: fit {sc.fit}/10, {sc.order.site}, "
-                     f"{ai_scorer.mask_contacts((sc.order.title or '')[:80])!r}")
+                     f"{ai_scorer.mask_contacts(sc.order.title or '')[:80]!r}")
     return res
 
 

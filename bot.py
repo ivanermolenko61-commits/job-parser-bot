@@ -451,6 +451,9 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
         if flood:
             retry.append(sc)
             continue
+        if _order_is_stale(sc):   # состарился, пока уходили предыдущие заказы пачки
+            retry.append(sc)
+            continue
         try:
             message_id = await _send_order(sc)
         except TelegramRetryAfter as e:
@@ -471,6 +474,10 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
             logging.error(f"[FREELANCE] отправленный заказ не записан в БД: {sc.order.url}")
         await asyncio.sleep(0.5)
 
+    late = [sc for sc in extra if _order_is_stale(sc)]
+    if late:
+        retry.extend(late)
+        extra = [sc for sc in extra if sc not in late]
     if extra:
         extra_sorted = sorted(extra, key=_sort_key_for_cap, reverse=True)
         header = f"➕ Ещё {len(extra)} подходящих заказов (не показаны из-за лимита):"

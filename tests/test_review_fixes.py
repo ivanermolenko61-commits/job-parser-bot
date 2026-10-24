@@ -207,6 +207,15 @@ class FreshnessBeforeSendTest(unittest.TestCase):
         sent_ids = [c.args[0].order.order_id for c in send.await_args_list]
         self.assertEqual(sent_ids, [1])
         self.assertEqual([sc.order.order_id for sc in progress["retry"]], [2])
+    def test_order_that_goes_stale_during_batch_is_not_sent(self):
+        a, b = self.sc(1, 1), self.sc(2, 1)
+        send = mock.AsyncMock(return_value=10)
+        progress = {}
+        # две проверки в начале (оба свежие), затем в цикле: первый свежий, второй состарился
+        with mock.patch.object(bot, "_order_is_stale", side_effect=[False, False, False, True]),              mock.patch.object(bot, "_send_order", send),              mock.patch.object(bot, "save_sent", return_value=True),              mock.patch("asyncio.sleep", mock.AsyncMock()):
+            asyncio.run(bot._deliver_freelance(pipeline.CycleResult(to_send=[a, b]), progress))
+        self.assertEqual([c.args[0].order.order_id for c in send.await_args_list], [1])
+        self.assertEqual([sc.order.order_id for sc in progress["retry"]], [2])
 
 
 class YandexUsageTest(unittest.TestCase):
@@ -252,6 +261,20 @@ class MaskContactsTest(unittest.TestCase):
         prompt = _user_prompt(order)
         self.assertNotIn("89031234567", prompt)
         self.assertNotIn("a@b.ru", prompt)
+
+    def test_international_phones(self):
+        for phone in ("+375 29 123-45-67", "+44 20 7946 0958", "+1 (415) 555-2671", "+7 903 123 45 67"):
+            self.assertEqual(mask_contacts(f"тел {phone} звонить"), "тел [телефон] звонить", phone)
+
+    def test_contact_on_truncation_boundary_is_masked(self):
+        from freelance import ai_scorer
+        body = "x " * 1490 + "пишите ivan@private-company.ru"   # email пересекает BODY_LIMIT
+        self.assertGreater(len(body), ai_scorer.BODY_LIMIT)
+        order = alot_client.FreelanceOrder(1, "kwork", "Бот", body, "1000 ₽", 1000.0, [],
+                                           datetime.now(timezone.utc), "https://x/1")
+        prompt = _user_prompt(order)
+        self.assertNotIn("ivan@", prompt)
+        self.assertNotIn("private", prompt)
 
     def test_alot_parse_error_does_not_log_content(self):
         item = {"title": "тел 89031234567 a@b.ru"}      # нет обязательных полей
