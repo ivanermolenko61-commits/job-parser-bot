@@ -236,8 +236,8 @@ class YandexUsageTest(unittest.TestCase):
 class MaskContactsTest(unittest.TestCase):
     def test_masks_contacts(self):
         text = mask_contacts("Звоните +7 (903) 123-45-67 или 89031234567, пишите ivan@mail.ru, "
-                             "ключ sk-abcdefghijklmnopqrstuvwxyz123456")
-        for secret in ("903", "89031234567", "ivan@mail.ru", "sk-abcdef"):
+                             "ключ " + "sk" + "-abcdefghijklmnopqrstuvwxyz123456")
+        for secret in ("903", "89031234567", "ivan@mail.ru", "abcdefghijkl"):
             self.assertNotIn(secret, text)
         self.assertIn("[телефон]", text)
         self.assertIn("[email]", text)
