@@ -69,19 +69,23 @@ def normalize_date(text: str) -> str:
             return f"{m.group(1)}T{m.group(2)}"
         return text
 
-    m = re.match(r"^(\d{1,2})\s+([а-яё]+)", text.lower().strip())
+    m = re.match(r"^(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?", text.lower().strip())
     if m:
         day = int(m.group(1))
         month_name = m.group(2)
         month = MONTHS_RU.get(month_name)
         if month:
             now = datetime.now()
-            year = now.year
-            # Если месяц в будущем относительно текущего — значит это
-            # прошлый год. Но если месяц тот же, а день ещё не наступил
-            # в этом году — тоже прошлый год.
-            if month > now.month or (month == now.month and day > now.day):
-                year -= 1
+            if m.group(3):
+                # год указан явно ("23 октября 2025"): берём его как есть
+                year = int(m.group(3))
+            else:
+                year = now.year
+                # Если месяц в будущем относительно текущего — значит это
+                # прошлый год. Но если месяц тот же, а день ещё не наступил
+                # в этом году — тоже прошлый год.
+                if month > now.month or (month == now.month and day > now.day):
+                    year -= 1
             return f"{year}-{month:02d}-{day:02d}T00:00:00"
 
     return text
@@ -299,11 +303,10 @@ def cleanup_old(days: int = 5) -> int:
         cursor = conn.execute(
             """
             DELETE FROM vacancies
-            WHERE datetime(
-                REPLACE(
-                    COALESCE(NULLIF(published_at, ''), found_at),
-                    'T', ' '
-                )
+            WHERE COALESCE(
+                -- дата публикации; если её нет или она не разбирается ("вчера") - found_at
+                datetime(REPLACE(NULLIF(published_at, ''), 'T', ' ')),
+                datetime(found_at)
             ) < datetime('now', ?)
             """,
             (f'-{days} days',),
@@ -704,8 +707,9 @@ def freelance_stats() -> dict:
 
 def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
     """Итог фриланс-сводки за последние hours часов: сколько заказов прошло префильтр
-    и чем кончилось. «Отсеяно AI» - rejected с fit ниже порога (rejected с высоким fit -
-    заказы из сводки по лимиту и дубли оценённых). near_miss - лучшие из отсеянных AI."""
+    и чем кончилось. «Отправлено» считается по sent_at (как в /status), остальное по seen_at.
+    «Отсеяно AI» - rejected с fit ниже порога (rejected с высоким fit - заказы из сводки
+    по лимиту и дубли оценённых). near_miss - лучшие из отсеянных AI."""
     since = f"-{int(hours)} hours"
     with _connect() as conn:
         rows = conn.execute(
@@ -716,13 +720,17 @@ def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
         counts = {"total": len(rows), "sent": 0, "rejected_ai": 0, "rejected_other": 0, "pending": 0}
         for status, fit, was_sent in rows:
             if was_sent:
-                counts["sent"] += 1
-            elif status == "pending":
+                continue  # отправленные считаем отдельно, по времени отправки
+            if status == "pending":
                 counts["pending"] += 1
             elif status == "rejected" and fit is not None and fit < FREELANCE_MIN_FIT:
                 counts["rejected_ai"] += 1
             else:  # дубли, сводка по лимиту, просроченные без оценки
                 counts["rejected_other"] += 1
+        counts["sent"] = conn.execute(
+            "SELECT COUNT(*) FROM freelance_orders WHERE sent_at >= datetime('now', ?)",
+            (since,),
+        ).fetchone()[0]
         best = conn.execute(
             "SELECT title, url, fit FROM freelance_orders "
             "WHERE seen_at >= datetime('now', ?) AND status = 'rejected' "

@@ -135,7 +135,9 @@ def _parse_item(item: dict) -> FreelanceOrder | None:
             is_suspicious=bool(item.get("reports")),
         )
     except (KeyError, TypeError, ValueError, OSError, OverflowError):
-        logging.warning(f"[ALOT] не удалось разобрать заказ: {str(item)[:120]}")
+        # содержимое заказа в лог не пишем: там могут быть контакты заказчика
+        ident = item.get("internalId") if isinstance(item, dict) else None
+        logging.warning(f"[ALOT] не удалось разобрать заказ (id: {ident})")
         return None
 
 

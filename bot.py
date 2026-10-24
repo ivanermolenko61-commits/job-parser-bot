@@ -4,7 +4,7 @@ import html
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from config import (
     CHECK_INTERVAL_MINUTES,
     FREELANCE_INTERVAL_MINUTES,
+    FREELANCE_MAX_AGE_HOURS,
     FREELANCE_MAX_PER_CYCLE,
     FREELANCE_MESSAGE_TTL_HOURS,
     FREELANCE_MIN_FIT,
@@ -81,6 +82,28 @@ MY_CHAT_ID = int(os.getenv("MY_CHAT_ID", "0"))
 scheduler = AsyncIOScheduler()
 
 subscribed = True
+VACANCIES_SUBSCRIBED_KEY = "vacancies_subscribed"
+
+
+def _set_subscribed(value: bool) -> None:
+    """Включает/ставит на паузу проверку вакансий и запоминает выбор в БД,
+    чтобы /stop переживал рестарт контейнера."""
+    global subscribed
+    subscribed = value
+    try:
+        kv_set(VACANCIES_SUBSCRIBED_KEY, "1" if value else "0")
+    except Exception:
+        logging.exception("[BOT] не удалось сохранить состояние подписки на вакансии")
+
+
+def _load_subscribed() -> None:
+    """Читает сохранённое состояние подписки на вакансии (по умолчанию включена)."""
+    global subscribed
+    try:
+        subscribed = kv_get(VACANCIES_SUBSCRIBED_KEY, "1") != "0"
+    except Exception:
+        logging.exception("[BOT] не удалось прочитать состояние подписки, считаю включённой")
+        subscribed = True
 
 # По умолчанию показываем до 300 вакансий (практически всё, что есть в БД)
 DEFAULT_LIST_LIMIT = 300
@@ -245,7 +268,12 @@ async def check_vacancies() -> bool:
         # а не режем исходный по счётчику. Иначе при сбое на середине списка
         # упавшая вакансия помечается отправленной (и теряется), а успешные
         # после неё — не помечаются (и придут повторно).
+        # Каждую вакансию записываем в историю сразу после отправки: перезапуск
+        # или сбой записи посреди пачки не повторит уже доставленные.
+        # Остаточный риск: процесс убит ровно между send_message и записью в БД
+        # (или запись не удалась дважды) - такая вакансия придёт повторно.
         sent_ok: list = []
+        mark_failed: list = []
         for v in new_vacancies:
             try:
                 await bot.send_message(
@@ -253,13 +281,20 @@ async def check_vacancies() -> bool:
                     text=v.format_message(),
                     parse_mode="HTML",
                 )
-                sent_ok.append(v)
-                await asyncio.sleep(0.5)
             except Exception:
                 logging.exception(f"[BOT] Не удалось отправить {v.url}")
+                continue
+            sent_ok.append(v)
+            if not await _mark_sent_with_retry(v):
+                mark_failed.append(v)
+            await asyncio.sleep(0.5)
 
+        if mark_failed:
+            logging.error(
+                f"[BOT] Отправлено, но не записано в историю: {len(mark_failed)} "
+                f"(могут прийти повторно)"
+            )
         if sent_ok:
-            mark_vacancies_sent(sent_ok)
             logging.info(f"[BOT] Успешно отправлено: {len(sent_ok)}")
         if len(sent_ok) < len(new_vacancies):
             logging.warning(
@@ -268,6 +303,20 @@ async def check_vacancies() -> bool:
             )
 
         return True
+
+
+async def _mark_sent_with_retry(vacancy) -> bool:
+    """Записывает одну отправленную вакансию в историю; две попытки. True - записано."""
+    for attempt in (1, 2):
+        try:
+            await asyncio.to_thread(mark_vacancies_sent, [vacancy])
+            return True
+        except Exception:
+            logging.exception(
+                f"[BOT] запись отправленной вакансии {vacancy.url} не удалась (попытка {attempt}/2)"
+            )
+            await asyncio.sleep(0.5)
+    return False
 
 
 # ---------- Фриланс (alot.pro) ----------
@@ -366,6 +415,13 @@ async def _set_order_status(order_id: int, status: str) -> None:
     await asyncio.to_thread(freelance_set_status, order_id, status)
 
 
+def _order_is_stale(sc) -> bool:
+    """Заказ старше FREELANCE_MAX_AGE_HOURS: пока его оценивали и ждали отправки,
+    он мог состариться. Такой в чат не уходит."""
+    limit = timedelta(hours=FREELANCE_MAX_AGE_HOURS)
+    return datetime.now(timezone.utc) - sc.order.published_at > limit
+
+
 async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     """Отправляет заказы цикла и сразу сохраняет каждый успешно отправленный.
 
@@ -373,14 +429,22 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     запасному формату (обычный текст), а если и он не прошёл, как и сетевой сбой
     или лимиты Telegram, - к retry (статус pending, повтор в следующем цикле).
     """
-    ranked = sorted(res.to_send, key=_sort_key_for_cap, reverse=True)
+    # progress заполняется по ходу: при неожиданном сбое вызывающий знает, что уже ушло
+    progress = progress if progress is not None else {}
+    retry = progress.setdefault("retry", [])
+    # Состарившиеся за время оценки не отправляем: уходят в pending, а следующий цикл
+    # (_load_pending) пометит их expired
+    stale = [sc for sc in res.to_send if _order_is_stale(sc)]
+    if stale:
+        logging.info(f"[FREELANCE] состарились до отправки: {len(stale)}, в чат не уходят")
+        retry.extend(stale)
+    stale_ids = {sc.order.order_id for sc in stale}
+    ranked = sorted((sc for sc in res.to_send if sc.order.order_id not in stale_ids),
+                    key=_sort_key_for_cap, reverse=True)
     chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=lambda sc: sc.order.order_id)
     extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
-    # progress заполняется по ходу: при неожиданном сбое вызывающий знает, что уже ушло
-    progress = progress if progress is not None else {}
     sent_ok = progress.setdefault("sent", [])
-    retry = progress.setdefault("retry", [])
     skipped = progress.setdefault("skipped", [])
     flood = False
     for sc in chosen:
@@ -877,11 +941,32 @@ async def cleanup_freelance_messages():
         logging.exception("[FREELANCE] cleanup_freelance_messages")
 
 
+SUMMARY_HOUR_MSK = 21
+SUMMARY_DAY_KEY = "freelance_summary_day"   # дата (МСК) последней отправленной сводки
+_summary_lock = asyncio.Lock()
+
+
 async def send_freelance_daily_summary():
-    """Раз в сутки (21:00 МСК) короткая сводка: тишина в чате отличима от поломки бота."""
+    """Раз в сутки (21:00 МСК) короткая сводка: тишина в чате отличима от поломки бота.
+    Одна сводка в календарный день (МСК): дату отправки помним в БД, поэтому повторный
+    вызов (cron + догоняющая отправка после рестарта) второй раз не пишет."""
+    async with _summary_lock:
+        await _send_freelance_daily_summary_locked()
+
+
+async def catch_up_freelance_summary():
+    """После рестарта: если 21:00 МСК уже прошло, а сводка за сегодня не уходила - отправить."""
+    if datetime.now(MSK).hour >= SUMMARY_HOUR_MSK:
+        await send_freelance_daily_summary()
+
+
+async def _send_freelance_daily_summary_locked():
     try:
         if not await _freelance_subscribed():
             return  # фриланс на паузе: сводка не нужна
+        today = datetime.now(MSK).date().isoformat()
+        if await asyncio.to_thread(kv_get, SUMMARY_DAY_KEY) == today:
+            return  # за сегодня уже отправляли
         d = await asyncio.to_thread(freelance_day_summary)
         text = (
             "📋 <b>Фриланс за сутки</b>\n"
@@ -900,6 +985,7 @@ async def send_freelance_daily_summary():
             text += "\n\nБлижайшие из отсеянных:\n" + "\n".join(lines)
         await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
                                disable_web_page_preview=True)
+        await asyncio.to_thread(kv_set, SUMMARY_DAY_KEY, today)
     except Exception:
         logging.exception("[FREELANCE] send_freelance_daily_summary")
 
@@ -977,8 +1063,7 @@ async def _send_list(message: Message, limit: int):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    global subscribed
-    subscribed = True
+    await asyncio.to_thread(_set_subscribed, True)
 
     await message.answer(
         f"👋 Привет!\n\n"
@@ -1005,8 +1090,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message):
-    global subscribed
-    subscribed = False
+    await asyncio.to_thread(_set_subscribed, False)
     await message.answer(
         "⏸ Уведомления приостановлены.\n\nНажмите «▶️ Возобновить» или /start.",
         reply_markup=main_reply_kb(),
@@ -1166,6 +1250,7 @@ async def btn_resume(message: Message):
 
 async def main():
     init_db()
+    _load_subscribed()
 
     deleted = cleanup_old(days=CLEANUP_DAYS)
     logging.info(
@@ -1199,13 +1284,14 @@ async def main():
     scheduler.add_job(
         send_freelance_daily_summary,
         "cron",
-        hour=21,
+        hour=SUMMARY_HOUR_MSK,
         minute=0,
         timezone=MSK,
-        misfire_grace_time=1800,  # перезапуск около 21:00 не должен терять сводку
+        misfire_grace_time=1800,  # задержка планировщика; после рестарта - catch_up_freelance_summary
         coalesce=True,
     )
     scheduler.start()
+    asyncio.create_task(catch_up_freelance_summary())
     logging.info(f"Планировщик запущен: проверка каждые {CHECK_INTERVAL_MINUTES} мин")
     logging.info(f"Бот запущен. Разрешён только user_id={MY_CHAT_ID}")
 

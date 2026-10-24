@@ -12,6 +12,7 @@
 траты считались бы с нуля и первая же запись затёрла бы настоящий итог.
 """
 import json
+import math
 import logging
 import os
 import threading
@@ -108,9 +109,14 @@ def usage_cost(model: str, usage) -> float | None:
         cached = float(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0.0
     except (TypeError, ValueError):
         return None
+    # отрицательные, бесконечные и NaN-значения не должны уменьшать или ломать учёт гранта:
+    # такой usage считаем нечитаемым, и settle спишет резерв (худшую цену)
+    if not all(math.isfinite(v) and v >= 0 for v in (prompt, completion, cached)):
+        return None
     if prompt <= 0 and completion <= 0:
         return None
-    return cost(model, prompt, completion, cached)
+    result = cost(model, prompt, completion, cached)
+    return result if math.isfinite(result) and result >= 0 else None
 
 
 def _load() -> dict | None:

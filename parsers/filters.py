@@ -60,9 +60,12 @@ SENIORITY_WORDS = [
 
 # --- Маркеры джуна: «Junior/Middle», «Стажёр» — наши ---
 JUNIOR_WORDS = [
-    "junior", "джун", "стажер", "стажёр", "стажировк", "intern", "trainee",
+    "junior", "джун", "стажер", "стажёр", "стажировк", "trainee",
     "младший", "начинающ", "ученик", "без опыта", "entry",
 ]
+
+# Английские маркеры, которые нельзя искать как начало слова: "intern" совпало бы с "Internal"
+JUNIOR_WHOLE_WORDS = ["intern", "interns", "internship"]
 
 # --- IT-слова: хотя бы одно должно быть в названии ---
 INCLUDE_IT_WORDS = [
@@ -86,12 +89,13 @@ LEVEL_PATTERN = re.compile(
 _WORD_CHAR = r"a-zа-яё0-9"
 
 
-def _compile(words):
-    """Одна регулярка на весь список — быстрее, чем проверять слова по одному."""
+def _compile(words, whole_words=()):
+    """Одна регулярка на весь список — быстрее, чем проверять слова по одному.
+    whole_words - слова, которые ищутся только целиком (без продолжения)."""
     parts = []
     for w in words:
         esc = re.escape(w)
-        if len(w) <= 3:
+        if len(w) <= 3 or w in whole_words:
             parts.append(rf"(?<![{_WORD_CHAR}]){esc}(?![{_WORD_CHAR}])")
         else:
             parts.append(rf"(?<![{_WORD_CHAR}]){esc}")
@@ -100,7 +104,7 @@ def _compile(words):
 
 _EXCLUDE_RE = _compile(EXCLUDE_WORDS)
 _SENIOR_RE = _compile(SENIORITY_WORDS)
-_JUNIOR_RE = _compile(JUNIOR_WORDS)
+_JUNIOR_RE = _compile(JUNIOR_WORDS + JUNIOR_WHOLE_WORDS, JUNIOR_WHOLE_WORDS)
 _IT_RE = _compile(INCLUDE_IT_WORDS)
 
 
@@ -158,6 +162,10 @@ def _norm(text: str) -> str:
     return " ".join(_NON_WORD_RE.sub(" ", t).split())
 
 
+# Заглушки, которыми парсеры заменяют отсутствующую компанию: это не работодатель
+UNKNOWN_COMPANIES = {"не указана", "не указано", "не указан", "-", "—"}
+
+
 def dedup_key(title: str, company: str) -> str:
     """Ключ «название|компания» без регистра, кавычек и ООО/АО.
 
@@ -166,7 +174,7 @@ def dedup_key(title: str, company: str) -> str:
     """
     comp = _norm(company)
     comp = " ".join(_LEGAL_FORMS_RE.sub(" ", comp).split())
-    if not comp:
+    if not comp or comp in UNKNOWN_COMPANIES:
         return ""
     return f"{_norm(title)}|{comp}"
 

@@ -743,11 +743,28 @@ def score_order(order) -> dict | None:
     return None
 
 
+# Контакты заказчика не нужны для оценки задачи, а бесплатные провайдеры - внешний сервис:
+# телефоны, email и похожие на ключи длинные токены заменяем метками. Ссылки и @ники
+# оставляем: «бот @name» или «сайт example.com» - часть задачи.
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_PHONE_RE = re.compile(r"(?<![\w.])(?:\+\s*\d|8|7)(?:[\s\-().]*\d){9,10}(?![\w]|[.,]?\d)")
+_TOKEN_RE = re.compile(
+    r"(?<![\w-])(?:sk-|ghp_|AKIA|xox[bap]-)[A-Za-z0-9_-]{16,}|(?<![\w-])[A-Za-z0-9_-]{32,}(?![\w-])"
+)
+
+
+def mask_contacts(text: str) -> str:
+    """Заменяет email, телефоны и токены метками; смысл задачи не меняется."""
+    text = _EMAIL_RE.sub("[email]", text or "")
+    text = _TOKEN_RE.sub("[токен]", text)
+    return _PHONE_RE.sub("[телефон]", text)
+
+
 def _user_prompt(order) -> str:
     return (
-        f"Название: {order.title}\n"
-        f"Цена: {order.price_text or 'не указана'}\n"
-        f"Описание:\n{(order.body or '')[:BODY_LIMIT]}"
+        f"Название: {mask_contacts(order.title)}\n"
+        f"Цена: {mask_contacts(order.price_text) or 'не указана'}\n"
+        f"Описание:\n{mask_contacts((order.body or '')[:BODY_LIMIT])}"
     )
 
 

@@ -227,4 +227,4 @@ def mark_vacancies_sent(vacancies: list[Vacancy]) -> None:
             url=v.url,
             published_at=v.published_at,
         )
-    logging.info(f"[MANAGER] Помечено как отправлено: {len(vacancies)}")
+    logging.debug(f"[MANAGER] Помечено как отправлено: {len(vacancies)}")
