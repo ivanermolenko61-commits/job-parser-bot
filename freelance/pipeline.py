@@ -424,6 +424,10 @@ def _prepare_cycle() -> CycleResult:
         f"(из них в резерве квоты: {res.reserved}{quota_note}), "
         f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}"
     )
+    # Что именно отсеял AI: чтобы по логу было видно, не режется ли нужное
+    for sc in res.rejected:
+        logging.info(f"[FREELANCE] отсеян AI: fit {sc.fit}/10, {sc.order.site}, "
+                     f"{(sc.order.title or '')[:80]!r}")
     return res
 
 

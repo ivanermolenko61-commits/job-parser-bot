@@ -39,6 +39,7 @@ from database import (
     freelance_recent,
     freelance_set_deal_price,
     freelance_set_status,
+    freelance_day_summary,
     freelance_stats,
     get_recent_vacancies,
     init_db,
@@ -876,6 +877,33 @@ async def cleanup_freelance_messages():
         logging.exception("[FREELANCE] cleanup_freelance_messages")
 
 
+async def send_freelance_daily_summary():
+    """Раз в сутки (21:00 МСК) короткая сводка: тишина в чате отличима от поломки бота."""
+    try:
+        if not await _freelance_subscribed():
+            return  # фриланс на паузе: сводка не нужна
+        d = await asyncio.to_thread(freelance_day_summary)
+        text = (
+            "📋 <b>Фриланс за сутки</b>\n"
+            f"Прошло префильтр: {d['total']}\n"
+            f"Отправлено вам: {d['sent']}\n"
+            f"Отсеяно AI: {d['rejected_ai']}, дубли и прочее: {d['rejected_other']}\n"
+            f"Ждут оценки: {d['pending']}"
+        )
+        if d["near_miss"]:
+            lines = []
+            for m in d["near_miss"]:
+                title = html.escape((m["title"] or "")[:70])
+                if m["url"]:
+                    title = f'<a href="{html.escape(m["url"])}">{title}</a>'
+                lines.append(f'• {m["fit"]}/10 {title}')
+            text += "\n\nБлижайшие из отсеянных:\n" + "\n".join(lines)
+        await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
+                               disable_web_page_preview=True)
+    except Exception:
+        logging.exception("[FREELANCE] send_freelance_daily_summary")
+
+
 @dp.callback_query(F.data == "fl_toggle")
 async def cb_fl_toggle(call: CallbackQuery):
     try:
@@ -1167,6 +1195,15 @@ async def main():
         cleanup_freelance_messages,
         "interval",
         hours=1,
+    )
+    scheduler.add_job(
+        send_freelance_daily_summary,
+        "cron",
+        hour=21,
+        minute=0,
+        timezone=MSK,
+        misfire_grace_time=1800,  # перезапуск около 21:00 не должен терять сводку
+        coalesce=True,
     )
     scheduler.start()
     logging.info(f"Планировщик запущен: проверка каждые {CHECK_INTERVAL_MINUTES} мин")

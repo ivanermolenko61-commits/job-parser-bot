@@ -179,7 +179,7 @@ class ChainOrderTest(ProviderTestBase):
             chain = ai_scorer._parse_chain("mistral, bogus ,groq,mistral")
         self.assertEqual(chain, ["mistral", "groq"])
         self.assertEqual(ai_scorer._parse_chain(None),
-                         ["gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
+                         ["cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
 
     def test_order_follows_ai_providers(self):
         self.use(GROQ_MODELS="g1", CEREBRAS_MODELS="c1", MISTRAL_MODELS="s1")
@@ -511,7 +511,7 @@ class ChainResolveTest(ProviderTestBase):
         self.use()
         with self.assertLogs(level="ERROR"):
             chain = ai_scorer._resolve_chain("grokk,yandx")
-        self.assertEqual(chain, ["gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
+        self.assertEqual(chain, ["cloudflare", "openrouter", "github", "groq", "cerebras", "mistral"])
 
     def test_chain_without_keys_falls_back(self):
         self.use()
@@ -526,7 +526,7 @@ class ChainResolveTest(ProviderTestBase):
 
     def test_default_when_unset(self):
         self.use()
-        self.assertEqual(ai_scorer._resolve_chain(None)[0], "gemini")
+        self.assertEqual(ai_scorer._resolve_chain(None)[0], "cloudflare")
 
 
 class SafetyTest(ProviderTestBase):
@@ -735,7 +735,7 @@ class NewProvidersTest(unittest.TestCase):
             self.assertNotIn("{", p.base_url)
 
     def test_default_chain_order(self):
-        self.assertEqual(ai_scorer._parse_chain(None)[:4], ["gemini", "cloudflare", "openrouter", "github"])
+        self.assertEqual(ai_scorer._parse_chain(None)[:3], ["cloudflare", "openrouter", "github"])
         self.assertNotIn("yandex", ai_scorer._parse_chain(None))
 
 

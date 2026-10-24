@@ -1,7 +1,7 @@
 """Оценка фриланс-заказа: цепочка бесплатных AI-провайдеров, взаимозаменяемых.
 
-Порядок задаёт AI_PROVIDERS (по умолчанию gemini,cloudflare,openrouter,github,groq,
-cerebras,mistral; платный yandex - только явно). Провайдер без ключа пропускается. Если провайдер в лимите, квота кончилась,
+Порядок задаёт AI_PROVIDERS (по умолчанию cloudflare,openrouter,github,groq,
+cerebras,mistral; gemini отключён в коде (DISABLED_PROVIDERS); платный yandex - только явно). Провайдер без ключа пропускается. Если провайдер в лимите, квота кончилась,
 ключ отклонён или ответ не JSON - заказ сразу уходит следующему, а провайдер/модель
 на паузе пропускаются до её окончания. Gemini - свои модели GEMINI_MODELS; groq,
 cerebras, mistral, openrouter - общий OpenAI-совместимый клиент (только бесплатные
@@ -157,12 +157,15 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Бесплатные OpenAI-совместимые провайдеры: groq, cerebras, mistral, openrouter
 # ---------------------------------------------------------------------------
-# Порядок по живому сравнению 09.10.2026 на реальных заказах: gemini (быстрый, большой лимит) ->
+# Порядок по живому сравнению 09.10.2026 на реальных заказах: gemini (отключён: регион BotHost) ->
 # cloudflare gpt-oss-120b (лучшая детализация, 40/сутки) -> openrouter nemotron -> github (из РФ
 # не отвечает, проверить с сервера) -> провайдеры без бесплатного ключа
 PROVIDER_NAMES = ("gemini", "cloudflare", "openrouter", "github", "groq", "cerebras", "mistral", "yandex")
 # yandex платный: в цепочку по умолчанию не входит, включается только явно
-DEFAULT_CHAIN = ",".join(n for n in PROVIDER_NAMES if n != "yandex")
+DEFAULT_CHAIN = ",".join(n for n in PROVIDER_NAMES if n not in ("yandex", "gemini"))
+# Отключены в коде, даже если стоят в AI_PROVIDERS на сервере: Gemini с IP BotHost всегда
+# отвечает 400 «User location is not supported» и только засоряет логи и /aitest
+DISABLED_PROVIDERS = ("gemini",)
 
 PROVIDER_TIMEOUT_SEC = 60            # рассуждающие модели могут думать до минуты
 PROVIDER_MAX_WAIT_SEC = float(os.getenv("AI_PROVIDER_MAX_WAIT_SEC", "20"))  # дольше ждать очередь - отдаём заказ дальше
@@ -344,6 +347,9 @@ def _parse_chain(raw: str | None) -> list[str]:
     for name in (raw or DEFAULT_CHAIN).split(","):
         name = name.strip().lower()
         if not name or name in chain:
+            continue
+        if name in DISABLED_PROVIDERS:
+            logging.warning(f"[AI] {name} отключён в коде, из AI_PROVIDERS пропущен")
             continue
         if name not in PROVIDER_NAMES:
             logging.warning(f"[AI] AI_PROVIDERS: неизвестный провайдер {name!r}, пропущен")

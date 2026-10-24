@@ -702,6 +702,38 @@ def freelance_stats() -> dict:
         return {"seen_24h": seen, "sent_24h": sent}
 
 
+def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
+    """Итог фриланс-сводки за последние hours часов: сколько заказов прошло префильтр
+    и чем кончилось. «Отсеяно AI» - rejected с fit ниже порога (rejected с высоким fit -
+    заказы из сводки по лимиту и дубли оценённых). near_miss - лучшие из отсеянных AI."""
+    since = f"-{int(hours)} hours"
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT status, fit, sent_at IS NOT NULL FROM freelance_orders "
+            "WHERE seen_at >= datetime('now', ?)",
+            (since,),
+        ).fetchall()
+        counts = {"total": len(rows), "sent": 0, "rejected_ai": 0, "rejected_other": 0, "pending": 0}
+        for status, fit, was_sent in rows:
+            if was_sent:
+                counts["sent"] += 1
+            elif status == "pending":
+                counts["pending"] += 1
+            elif status == "rejected" and fit is not None and fit < FREELANCE_MIN_FIT:
+                counts["rejected_ai"] += 1
+            else:  # дубли, сводка по лимиту, просроченные без оценки
+                counts["rejected_other"] += 1
+        best = conn.execute(
+            "SELECT title, url, fit FROM freelance_orders "
+            "WHERE seen_at >= datetime('now', ?) AND status = 'rejected' "
+            "AND fit IS NOT NULL AND fit < ? AND sent_at IS NULL "
+            "ORDER BY fit DESC, order_id DESC LIMIT ?",
+            (since, FREELANCE_MIN_FIT, near_miss),
+        ).fetchall()
+        counts["near_miss"] = [{"title": r[0], "url": r[1], "fit": r[2]} for r in best]
+        return counts
+
+
 if __name__ == "__main__":
     init_db()
     print("База инициализирована:", DB_PATH)
