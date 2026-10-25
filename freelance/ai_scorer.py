@@ -81,7 +81,7 @@ _last_ok: dict | None = None          # {"model": ..., "at": iso}
 
 REQUEST_TIMEOUT_SEC = 30
 GEMMA_TIMEOUT_SEC = 90
-BODY_LIMIT = 3000
+BODY_LIMIT = 2000
 # Признаки неверного/недействительного ключа (а не проблемы конкретной модели)
 KEY_ERROR_MARKERS = ("API_KEY_INVALID", "API key not valid", "PERMISSION_DENIED",
                      "API key expired", "UNAUTHENTICATED")
@@ -264,6 +264,7 @@ class _Provider:
     paused: dict = field(default_factory=dict)    # модель -> конец паузы после 429
     disabled: set = field(default_factory=set)    # модели без доступа (404) - до рестарта
     no_json: set = field(default_factory=set)     # модели без response_format
+    no_reasoning: set = field(default_factory=set)  # модели без reasoning_effort
     count_loaded: bool = False          # дневной счётчик уже восстановлен из kv
     folder: str = ""                     # yandex: каталог Yandex Cloud (часть URI модели)
     cap_logged_day: str = ""             # за какие сутки уже писали в лог об исчерпанном потолке
@@ -294,6 +295,16 @@ def _env_number(environ, name: str, default, cast):
     except ValueError:
         logging.warning(f"[AI] {name}: некорректное значение, берём {default}")
         return default
+
+
+# Длина описания заказа в запросе: меньше текста - меньше токенов (нейронов Cloudflare, рублей Яндекса);
+# смысл заказа обычно в первых абзацах
+BODY_LIMIT = max(500, _env_number(os.environ, "AI_BODY_LIMIT", BODY_LIMIT, int))
+# reasoning_effort для gpt-oss (low/medium/high): меньше «размышлений» - дешевле вызов. Пусто - не отправляем
+_effort = (os.environ.get("AI_REASONING_EFFORT") or "").strip().lower()
+REASONING_EFFORT = _effort if _effort in ("low", "medium", "high") else ""
+if _effort and not REASONING_EFFORT:
+    logging.warning("[AI] AI_REASONING_EFFORT: допустимо low/medium/high, параметр не отправляется")
 
 
 def _build_providers(environ) -> dict:
@@ -457,6 +468,7 @@ def status() -> dict:
             "last_error": _last_error,
             "gemini_last_error": _gemini_last_error,
         }
+    result["triage_today"] = triage_today()
     if "yandex" in providers and providers["yandex"]["has_key"]:
         providers["yandex"]["budget"] = yandex_budget.summary(
             max_tokens=PROVIDER_MAX_TOKENS, models=providers["yandex"]["models"])
@@ -1296,7 +1308,8 @@ def _provider_model_id(p: _Provider, model: str) -> str:
     return f"gpt://{p.folder}/{model}" if p.name == "yandex" else model
 
 
-def _provider_body(model: str, order, use_json: bool, openrouter: bool = False) -> dict:
+def _provider_body(model: str, order, use_json: bool, openrouter: bool = False,
+                   reasoning: bool = False) -> dict:
     # Никаких plugins/web search/«:online»/fallback-списков моделей - они могут быть платными
     body = {
         "model": model,
@@ -1311,7 +1324,15 @@ def _provider_body(model: str, order, use_json: bool, openrouter: bool = False) 
         body["usage"] = {"include": True}  # учёт расхода: в ответе usage.cost, по нему ловим платное
     if use_json:
         body["response_format"] = {"type": "json_object"}
+    if reasoning and REASONING_EFFORT:
+        body["reasoning_effort"] = REASONING_EFFORT
     return body
+
+
+def _wants_reasoning(p: _Provider, model: str) -> bool:
+    """reasoning_effort шлём только рассуждающим gpt-oss и только если его не отклоняли (под _lock не нужен:
+    читаем множество, в которое пишут лишь добавлением)."""
+    return bool(REASONING_EFFORT) and "gpt-oss" in model.lower() and model not in p.no_reasoning
 
 
 def _usable(p: _Provider, model: str) -> str | None:
@@ -1455,8 +1476,9 @@ def _ask_provider_model(p: _Provider, model: str, order):
     label = f"{p.name}:{model}"
     with _lock:
         use_json = model not in p.no_json
+        use_reasoning = _wants_reasoning(p, model)
     resp = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         wait = _reserve_slot(p)   # внутри под _lock проверяет dead/blocked_until
         if wait is None:
             return "stop"
@@ -1483,7 +1505,8 @@ def _ask_provider_model(p: _Provider, model: str, order):
             resp = requests.post(
                 f"{p.base_url}/chat/completions",
                 headers=_provider_headers(p),
-                json=_provider_body(_provider_model_id(p, model), order, use_json, p.name == "openrouter"),
+                json=_provider_body(_provider_model_id(p, model), order, use_json,
+                                    p.name == "openrouter", use_reasoning),
                 timeout=PROVIDER_TIMEOUT_SEC,
             )
         except Exception as e:
@@ -1504,7 +1527,16 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 _log_yandex_cost(model, usage, yandex_budget.settle(model, reserved, usage))
             else:
                 yandex_budget.release(reserved)   # ошибки (4xx/5xx) не тарифицируются
-        if resp.status_code == 400 and use_json and attempt == 1:
+        if resp.status_code == 400 and use_reasoning and attempt < 3:
+            body = str(resp.text or "")[:600].lower()
+            # параметр reasoning_effort не поддержан: запоминаем и повторяем без него
+            if "reasoning" in body:
+                with _lock:
+                    p.no_reasoning.add(model)
+                use_reasoning = False
+                logging.info(f"[AI] {label}: reasoning_effort не поддержан, повтор без него")
+                continue
+        if resp.status_code == 400 and use_json and attempt < 3:
             body = str(resp.text or "")[:600].lower()
             # json_validate_failed - модель дала кривой JSON, а не "формат не поддержан"
             if "json_validate_failed" not in body and "response_format" in body and any(
@@ -1618,6 +1650,108 @@ def _ask_provider_model(p: _Provider, model: str, order):
     parsed["model"] = label
     _mark_ok(label, gemini=False, provider=p)
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Быстрый триаж: дешёвая нерассуждающая модель Cloudflare решает, есть ли смысл
+# в полной оценке. Свой счётчик и своя пауза: слоты основной оценки не тратятся.
+# Любая неудача -> None, и заказ идёт на полную оценку как раньше.
+# ---------------------------------------------------------------------------
+TRIAGE_MODEL = (os.getenv("TRIAGE_MODEL") or "@cf/meta/llama-3.1-8b-instruct-fp8").strip()
+TRIAGE_MAX_PER_DAY = _env_number(os.environ, "TRIAGE_MAX_PER_DAY", 300, int)
+TRIAGE_BODY_LIMIT = 600
+TRIAGE_TIMEOUT_SEC = 20
+TRIAGE_PROMPT = (
+    "Быстро оцени фриланс-заказ для исполнителя, у которого код пишет ИИ-ассистент. "
+    "Подходят: Telegram-боты, сайты, лендинги, парсеры, скрипты и автоматизация, "
+    "интеграции по API, WordPress/Tilda, Google Таблицы, вёрстка. Не подходят: дизайн, "
+    "тексты, SMM, офлайн и ручная работа, 1С, обучение, объявления исполнителей о своих "
+    "услугах. fit 0-2: точно не подходит; 3-10: может подойти (сомневаешься - ставь 5). "
+    'Ответь только JSON: {"fit": число}'
+)
+_FIT_RE = re.compile(r'"?fit"?\s*[:=]\s*"?(\d+(?:[.,]\d+)?)')
+
+_triage_lock = threading.Lock()
+_triage_day = ""
+_triage_count = 0
+_triage_paused_until = 0.0
+_triage_disabled = False      # модель недоступна (404): до рестарта
+
+
+def _triage_prompt(order) -> str:
+    return (
+        f"Название: {mask_contacts(order.title)}\n"
+        f"Цена: {mask_contacts(order.price_text) or 'не указана'}\n"
+        f"Описание:\n{mask_contacts(order.body or '')[:TRIAGE_BODY_LIMIT]}"
+    )
+
+
+def triage_today() -> int:
+    with _triage_lock:
+        return _triage_count if _triage_day == _today() else 0
+
+
+def triage_order(order) -> int | None:
+    """Быстрая оценка fit 0-10 или None (нет Cloudflare, лимит, пауза, сбой, неразборчивый ответ)."""
+    global _triage_day, _triage_count, _triage_paused_until, _triage_disabled
+    import requests
+    p = PROVIDERS.get("cloudflare")
+    if p is None or not p.key or "cloudflare" not in CHAIN or not TRIAGE_MODEL:
+        return None
+    now = time.monotonic()
+    with _lock:
+        if p.dead or now < p.blocked_until:
+            return None
+    with _triage_lock:
+        today = _today()
+        if _triage_day != today:
+            _triage_day, _triage_count = today, 0
+        if _triage_disabled or now < _triage_paused_until or _triage_count >= TRIAGE_MAX_PER_DAY:
+            return None
+        _triage_count += 1
+    try:
+        resp = requests.post(
+            f"{p.base_url}/chat/completions",
+            headers=_provider_headers(p),
+            json={
+                "model": TRIAGE_MODEL,
+                "messages": [{"role": "system", "content": TRIAGE_PROMPT},
+                             {"role": "user", "content": _triage_prompt(order)}],
+                "temperature": 0,
+                "max_tokens": 60,
+            },
+            timeout=TRIAGE_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        logging.warning(f"[TRIAGE] сбой запроса: {type(e).__name__}")
+        return None
+    code = resp.status_code
+    if code == 429:
+        pause, _daily = _provider_pause(resp)
+        with _triage_lock:
+            _triage_paused_until = max(_triage_paused_until, time.monotonic() + pause)
+        logging.warning(f"[TRIAGE] лимит Cloudflare, пауза {pause} с")
+        return None
+    if code == 404:
+        with _triage_lock:
+            _triage_disabled = True
+        logging.warning(f"[TRIAGE] модель {TRIAGE_MODEL} недоступна (HTTP 404), триаж выключен до рестарта")
+        return None
+    if code != 200:
+        logging.warning(f"[TRIAGE] HTTP {code}")
+        return None
+    try:
+        text = _content_text(resp.json()["choices"][0]["message"]["content"]) or ""
+    except Exception:
+        return None
+    m = _FIT_RE.search(text)
+    if not m:
+        logging.warning(f"[TRIAGE] ответ без fit: {text[:80]!r}")
+        return None
+    try:
+        return max(0, min(10, int(round(float(m.group(1).replace(",", "."))))))
+    except ValueError:
+        return None
 
 
 def _probe_order():

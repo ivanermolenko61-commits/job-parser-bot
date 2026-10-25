@@ -18,6 +18,7 @@ import html
 import json
 import logging
 import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -77,6 +78,19 @@ FIRST_RUN_LOOKBACK = 50
 # Отложенный заказ ждёт в pending; квота сбрасывается в 03:00 МСК, а свежесть - 6 ч,
 # поэтому после сброса оценятся только недавние отложенные, остальные истекут.
 RESERVE_SHARE = {2: 0.2, 3: 0.5}
+# Быстрый триаж (ai_scorer.triage_order): off - выключен; shadow - считается и сравнивается с полной
+# оценкой в логе, заказы не отсеивает; on - заказы с быстрой оценкой <= TRIAGE_REJECT_MAX не оцениваются
+# полной моделью. Любое другое значение - shadow.
+TRIAGE_MODE = (os.environ.get("FREELANCE_TRIAGE") or "shadow").strip().lower()
+if TRIAGE_MODE not in ("off", "shadow", "on"):
+    TRIAGE_MODE = "shadow"
+try:
+    TRIAGE_REJECT_MAX = max(0, min(4, int(os.environ.get("TRIAGE_REJECT_MAX") or 2)))
+except ValueError:
+    TRIAGE_REJECT_MAX = 2
+TRIAGE_CACHE_MAX = 2000
+_triage_cache: dict[int, int] = {}
+_triage_lock = threading.Lock()
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
 QUOTA_OUT_DAY_KEY = "ai_quota_out_day"   # день МСК, за который уже сообщили «квота кончилась»
@@ -146,6 +160,7 @@ class CycleResult:
     models_used: dict = field(default_factory=dict)  # модель -> сколько оценок
     pending_loaded: int = 0
     reserved: int = 0        # отложено ради резерва квоты
+    triaged: int = 0         # отсеяно быстрым фильтром без полной оценки
     quota_out: datetime | None = None   # квоты нет ни у кого: когда вернётся первый провайдер
 
 
@@ -366,15 +381,22 @@ def _prepare_cycle() -> CycleResult:
         idx, sc = item
         if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
             return _SKIPPED
-        if res.quota_out:
-            return _RESERVED
-        if _quota_reserved(priority(sc.order)):
+        will_score = not res.quota_out and not _quota_reserved(priority(sc.order))
+        # shadow: быстрая оценка нужна только для сравнения с полной, значит, когда полная будет
+        triage = _triage(sc) if (TRIAGE_MODE == "on" or (TRIAGE_MODE == "shadow" and will_score)) else None
+        if TRIAGE_MODE == "on" and triage is not None and triage <= TRIAGE_REJECT_MAX:
+            return {"fit": triage, "triage": True, "model": f"triage:{ai_scorer.TRIAGE_MODEL}",
+                    "summary": "отсеян быстрым фильтром"}
+        if not will_score:
             return _RESERVED
         try:
-            return ai_scorer.score_order(sc.order)
+            result = ai_scorer.score_order(sc.order)
         except Exception:
             logging.exception("[FREELANCE] сбой оценки заказа")
             return None
+        if TRIAGE_MODE == "shadow" and triage is not None and result is not None:
+            _log_triage_shadow(sc, triage, result)
+        return result
 
     with ThreadPoolExecutor(AI_WORKERS) as pool:
         results = list(pool.map(_score, enumerate(to_score)))
@@ -393,12 +415,18 @@ def _prepare_cycle() -> CycleResult:
                     res.reserved += 1
                 res.unscored.append(sc)
                 continue
-            res.ai_attempted += 1
+            if not (isinstance(r, dict) and r.get("triage")):
+                # быстрый фильтр в «здоровье» AI не считаем: иначе при лежащей полной модели
+                # успешные триажи скрыли бы алерт «AI не работает»
+                res.ai_attempted += 1
             if r is None:
                 sc.attempts += 1
                 res.unscored.append(sc)
                 continue
-            res.ai_ok += 1
+            if r.get("triage"):
+                res.triaged += 1
+            else:
+                res.ai_ok += 1
             sc.ai = r
             fresh_scored = True
             res.models_used[r.get("model", "?")] = res.models_used.get(r.get("model", "?"), 0) + 1
@@ -422,13 +450,48 @@ def _prepare_cycle() -> CycleResult:
         f"кандидатов: {len(candidates)}, к отправке: {len(res.to_send)}, "
         f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)} "
         f"(из них в резерве квоты: {res.reserved}{quota_note}), "
-        f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}"
+        f"AI: {res.ai_ok}/{res.ai_attempted} {res.models_used}, быстрый фильтр: {res.triaged}"
     )
     # Что именно отсеял AI: чтобы по логу было видно, не режется ли нужное
     for sc in res.rejected:
-        logging.info(f"[FREELANCE] отсеян AI: fit {sc.fit}/10, {sc.order.site}, "
+        how = ", быстрый фильтр" if (sc.ai or {}).get("triage") else ""
+        logging.info(f"[FREELANCE] отсеян AI: fit {sc.fit}/10{how}, {sc.order.site}, "
                      f"{ai_scorer.mask_contacts(sc.order.title or '')[:80]!r}")
     return res
+
+
+def _triage(sc: ScoredOrder) -> int | None:
+    """Быстрая оценка заказа (результат помним: заказ в резерве квоты не триажим каждый цикл).
+    Только для заказов без оценки и без неудачных попыток."""
+    if sc.ai is not None or sc.attempts:
+        return None
+    oid = sc.order.order_id
+    with _triage_lock:
+        if oid in _triage_cache:
+            return _triage_cache[oid]
+    try:
+        value = ai_scorer.triage_order(sc.order)
+    except Exception:
+        logging.exception("[TRIAGE] сбой быстрой оценки")
+        return None
+    if value is not None:
+        with _triage_lock:
+            if len(_triage_cache) >= TRIAGE_CACHE_MAX:
+                _triage_cache.clear()
+            _triage_cache[oid] = value
+    return value
+
+
+def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict) -> None:
+    """Сравнение быстрой и полной оценки (режим shadow): по этим строкам решаем, включать ли триаж."""
+    try:
+        full = int(result["fit"])
+    except (KeyError, TypeError, ValueError):
+        return
+    miss = triage <= TRIAGE_REJECT_MAX and full >= FREELANCE_MIN_FIT
+    title = ai_scorer.mask_contacts(sc.order.title or "")[:60]
+    logging.info(f"[TRIAGE] заказ {sc.order.order_id}: быстрая {triage}, полная {full}"
+                 f"{' - ПРОПУСТИЛ БЫ ХОРОШИЙ' if miss else ''} {title!r}")
 
 
 def _quota_reserved(group: int) -> bool:

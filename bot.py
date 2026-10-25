@@ -967,6 +967,19 @@ async def catch_up_freelance_summary():
         await send_freelance_daily_summary()
 
 
+def _ai_usage_line(st: dict) -> str:
+    """Расход AI-запросов за сутки по провайдерам и число быстрых оценок. Счётчики
+    держатся с последнего сброса (03:00 МСК, Yandex - 00:00), в 21:00 это почти весь день."""
+    parts = []
+    for name, p in (st.get("providers") or {}).items():
+        if p.get("enabled") and p.get("limit"):
+            parts.append(f"{name} {p.get('today', 0)}/{p['limit']}")
+    triage = int(st.get("triage_today") or 0)
+    if triage:
+        parts.append(f"быстрых оценок {triage}")
+    return ("AI за сутки: " + ", ".join(parts)) if parts else ""
+
+
 async def _send_freelance_daily_summary_locked():
     try:
         if not await _freelance_subscribed():
@@ -982,6 +995,9 @@ async def _send_freelance_daily_summary_locked():
             f"Отсеяно AI: {d['rejected_ai']}, дубли и прочее: {d['rejected_other']}\n"
             f"Ждут оценки: {d['pending']}"
         )
+        usage = _ai_usage_line(await asyncio.to_thread(ai_scorer.status))
+        if usage:
+            text += "\n" + usage
         if d["near_miss"]:
             lines = []
             for m in d["near_miss"]:
