@@ -394,6 +394,8 @@ def _prepare_cycle() -> CycleResult:
         except Exception:
             logging.exception("[FREELANCE] сбой оценки заказа")
             return None
+        if result is not None:
+            _save_scored_now(sc, result)
         if TRIAGE_MODE == "shadow" and triage is not None and result is not None:
             _log_triage_shadow(sc, triage, result)
         return result
@@ -437,7 +439,8 @@ def _prepare_cycle() -> CycleResult:
             # заставить тратить квоту на повторную оценку (finish_cycle перезапишет статус)
             _save_retry(sc, "pending")
         fit = sc.fit
-        if fit is not None and fit < FREELANCE_MIN_FIT:
+        # отсев быстрым фильтром окончателен при любом FREELANCE_MIN_FIT (порог мог быть <= TRIAGE_REJECT_MAX)
+        if (fit is not None and fit < FREELANCE_MIN_FIT) or (sc.ai or {}).get("triage"):
             res.rejected.append(sc)
         else:
             res.to_send.append(sc)
@@ -458,6 +461,18 @@ def _prepare_cycle() -> CycleResult:
         logging.info(f"[FREELANCE] отсеян AI: fit {sc.fit}/10{how}, {sc.order.site}, "
                      f"{ai_scorer.mask_contacts(sc.order.title or '')[:80]!r}")
     return res
+
+
+def _save_scored_now(sc: ScoredOrder, result: dict) -> None:
+    """Оценка уже получена и стоила квоты: сразу в БД как pending, не дожидаясь конца пачки.
+    Рестарт посреди цикла иначе заставил бы оценивать те же заказы заново. Работаем с копией:
+    sc.ai основной поток выставит сам (по нему считаются счётчики цикла)."""
+    try:
+        tmp = ScoredOrder(sc.order, dict(result), sc.dedup, sc.attempts)
+        _ensure_price(tmp)
+        _save_retry(tmp, "pending")
+    except Exception:
+        logging.exception(f"[FREELANCE] не удалось сразу сохранить оценку {sc.order.url}")
 
 
 def _triage(sc: ScoredOrder) -> int | None:

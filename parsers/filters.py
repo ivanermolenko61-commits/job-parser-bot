@@ -82,8 +82,11 @@ INCLUDE_IT_WORDS = [
 ]
 
 # Уровень в явном виде (для проверки ALLOWED_LEVELS)
+# Только целым словом: иначе «Internal Tools» читается как Intern, «Middleware» как Middle,
+# «Leader» как Lead, и подходящая вакансия отсеивается
 LEVEL_PATTERN = re.compile(
-    r"(Junior|Middle|Senior|Lead|Intern|Стажёр|Стажер|Trainee)", re.IGNORECASE,
+    r"(?<![a-zа-яё0-9])(Junior|Middle|Senior|Lead|Intern|Стажёр|Стажер|Trainee)(?![a-zа-яё0-9])",
+    re.IGNORECASE,
 )
 
 _WORD_CHAR = r"a-zа-яё0-9"

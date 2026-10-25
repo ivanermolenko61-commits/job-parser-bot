@@ -87,11 +87,10 @@ class HabrParser(BaseParser):
 
         text = meta_tag.get_text(" ", strip=True)
 
-        level = ""
-        m = LEVEL_PATTERN.search(text)
-        if m:
-            level = m.group(1)
-            text = text.replace(m.group(0), " ", 1)
+        # Все уровни, а не первый: «Middle / Junior» должен пройти проверку is_allowed_level
+        found = [m.group(1) for m in LEVEL_PATTERN.finditer(text)]
+        level = " / ".join(dict.fromkeys(found))
+        text = LEVEL_PATTERN.sub(" ", text)
 
         is_remote = "Можно удалённо" in text or "Удалённо" in text
         text = text.replace("Можно удалённо", " ").replace("Удалённо", " ")

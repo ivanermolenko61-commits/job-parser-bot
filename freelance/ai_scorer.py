@@ -693,11 +693,14 @@ def parse_ai_json(text: str) -> dict | None:
         if data is None:
             return None
     try:
+        if isinstance(data.get("fit"), bool):
+            return None            # true/false - не оценка
         fit_raw = float(data.get("fit"))
-        if not math.isfinite(fit_raw):
+        # вне шкалы 0-10 (85, -100) - ответ неверный: пробуем следующую модель, а не режем до границы
+        if not math.isfinite(fit_raw) or not -0.5 <= fit_raw <= 10.5:
             return None
         fit = int(round(fit_raw))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     difficulty = str(data.get("difficulty") or "").strip().lower()
     if difficulty not in ("легко", "средне", "сложно"):
@@ -1102,31 +1105,33 @@ def _load_count(p: _Provider) -> None:
     """Один раз за процесс подтягивает дневной счётчик провайдера из kv (ключ
     ai_count_<имя> = "YYYY-MM-DD:N"), чтобы рестарт не обнулял бесплатную квоту.
     Остальные потоки ждут загрузку (иначе заняли бы слот до неё и потеряли сохранённое N).
-    Любая ошибка БД или чужое значение - работаем как раньше, только в памяти."""
+    Ошибка чтения БД - работаем в памяти, но чтение повторится при следующем запросе, а запись в kv
+    до успешного чтения пропускается (иначе малый счётчик затёр бы сохранённый расход).
+    Чужое значение в kv - как пустое."""
     with _count_load_lock:
         if p.count_loaded:
             return
         try:
-            try:
-                from database import kv_get
-                raw = kv_get(f"ai_count_{p.name}")
-            except Exception as e:
-                logging.warning(f"[AI] {p.name}: счётчик за сутки не прочитан из БД: {type(e).__name__}")
-                return
-            day, sep, num = str(raw or "").partition(":")
-            if not (sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)):
-                return
-            with _lock:
-                if day == _today(p) and p.day in ("", day):
-                    p.day, p.count = day, max(p.count, int(num))
-        finally:
-            p.count_loaded = True
+            from database import kv_get
+            raw = kv_get(f"ai_count_{p.name}")
+        except Exception as e:
+            logging.warning(f"[AI] {p.name}: счётчик за сутки не прочитан из БД: {type(e).__name__}")
+            return
+        p.count_loaded = True
+        day, sep, num = str(raw or "").partition(":")
+        if not (sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)):
+            return
+        with _lock:
+            if day == _today(p) and p.day in ("", day):
+                p.day, p.count = day, max(p.count, int(num))
 
 
 def _save_count(p: _Provider) -> None:
     """Записывает дневной счётчик провайдера в kv. Снимок и запись - под _count_save_lock,
     чтобы старый снимок не перезаписал новый; сам _lock во время записи не держим."""
     with _count_save_lock:
+        if not p.count_loaded:
+            return   # сохранённый расход не прочитан: запись затёрла бы его меньшим числом
         with _lock:
             value = f"{p.day}:{p.count}"
         try:
@@ -1747,6 +1752,10 @@ def triage_order(order) -> int | None:
     with _lock:
         if p.dead or now < p.blocked_until:
             return None
+        live = [m for m in p.models if m not in p.disabled]
+        # нейроны Cloudflare общие: если полная оценка упёрлась в дневной 429, триаж тоже не шлём
+        if live and all(p.paused.get(m, 0.0) - now > CAPACITY_PAUSE_SEC for m in live):
+            return None
     with _triage_lock:
         if not _triage_load_count():
             return None
@@ -1776,9 +1785,14 @@ def triage_order(order) -> int | None:
         return None
     code = resp.status_code
     if code == 429:
-        pause, _daily = _provider_pause(resp)
+        pause, daily = _provider_pause(resp)
+        until = time.monotonic() + pause
         with _triage_lock:
-            _triage_paused_until = max(_triage_paused_until, time.monotonic() + pause)
+            _triage_paused_until = max(_triage_paused_until, until)
+        if daily:
+            with _lock:   # дневная квота аккаунта кончилась и для полной оценки тоже
+                for m in p.models:
+                    p.paused[m] = max(p.paused.get(m, 0.0), until)
         logging.warning(f"[TRIAGE] лимит Cloudflare, пауза {pause} с")
         return None
     if code == 404:

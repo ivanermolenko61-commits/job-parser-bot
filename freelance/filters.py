@@ -47,6 +47,14 @@ EXCLUDE_WORDS = [
 _INCLUDE_RE = _compile(INCLUDE_WORDS)
 _EXCLUDE_RE = _compile(EXCLUDE_WORDS)
 
+# Дизайн уже есть у заказчика: эти обороты не считаем словом «дизайн» в EXCLUDE_WORDS
+_DESIGN_GIVEN_RE = re.compile(
+    r"(?:по|из|с|на основе)\s+(?:готов\w+|имеющ\w+|утвержд\w+|своему|моему|нашему)\s+(?:дизайн|макет)\w*"
+    r"|(?:готов\w+|имеющ\w+|утвержд\w+)\s+дизайн\w*"
+    r"|дизайн\s+(?:уже\s+)?(?:готов|есть|имеется|утвержд)\w*",
+    re.IGNORECASE,
+)
+
 # Объявление исполнителя о своих услугах: глагол 1-го лица ед.ч. в начале названия
 _SERVICE_OFFER_RE = re.compile(
     r"^[^a-zа-я0-9]*(?:создам|сделаю|разработаю|настрою|напишу|выполню|"
@@ -69,7 +77,8 @@ def is_candidate(order) -> bool:
     title = order.title or ""
     if is_service_offer(title):
         return False
-    if _EXCLUDE_RE.search(title):
+    # «Вёрстка по готовому дизайну» - заказ на разработку: дизайн тут дан, а не заказывается
+    if _EXCLUDE_RE.search(_DESIGN_GIVEN_RE.sub(" ", title)):
         return False
     if DEV_CATEGORIES.intersection(order.categories):
         return True
