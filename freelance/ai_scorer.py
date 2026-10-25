@@ -1117,22 +1117,23 @@ def _load_count(p: _Provider) -> None:
         except Exception as e:
             logging.warning(f"[AI] {p.name}: счётчик за сутки не прочитан из БД: {type(e).__name__}")
             return
-        p.count_loaded = True
         day, sep, num = str(raw or "").partition(":")
-        if not (sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)):
-            return
+        valid = bool(sep and num.isdigit() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day))
         with _lock:
-            if day == _today(p) and p.day in ("", day):
-                p.day, p.count = day, max(p.count, int(num))
+            # расход, накопленный в памяти после неудачного чтения, прибавляется к сохранённому
+            # (пока чтение не удалось, записи в kv не было); флаг - в том же критическом участке
+            if valid and day == _today(p) and p.day in ("", day):
+                p.day, p.count = day, int(num) + p.count
+            p.count_loaded = True
 
 
 def _save_count(p: _Provider) -> None:
     """Записывает дневной счётчик провайдера в kv. Снимок и запись - под _count_save_lock,
     чтобы старый снимок не перезаписал новый; сам _lock во время записи не держим."""
     with _count_save_lock:
-        if not p.count_loaded:
-            return   # сохранённый расход не прочитан: запись затёрла бы его меньшим числом
         with _lock:
+            if not p.count_loaded:
+                return   # сохранённый расход не прочитан: запись затёрла бы его меньшим числом
             value = f"{p.day}:{p.count}"
         try:
             from database import kv_set
@@ -1753,8 +1754,9 @@ def triage_order(order) -> int | None:
         if p.dead or now < p.blocked_until:
             return None
         live = [m for m in p.models if m not in p.disabled]
-        # нейроны Cloudflare общие: если полная оценка упёрлась в дневной 429, триаж тоже не шлём
-        if live and all(p.paused.get(m, 0.0) - now > CAPACITY_PAUSE_SEC for m in live):
+        # нейроны Cloudflare общие: пока все модели полной оценки на паузе (в том числе дневной 429),
+        # триаж тоже не шлём - запрос всё равно упрётся в тот же лимит
+        if live and all(p.paused.get(m, 0.0) > now for m in live):
             return None
     with _triage_lock:
         if not _triage_load_count():

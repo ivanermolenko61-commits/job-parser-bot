@@ -66,7 +66,8 @@ class DesignWordTest(unittest.TestCase):
                 self.assertTrue(is_candidate(order(title)))
 
     def test_ordering_design_still_excluded(self):
-        for title in ("Нужен дизайн сайта", "Дизайн логотипа и сайт", "Разработать дизайн лендинга"):
+        for title in ("Нужен дизайн сайта", "Дизайн логотипа и сайт", "Разработать дизайн лендинга",
+                      "Нужен дизайн готового сайта", "Дизайн готовых страниц для лендинга"):
             with self.subTest(title=title):
                 self.assertFalse(is_candidate(order(title)))
 
@@ -100,7 +101,7 @@ class CountLoadTest(unittest.TestCase):
             kv_set.assert_not_called()                  # 44 в БД не затёрто единицей
             ai_scorer._load_count(p)
         self.assertTrue(p.count_loaded)
-        self.assertEqual(p.count, 44)
+        self.assertEqual(p.count, 45)       # 44 сохранённых + 1 запрос, сделанный пока БД не читалась
 
 
 class TriageSharedQuotaTest(unittest.TestCase):
