@@ -110,7 +110,9 @@ class TriageClientTest(unittest.TestCase):
     def test_fit_parsed_as_json_not_by_prefix(self):
         cases = {'{"fit": 1e1}': 10, '```json\n{"fit": 3}\n```': 3, '{"fit": 2.4}': 2,
                  '{"fit": 42}': None, '{"fit": -1}': None, '{"fit": "1"}': None,
-                 '{"fit": true}': None, '{"fit": null}': None, '[1]': None, 'fit: 1': None}
+                 '{"fit": true}': None, '{"fit": null}': None, '[1]': None, 'fit: 1': None,
+                 '[{"fit": 1}]': None, 'ответ: {"fit": 1}': None, '{"fit": 1} и ещё {"fit": 9}': None,
+                 '{"fit": 1' + '0' * 400 + '}': None, '{"fit": NaN}': None}
         for text, expected in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(ai_scorer._parse_triage_fit(text), expected)
@@ -128,6 +130,26 @@ class TriageClientTest(unittest.TestCase):
                 mock.patch("requests.post") as post:
             self.assertIsNone(ai_scorer.triage_order(ORDER))
         post.assert_not_called()
+
+    def test_db_read_failure_skips_triage_and_retries_load(self):
+        today = ai_scorer._today()
+        with mock.patch.object(ai_scorer, "_triage_loaded", False), \
+                mock.patch.object(ai_scorer, "_triage_day", ""), \
+                mock.patch.object(ai_scorer, "_triage_count", 0), \
+                mock.patch("database.kv_get", side_effect=[OSError("db"), f"{today}:7"]), \
+                mock.patch("requests.post", return_value=http()) as post:
+            self.assertIsNone(ai_scorer.triage_order(ORDER))     # чтение не удалось: запроса нет
+            post.assert_not_called()
+            self.assertEqual(ai_scorer.triage_order(ORDER), 1)   # второе чтение удалось
+            self.assertEqual(ai_scorer._triage_count, 8)         # расход 7 не потерян
+        self.save.assert_called_with(f"{today}:8")
+
+    def test_save_happens_under_lock(self):
+        held = []
+        self.save.side_effect = lambda value: held.append(ai_scorer._triage_lock.locked())
+        with mock.patch("requests.post", return_value=http()):
+            ai_scorer.triage_order(ORDER)
+        self.assertEqual(held, [True])
 
     def test_stale_day_in_kv_ignored(self):
         with mock.patch.object(ai_scorer, "_triage_loaded", False), \

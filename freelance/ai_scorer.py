@@ -1679,21 +1679,23 @@ _triage_disabled = False      # модель недоступна (404): до р
 _triage_loaded = False        # счётчик за сутки уже восстановлен из kv
 
 
-def _triage_load_count() -> None:
-    """Один раз за процесс подтягивает счётчик из kv (вызывать под _triage_lock).
-    Ошибка БД - считаем только в памяти."""
+def _triage_load_count() -> bool:
+    """Подтягивает счётчик из kv один раз за процесс (вызывать под _triage_lock).
+    False - БД не прочитана: триаж пропускаем (заказ пойдёт на полную оценку) и повторим чтение
+    при следующем вызове, иначе успешная запись затёрла бы сохранённый расход."""
     global _triage_day, _triage_count, _triage_loaded
     if _triage_loaded:
-        return
-    _triage_loaded = True
+        return True
     try:
         from database import kv_get
         day, sep, num = str(kv_get(TRIAGE_COUNT_KEY) or "").partition(":")
     except Exception as e:
         logging.warning(f"[TRIAGE] счётчик за сутки не прочитан из БД: {type(e).__name__}")
-        return
+        return False
+    _triage_loaded = True
     if sep and num.isdigit() and day == _today() and _triage_day in ("", day):
         _triage_day, _triage_count = day, max(_triage_count, int(num))
+    return True
 
 
 def _triage_save_count(value: str) -> None:
@@ -1707,18 +1709,16 @@ def _triage_save_count(value: str) -> None:
 def _parse_triage_fit(text: str) -> int | None:
     """fit из ответа: настоящий JSON-объект, число 0-10 (не bool, не строка). Иначе None:
     лучше полная оценка, чем отсев по неверно прочитанному числу."""
-    cleaned = re.sub(r"```(?:json)?", "", text or "", flags=re.IGNORECASE).strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start == -1 or end <= start:
-        return None
+    # только внешнее Markdown-ограждение; весь остальной текст должен быть одним JSON-объектом
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text or "", flags=re.IGNORECASE).strip()
     try:
-        data = json.loads(cleaned[start:end + 1])
+        data = json.loads(cleaned)
     except ValueError:
         return None
     fit = data.get("fit") if isinstance(data, dict) else None
-    if isinstance(fit, bool) or not isinstance(fit, (int, float)) or not math.isfinite(fit):
+    if isinstance(fit, bool) or not isinstance(fit, (int, float)):
         return None
-    if not 0 <= fit <= 10:
+    if not 0 <= fit <= 10:      # NaN/inf и огромные числа тоже не проходят
         return None
     return int(round(fit))
 
@@ -1748,15 +1748,16 @@ def triage_order(order) -> int | None:
         if p.dead or now < p.blocked_until:
             return None
     with _triage_lock:
-        _triage_load_count()
+        if not _triage_load_count():
+            return None
         today = _today()
         if _triage_day != today:
             _triage_day, _triage_count = today, 0
         if _triage_disabled or now < _triage_paused_until or _triage_count >= TRIAGE_MAX_PER_DAY:
             return None
         _triage_count += 1
-        saved = f"{_triage_day}:{_triage_count}"
-    _triage_save_count(saved)
+        # запись под тем же lock: старое значение не перезапишет новое
+        _triage_save_count(f"{_triage_day}:{_triage_count}")
     try:
         resp = requests.post(
             f"{p.base_url}/chat/completions",
