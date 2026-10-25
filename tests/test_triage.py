@@ -48,9 +48,12 @@ class TriageClientTest(unittest.TestCase):
                   mock.patch.object(ai_scorer, "_triage_day", ""),
                   mock.patch.object(ai_scorer, "_triage_count", 0),
                   mock.patch.object(ai_scorer, "_triage_paused_until", 0.0),
-                  mock.patch.object(ai_scorer, "_triage_disabled", False)):
+                  mock.patch.object(ai_scorer, "_triage_disabled", False),
+                  mock.patch.object(ai_scorer, "_triage_loaded", True),
+                  mock.patch.object(ai_scorer, "_triage_save_count")):
             p.start()
             self.addCleanup(p.stop)
+        self.save = ai_scorer._triage_save_count
         self.cf = providers["cloudflare"]
 
     def test_returns_fit_and_does_not_spend_main_quota(self):
@@ -104,9 +107,35 @@ class TriageClientTest(unittest.TestCase):
         self.assertNotIn("private-company", sent)
         self.assertNotIn("999", sent)
 
-    def test_fit_clamped(self):
-        with mock.patch("requests.post", return_value=http(content='{"fit": 42}')):
-            self.assertEqual(ai_scorer.triage_order(ORDER), 10)
+    def test_fit_parsed_as_json_not_by_prefix(self):
+        cases = {'{"fit": 1e1}': 10, '```json\n{"fit": 3}\n```': 3, '{"fit": 2.4}': 2,
+                 '{"fit": 42}': None, '{"fit": -1}': None, '{"fit": "1"}': None,
+                 '{"fit": true}': None, '{"fit": null}': None, '[1]': None, 'fit: 1': None}
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ai_scorer._parse_triage_fit(text), expected)
+
+    def test_counter_persisted_and_restored_after_restart(self):
+        with mock.patch("requests.post", return_value=http()):
+            ai_scorer.triage_order(ORDER)
+        today = ai_scorer._today()
+        self.save.assert_called_with(f"{today}:1")
+        # «рестарт»: память пуста, в kv - 300 за сегодня -> потолок достигнут
+        with mock.patch.object(ai_scorer, "_triage_loaded", False), \
+                mock.patch.object(ai_scorer, "_triage_day", ""), \
+                mock.patch.object(ai_scorer, "_triage_count", 0), \
+                mock.patch("database.kv_get", return_value=f"{today}:{ai_scorer.TRIAGE_MAX_PER_DAY}"), \
+                mock.patch("requests.post") as post:
+            self.assertIsNone(ai_scorer.triage_order(ORDER))
+        post.assert_not_called()
+
+    def test_stale_day_in_kv_ignored(self):
+        with mock.patch.object(ai_scorer, "_triage_loaded", False), \
+                mock.patch.object(ai_scorer, "_triage_day", ""), \
+                mock.patch.object(ai_scorer, "_triage_count", 0), \
+                mock.patch("database.kv_get", return_value="2000-01-01:300"), \
+                mock.patch("requests.post", return_value=http()):
+            self.assertEqual(ai_scorer.triage_order(ORDER), 1)
 
 
 class TokenSavingTest(unittest.TestCase):

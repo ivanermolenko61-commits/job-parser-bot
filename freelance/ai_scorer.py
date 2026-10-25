@@ -1669,13 +1669,58 @@ TRIAGE_PROMPT = (
     "услугах. fit 0-2: точно не подходит; 3-10: может подойти (сомневаешься - ставь 5). "
     'Ответь только JSON: {"fit": число}'
 )
-_FIT_RE = re.compile(r'"?fit"?\s*[:=]\s*"?(\d+(?:[.,]\d+)?)')
+TRIAGE_COUNT_KEY = "ai_count_triage"   # kv: "YYYY-MM-DD:N", чтобы рестарт не обнулял суточный потолок
 
 _triage_lock = threading.Lock()
 _triage_day = ""
 _triage_count = 0
 _triage_paused_until = 0.0
 _triage_disabled = False      # модель недоступна (404): до рестарта
+_triage_loaded = False        # счётчик за сутки уже восстановлен из kv
+
+
+def _triage_load_count() -> None:
+    """Один раз за процесс подтягивает счётчик из kv (вызывать под _triage_lock).
+    Ошибка БД - считаем только в памяти."""
+    global _triage_day, _triage_count, _triage_loaded
+    if _triage_loaded:
+        return
+    _triage_loaded = True
+    try:
+        from database import kv_get
+        day, sep, num = str(kv_get(TRIAGE_COUNT_KEY) or "").partition(":")
+    except Exception as e:
+        logging.warning(f"[TRIAGE] счётчик за сутки не прочитан из БД: {type(e).__name__}")
+        return
+    if sep and num.isdigit() and day == _today() and _triage_day in ("", day):
+        _triage_day, _triage_count = day, max(_triage_count, int(num))
+
+
+def _triage_save_count(value: str) -> None:
+    try:
+        from database import kv_set
+        kv_set(TRIAGE_COUNT_KEY, value)
+    except Exception as e:
+        logging.warning(f"[TRIAGE] счётчик за сутки не записан в БД: {type(e).__name__}")
+
+
+def _parse_triage_fit(text: str) -> int | None:
+    """fit из ответа: настоящий JSON-объект, число 0-10 (не bool, не строка). Иначе None:
+    лучше полная оценка, чем отсев по неверно прочитанному числу."""
+    cleaned = re.sub(r"```(?:json)?", "", text or "", flags=re.IGNORECASE).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(cleaned[start:end + 1])
+    except ValueError:
+        return None
+    fit = data.get("fit") if isinstance(data, dict) else None
+    if isinstance(fit, bool) or not isinstance(fit, (int, float)) or not math.isfinite(fit):
+        return None
+    if not 0 <= fit <= 10:
+        return None
+    return int(round(fit))
 
 
 def _triage_prompt(order) -> str:
@@ -1703,12 +1748,15 @@ def triage_order(order) -> int | None:
         if p.dead or now < p.blocked_until:
             return None
     with _triage_lock:
+        _triage_load_count()
         today = _today()
         if _triage_day != today:
             _triage_day, _triage_count = today, 0
         if _triage_disabled or now < _triage_paused_until or _triage_count >= TRIAGE_MAX_PER_DAY:
             return None
         _triage_count += 1
+        saved = f"{_triage_day}:{_triage_count}"
+    _triage_save_count(saved)
     try:
         resp = requests.post(
             f"{p.base_url}/chat/completions",
@@ -1744,14 +1792,10 @@ def triage_order(order) -> int | None:
         text = _content_text(resp.json()["choices"][0]["message"]["content"]) or ""
     except Exception:
         return None
-    m = _FIT_RE.search(text)
-    if not m:
-        logging.warning(f"[TRIAGE] ответ без fit: {text[:80]!r}")
-        return None
-    try:
-        return max(0, min(10, int(round(float(m.group(1).replace(",", "."))))))
-    except ValueError:
-        return None
+    fit = _parse_triage_fit(text)
+    if fit is None:
+        logging.warning(f"[TRIAGE] ответ без разборчивого fit: {text[:80]!r}")
+    return fit
 
 
 def _probe_order():
