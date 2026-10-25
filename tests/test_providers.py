@@ -299,7 +299,8 @@ class OpenRouterFreeOnlyTest(ProviderTestBase):
     def test_defaults_are_free(self):
         prov = self.use()
         self.assertEqual(prov["openrouter"].models, [
-            "nvidia/nemotron-3-super-120b-a12b:free", "openrouter/free"])
+            "nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3.5-super-vl:free", "google/gemma-4-31b-it:free"])
         self.assertEqual(prov["openrouter"].max_per_day, 45)
 
     def _models_payload(self):

@@ -230,8 +230,12 @@ PROVIDER_SPECS = {
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1", "prefix": "OPENROUTER",
-        # google/gemma-4-31b-it:free убрана: на сравнении 09.10 отвечала только 429
-        "models": "nvidia/nemotron-3-super-120b-a12b:free," + OPENROUTER_FREE_ROUTER,
+        # Крупные модели по порядку: если у первой нет серверов (404), берётся следующая.
+        # openrouter/free убран из умолчаний: он подставлял случайные мелкие модели
+        # (например, 2.6B), и оценки заказов становились случайными (разбор 25.10).
+        # gemma-4-31b стоит последней: на сравнении 09.10 она отвечала только 429.
+        "models": "nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3-ultra-550b-a55b:free,"
+                  "nvidia/nemotron-3.5-super-vl:free,google/gemma-4-31b-it:free",
         # лимит 50/сутки общий на все :free-модели, поэтому 429 по дню паузит весь провайдер
         "interval": 3.5, "per_day": 45, "shared_daily": True,
     },
