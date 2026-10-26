@@ -180,6 +180,38 @@ class CycleWithSwitchesTest(CycleTestBase):
         sources.set_enabled(sources.KWORK, True)
         self.assertEqual(list(pipeline._load_pending(floor, set(), [], fetch_alot=False)), [kw.order_id])
 
+    def test_disabled_source_queue_does_not_crowd_out_enabled(self):
+        # заказов выключенного источника больше PENDING_FETCH_LIMIT и они новее; заказ включённого - за ними
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            o = make_order(sources.KWORK_ID_OFFSET + 100 + i)
+            o.site, o.published_at = "kworkru", now - timedelta(minutes=5 + i)
+            pipeline.save_order(pipeline.ScoredOrder(o, None, f"kw{i}"), "pending")
+        fl = self.pending_feed_order(sources.FL_ID_OFFSET + 90, "flru", hours_ago=3)
+        sources.set_enabled(sources.KWORK, False)
+        with mock.patch.object(pipeline, "PENDING_FETCH_LIMIT", 3):
+            res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
+        self.assertEqual(list(res), [fl.order_id])
+
+    def test_expired_of_disabled_source_still_closed(self):
+        import database
+        old = self.pending_feed_order(sources.KWORK_ID_OFFSET + 95, "kworkru", hours_ago=8)
+        sources.set_enabled(sources.KWORK, False)
+        pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [], fetch_alot=False)
+        self.assertEqual(database.freelance_get(old.order_id)["status"], "expired")
+
+    def test_alot_pending_does_not_take_slots_when_alot_unavailable(self):
+        now = datetime.now(timezone.utc)
+        for i in range(4):
+            o = make_order(2000 + i)
+            o.published_at = now - timedelta(minutes=1 + i)
+            pipeline.save_order(pipeline.ScoredOrder(o, None, f"a{i}"), "pending")
+        fl = self.pending_feed_order(sources.FL_ID_OFFSET + 91, "flru", hours_ago=3)
+        with mock.patch.object(pipeline, "PENDING_FETCH_LIMIT", 2),                 mock.patch.object(pipeline, "_fetch_items") as items:
+            res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
+        items.assert_not_called()
+        self.assertEqual(list(res), [fl.order_id])
+
     def test_kwork_pending_restored_when_feed_missing(self):
         kw = self.pending_feed_order(sources.KWORK_ID_OFFSET + 55, "kworkru")
         res = pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [],

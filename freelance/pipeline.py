@@ -281,6 +281,10 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     # простое AI старые строки за пределами лимита висели бы pending
     rows = freelance_pending(PENDING_SCAN_LIMIT)
     live: dict[int, dict] = {}
+    # Какие источники сейчас обрабатываются. Заказы остальных (выключены; alot лежит) в live не
+    # попадают: иначе их очередь заняла бы PENDING_FETCH_LIMIT мест и вытеснила заказы включённых
+    # источников, которые истекли бы без оценки при свободной квоте AI. Просроченные закрываем всегда
+    active = {n: sources.is_enabled(n) and (n != sources.ALOT or fetch_alot) for n in sources.ALL_SOURCES}
     for row in rows:
         oid = row["order_id"]
         if oid in sent_now:
@@ -289,12 +293,14 @@ def _load_pending(threshold: datetime, sent_now: set[int],
         if published is not None and published < threshold:
             freelance_set_status(oid, "expired")
             continue
+        if not active[sources.source_of(oid)]:
+            continue
         if len(live) < PENDING_FETCH_LIMIT:
             live[oid] = row
     if not live:
         return {}
     items: list[dict] = []
-    ids = sorted((i for i in live if fetch_alot and not sources.is_feed_id(i)), reverse=True)  # новые первыми: при сбое сети теряем хвост
+    ids = sorted((i for i in live if not sources.is_feed_id(i)), reverse=True)  # новые первыми: при сбое сети теряем хвост
     for i in range(0, len(ids), PENDING_BATCH):
         try:
             items += _fetch_items(ids[i:i + PENDING_BATCH])
@@ -315,8 +321,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
         o = _order_from_dict(oid, stored[str(oid)]) if isinstance(stored[str(oid)], dict) else None
         if o is not None:
             feed_by_id[oid] = o
-    fetched += [o for oid, o in feed_by_id.items()
-                if oid in live and sources.is_enabled(sources.source_of(oid))]
+    fetched += [o for oid, o in feed_by_id.items() if oid in live]
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
         if order.order_id not in live:
