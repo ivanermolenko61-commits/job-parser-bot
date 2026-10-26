@@ -49,7 +49,7 @@ from freelance.alot_client import (
     find_upper_bound,
     site_name,
 )
-from freelance.filters import is_candidate, norm_dedup_key, priority
+from freelance.filters import is_candidate, norm_dedup_key, priority, reject_reason
 from health import monitor
 
 DEDUP_DAYS = 3
@@ -262,6 +262,41 @@ def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOr
     return result
 
 
+_PREFILTER_LOG_MAX = 2000
+_prefilter_logged: set[int] = set()
+
+
+def _log_dropped(order: FreelanceOrder, why: str) -> None:
+    """Отсев заказа Youdo - в лог (с причиной), чтобы потерю можно было разобрать по логу.
+    Контакты в названии маскируем: заказ в лог попадает целиком."""
+    if order.site == "youdoru":
+        title = ai_scorer.mask_contacts(order.title or "")[:80]
+        logging.info(f"[FREELANCE] отсеян: {why}, {order.site} {order.order_id}, {title!r}")
+
+
+def _prefilter(orders) -> list[FreelanceOrder]:
+    """Префильтр с учётом причин: причины в сводку цикла, а отсев Youdo и по стоп-словам -
+    в лог один раз на заказ (скан каждый цикл перечитывает хвост окна)."""
+    passed: list[FreelanceOrder] = []
+    reasons: dict[str, int] = {}
+    for o in orders:
+        why = reject_reason(o)
+        if why is None:
+            passed.append(o)
+            continue
+        key = why.split(":", 1)[0]
+        reasons[key] = reasons.get(key, 0) + 1
+        if (o.site == "youdoru" or key == "stop_word") and o.order_id not in _prefilter_logged:
+            if len(_prefilter_logged) >= _PREFILTER_LOG_MAX:
+                _prefilter_logged.clear()
+            _prefilter_logged.add(o.order_id)
+            title = ai_scorer.mask_contacts(o.title or "")[:80]
+            logging.info(f"[FREELANCE] префильтр: {why}, {o.site} {o.order_id}, {title!r}")
+    if reasons:
+        logging.info(f"[FREELANCE] префильтр отсеял: {reasons}")
+    return passed
+
+
 def _prepare_cycle() -> CycleResult:
     started = time.monotonic()
     res = CycleResult()
@@ -326,7 +361,7 @@ def _prepare_cycle() -> CycleResult:
 
     # Свежесть, префильтр, уже виденные
     threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
-    fresh = [o for o in scan.orders if o.published_at >= threshold and is_candidate(o)]
+    fresh = _prefilter(o for o in scan.orders if o.published_at >= threshold)
     seen = freelance_seen_ids([o.order_id for o in fresh])
     fresh = [o for o in fresh if o.order_id not in seen and o.order_id not in sent_now]
 
@@ -355,9 +390,11 @@ def _prepare_cycle() -> CycleResult:
         if (existing is None and k in known) or (existing is not None and k in known_sent):
             # дубль уже отправленного/оценённого заказа: запоминаем сразу
             # (для pending статус pending меняется на rejected)
+            _log_dropped(o, "дубль отправленного/оценённого")
             _save_retry(existing or ScoredOrder(o, None, k), "rejected")
         elif k and k in first_id:
             # дубль внутри пачки: сохраним в finish_cycle, если оригинал обработан
+            _log_dropped(o, f"дубль заказа {first_id[k]} в этой пачке")
             res.batch_dups.append((existing or ScoredOrder(o, None, k), first_id[k]))
         else:
             if k:
