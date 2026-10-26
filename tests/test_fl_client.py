@@ -156,14 +156,39 @@ class PendingFlTest(CycleTestBase):
         self.assertEqual(list(res), [oid])
         self.assertEqual(res[oid].attempts, 1)
 
-    def test_fl_pending_missing_from_rss_stays_pending(self):
+    def save_pending(self, oid, published, attempts=2):
+        import database
+        database.freelance_save(oid, "flru", "Парсер сайта", f"https://www.fl.ru/projects/{oid}/",
+                                "3 000 ₽", published.isoformat(), "dk", None, "", "pending",
+                                attempts=attempts)
+
+    def test_fl_pending_fell_out_of_feed_is_restored_from_db(self):
+        # оценка отложена (квота), лента прокрутилась и заказа в ней уже нет
         oid = fl_client.FL_ID_OFFSET + 778
         now = datetime.now(timezone.utc)
-        row = {"order_id": oid, "published_at": now.isoformat(), "ai_json": None}
-        with mock.patch.object(pipeline, "freelance_pending", return_value=[row]), \
-                mock.patch.object(pipeline, "freelance_set_status") as st:
-            self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
-        st.assert_not_called()
+        self.save_pending(oid, now - timedelta(hours=2))
+        res = pipeline._load_pending(now - timedelta(hours=6), set(), [])
+        self.assertEqual(list(res), [oid])
+        sc = res[oid]
+        self.assertEqual((sc.order.title, sc.order.site, sc.order.price_text),
+                         ("Парсер сайта", "flru", "3 000 ₽"))
+        self.assertEqual((sc.attempts, sc.dedup), (2, "dk"))
+        self.assertIsNone(sc.ai)
+
+    def test_fl_pending_restored_when_rss_failed(self):
+        oid = fl_client.FL_ID_OFFSET + 779
+        now = datetime.now(timezone.utc)
+        self.save_pending(oid, now - timedelta(hours=1))
+        res = pipeline._load_pending(now - timedelta(hours=6), set(), None)
+        self.assertEqual(list(res), [oid])
+
+    def test_fl_pending_expired_is_not_restored(self):
+        import database
+        oid = fl_client.FL_ID_OFFSET + 780
+        now = datetime.now(timezone.utc)
+        self.save_pending(oid, now - timedelta(hours=7))
+        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
+        self.assertEqual(database.freelance_get(oid)["status"], "expired")
 
 
 if __name__ == "__main__":

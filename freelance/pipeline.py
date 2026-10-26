@@ -34,6 +34,7 @@ from config import (
 )
 from database import (
     freelance_dup_keys,
+    freelance_get,
     freelance_pending,
     freelance_save,
     freelance_seen_ids,
@@ -214,7 +215,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает.
 
     Заказы alot.pro дозапрашиваются по id, заказы FL.ru берутся из свежего RSS цикла
-    (fl_orders): выпавшие из ленты остаются pending до истечения срока."""
+    (fl_orders), а выпавшие из ленты восстанавливаются из БД."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
     # простое AI старые строки за пределами лимита висели бы pending
     rows = freelance_pending(PENDING_SCAN_LIMIT)
@@ -242,8 +243,6 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             break
     fetched = [o for o in (_parse_item(item) for item in items) if o]
     fetched += [o for o in (fl_orders or []) if o.order_id in live]
-    if not fetched:
-        return {}
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
         if order.order_id not in live:
@@ -267,6 +266,19 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             order, ai, row.get("dedup_key") or norm_dedup_key(order),
             attempts=int(row.get("attempts") or 0),
         )
+    # FL.ru: заказ выпал из ленты (всплеск заказов) или RSS не получен, а оценка ещё не прошла.
+    # Восстанавливаем из БД (название, ссылка, цена, время; описания там нет) - иначе он
+    # дожил бы до истечения срока, так и не получив оценки
+    in_feed = {o.order_id for o in fetched}
+    for oid, row in live.items():
+        if not is_fl_id(oid) or oid in in_feed:
+            continue
+        full = freelance_get(oid)
+        if not full:
+            continue
+        restored = scored_from_row(full)
+        restored.attempts = int(row.get("attempts") or 0)
+        result[oid] = restored
     return result
 
 
