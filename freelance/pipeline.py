@@ -309,13 +309,23 @@ def feed_lag(orders, now: datetime | None = None):
     return newest, (now - newest).total_seconds() / 3600, (max(youdo) if youdo else None)
 
 
+_feed_seen: dict = {"newest": None}   # самый новый заказ, когда-либо увиденный в выдаче этим процессом
+
+
 def _report_feed_freshness(scan, now: datetime | None = None, threshold: float = ALOT_STALE_HOURS) -> None:
     """Оповещение «выдача alot.pro отстаёт»: alot.pro сам запаздывает с заказами (например, на 5-7 часов), и тогда бот
-    «молчит» не по своей вине. Серия плохих проверок и сообщение о восстановлении - в health.monitor (в памяти процесса)."""
+    «молчит» не по своей вине. Серия плохих проверок и сообщение о восстановлении - в health.monitor (в памяти процесса).
+    Окно скана обычно перечитывает последние ~100 id и не пустеет; если всё же пустое, судим по самому новому
+    заказу, который процесс видел раньше (после рестарта памяти нет - тогда пустое окно ничего не говорит)."""
+    now = now or datetime.now(timezone.utc)
     lag = feed_lag(scan.orders, now)
-    if lag is None:
-        return   # пустое окно: серию не трогаем (сбой скана учитывается отдельным источником "alot")
-    newest, hours, youdo = lag
+    youdo = lag[2] if lag else None
+    candidates = [t for t in (lag[0] if lag else None, _feed_seen["newest"]) if t is not None]
+    if not candidates:
+        return   # ни этого окна, ни истории: судить не по чему (сбой скана учитывается отдельным источником "alot")
+    newest = max(candidates)
+    _feed_seen["newest"] = newest
+    hours = (now - newest).total_seconds() / 3600
     stale = hours > threshold
     reason = None
     if stale:

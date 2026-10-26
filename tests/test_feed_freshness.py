@@ -43,6 +43,9 @@ class ReportFreshnessTest(unittest.TestCase):
         p = mock.patch.object(pipeline, "monitor", self.mon)
         p.start()
         self.addCleanup(p.stop)
+        p2 = mock.patch.dict(pipeline._feed_seen, {"newest": None})
+        p2.start()
+        self.addCleanup(p2.stop)
 
     def cycles(self, n, sc, threshold=3.0):
         for _ in range(n):
@@ -74,25 +77,66 @@ class ReportFreshnessTest(unittest.TestCase):
         self.assertIn("снова свежая", recovered[0])
         self.assertEqual(self.cycles(3, fresh), [])
 
+    def forget(self):
+        """Новый процесс: пустой монитор и нет запомненных заказов."""
+        self.mon.streak.clear()
+        self.mon._alerted.clear()
+        self.mon._pending.clear()
+        pipeline._feed_seen["newest"] = None
+
     def test_threshold_is_strict_and_configurable(self):
         self.assertEqual(self.cycles(4, scan(order(1, 3.0)), threshold=3.0), [])     # ровно порог - не отставание
+        self.forget()
         self.assertEqual(len(self.cycles(3, scan(order(2, 3.1)), threshold=3.0)), 1)
-        self.setUp()
+        self.forget()
         self.assertEqual(len(self.cycles(3, scan(order(3, 2.0)), threshold=1.0)), 1)
 
     def test_no_youdo_in_window_is_said_explicitly(self):
         alerts = self.cycles(3, scan(order(1, 6, "kworkru")))
         self.assertIn("заказов Youdo в просмотренном окне нет", alerts[0])
 
-    def test_empty_window_does_not_touch_the_series(self):
+    def test_empty_window_without_history_is_silent(self):
+        self.assertEqual(self.cycles(6, scan()), [])                 # ни окна, ни истории: судить не по чему
+        self.assertEqual(self.mon.streaks().get("alot_feed", 0), 0)
+
+    def test_empty_window_after_a_stale_scan_continues_the_series(self):
         stale = scan(order(1, 7))
         self.cycles(2, stale)
-        self.assertEqual(self.cycles(5, scan()), [])                 # пустое окно - не доказательство
-        self.assertEqual(len(self.cycles(1, stale)), 1)              # серия сохранилась: третья плохая проверка
+        self.assertEqual(len(self.cycles(1, scan())), 1)             # пустое окно: судим по запомненному заказу
+
+    def test_fresh_scan_then_empty_scans_after_threshold_alert(self):
+        """Свежий заказ был, потом заказы перестали приходить и окна опустели: по прошествии порога - оповещение."""
+        pipeline._report_feed_freshness(scan(order(1, 0.5)), now=NOW, threshold=3.0)
+        later = NOW + timedelta(hours=4)                             # заказу уже 4.5 ч
+        for _ in range(2):
+            pipeline._report_feed_freshness(scan(), now=later, threshold=3.0)
+        self.assertEqual(self.mon.pop_alerts(), [])
+        pipeline._report_feed_freshness(scan(), now=later, threshold=3.0)
+        alerts = self.mon.pop_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("4.5 ч назад", alerts[0])
+
+    def test_empty_scans_before_threshold_stay_silent(self):
+        pipeline._report_feed_freshness(scan(order(1, 0.5)), now=NOW, threshold=3.0)
+        for _ in range(5):
+            pipeline._report_feed_freshness(scan(), now=NOW + timedelta(hours=1), threshold=3.0)
+        self.assertEqual(self.mon.pop_alerts(), [])
+
+    def test_older_window_does_not_move_remembered_newest_back(self):
+        pipeline._report_feed_freshness(scan(order(1, 0.5)), now=NOW, threshold=3.0)
+        pipeline._report_feed_freshness(scan(order(2, 6)), now=NOW, threshold=3.0)   # окно старше запомненного
+        self.assertEqual(pipeline._feed_seen["newest"], NOW - timedelta(hours=0.5))
+        self.assertEqual(self.mon.pop_alerts(), [])
 
 
 class CycleIntegrationTest(CycleTestBase):
     """Оповещение встроено в цикл: в health.monitor идёт источник alot_feed, а сбой проверки цикл не ломает."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.dict(pipeline._feed_seen, {"newest": None})   # как новый процесс: заказов в памяти нет
+        p.start()
+        self.addCleanup(p.stop)
 
     def feed_calls(self):
         return [c for c in pipeline.monitor.record.call_args_list if c.args and c.args[0] == "alot_feed"]
