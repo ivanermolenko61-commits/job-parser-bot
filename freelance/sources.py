@@ -39,6 +39,15 @@ def source_of(order_id: int) -> str:
     return ALOT
 
 
+_INF = 1 << 62
+_RANGES = {ALOT: (0, FL_ID_OFFSET), FLRU: (FL_ID_OFFSET, KWORK_ID_OFFSET), KWORK: (KWORK_ID_OFFSET, _INF)}
+
+
+def id_ranges(names) -> list[tuple[int, int]]:
+    """Полуинтервалы order_id заказов указанных источников."""
+    return [_RANGES[n] for n in names]
+
+
 def _disabled_in_db() -> set[str]:
     raw = kv_get(_OFF_KEY, "") or ""
     return {s for s in raw.split(",") if s in ALL_SOURCES}

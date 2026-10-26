@@ -279,21 +279,24 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     ленты - из сохранённых полных заказов (_feed_store_*)."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
     # простое AI старые строки за пределами лимита висели бы pending
-    rows = freelance_pending(PENDING_SCAN_LIMIT)
-    live: dict[int, dict] = {}
     # Какие источники сейчас обрабатываются. Заказы остальных (выключены; alot лежит) в live не
-    # попадают: иначе их очередь заняла бы PENDING_FETCH_LIMIT мест и вытеснила заказы включённых
+    # попадают и не занимают лимиты выборки: иначе их очередь вытеснила бы заказы включённых
     # источников, которые истекли бы без оценки при свободной квоте AI. Просроченные закрываем всегда
     active = {n: sources.is_enabled(n) and (n != sources.ALOT or fetch_alot) for n in sources.ALL_SOURCES}
-    for row in rows:
+    inactive = [n for n in sources.ALL_SOURCES if not active[n]]
+    live: dict[int, dict] = {}
+    if inactive:
+        for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive)):
+            published = _parse_dt(row["published_at"])
+            if row["order_id"] not in sent_now and published is not None and published < threshold:
+                freelance_set_status(row["order_id"], "expired")
+    for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive), exclude_ranges=True):
         oid = row["order_id"]
         if oid in sent_now:
             continue
         published = _parse_dt(row["published_at"])
         if published is not None and published < threshold:
             freelance_set_status(oid, "expired")
-            continue
-        if not active[sources.source_of(oid)]:
             continue
         if len(live) < PENDING_FETCH_LIMIT:
             live[oid] = row

@@ -155,13 +155,14 @@ class CycleWithSwitchesTest(CycleTestBase):
         pipeline.monitor.record.assert_any_call("kwork", 0, mock.ANY, label="Источник фриланс-заказов Kwork")
 
     def test_pending_alot_not_fetched_when_fetch_alot_false(self):
-        oid = 1234
-        now = datetime.now(timezone.utc)
-        row = {"order_id": oid, "published_at": now.isoformat(), "ai_json": None}
-        with mock.patch.object(pipeline, "freelance_pending", return_value=[row]), \
-                mock.patch.object(pipeline, "_fetch_items") as items:
-            self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False), {})
+        o = make_order(1234)
+        pipeline.save_order(pipeline.ScoredOrder(o, None, "a"), "pending")
+        with mock.patch.object(pipeline, "_fetch_items") as items:
+            res = pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [],
+                                         fetch_alot=False)
         items.assert_not_called()
+        self.assertEqual(res, {})
+        self.assertEqual(database.freelance_get(1234)["status"], "pending")   # дождётся alot
 
     def pending_feed_order(self, oid, site, hours_ago=1):
         order = make_order(oid)
@@ -192,6 +193,29 @@ class CycleWithSwitchesTest(CycleTestBase):
         with mock.patch.object(pipeline, "PENDING_FETCH_LIMIT", 3):
             res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
         self.assertEqual(list(res), [fl.order_id])
+
+    def test_disabled_source_queue_larger_than_scan_limit(self):
+        # очередь выключенного источника больше PENDING_SCAN_LIMIT; заказ включённого - за ней
+        now = datetime.now(timezone.utc)
+        for i in range(6):
+            o = make_order(sources.KWORK_ID_OFFSET + 200 + i)
+            o.site, o.published_at = "kworkru", now - timedelta(minutes=5 + i)
+            pipeline.save_order(pipeline.ScoredOrder(o, None, f"kq{i}"), "pending")
+        fl = self.pending_feed_order(sources.FL_ID_OFFSET + 92, "flru", hours_ago=3)
+        sources.set_enabled(sources.KWORK, False)
+        with mock.patch.object(pipeline, "PENDING_SCAN_LIMIT", 3):
+            res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
+        self.assertEqual(list(res), [fl.order_id])
+
+    def test_pending_ranges_query(self):
+        for oid in (5, sources.FL_ID_OFFSET + 5, sources.KWORK_ID_OFFSET + 5):
+            pipeline.save_order(pipeline.ScoredOrder(make_order(oid), None, f"d{oid}"), "pending")
+        only = database.freelance_pending(10, sources.id_ranges([sources.KWORK, sources.ALOT]))
+        self.assertEqual(sorted(r["order_id"] for r in only), [5, sources.KWORK_ID_OFFSET + 5])
+        rest = database.freelance_pending(10, sources.id_ranges([sources.KWORK, sources.ALOT]),
+                                          exclude_ranges=True)
+        self.assertEqual([r["order_id"] for r in rest], [sources.FL_ID_OFFSET + 5])
+        self.assertEqual(len(database.freelance_pending(10)), 3)
 
     def test_expired_of_disabled_source_still_closed(self):
         import database
