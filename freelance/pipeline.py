@@ -214,7 +214,6 @@ def scored_from_row(row: dict) -> ScoredOrder:
 # одному названию нельзя (отказ окончателен). Хранится одним ключом kv (без изменения схемы БД),
 # перезаписывается целиком и чистится по возрасту заказа - не растёт.
 FEED_STORE_KEY = "freelance_feed_pending"
-FEED_STORE_BODY_LIMIT = 2000
 _feed_store_lock = threading.Lock()
 
 
@@ -227,7 +226,10 @@ def _feed_store_read() -> dict[str, dict]:
 
 
 def _order_to_dict(o: FreelanceOrder) -> dict:
-    return {"site": o.site, "title": o.title, "body": (o.body or "")[:FEED_STORE_BODY_LIMIT],
+    # ровно то, что увидит AI (_user_prompt: mask_contacts, затем BODY_LIMIT; маскирование идемпотентно),
+    # поэтому оценка после восстановления не теряет текста; контакты заказчика в БД не попадают
+    body = ai_scorer.mask_contacts(o.body or "")[:ai_scorer.BODY_LIMIT]
+    return {"site": o.site, "title": o.title, "body": body,
             "price_text": o.price_text, "price_value": o.price_value, "categories": list(o.categories),
             "published_at": o.published_at.isoformat(), "url": o.url}
 

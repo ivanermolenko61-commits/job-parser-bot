@@ -229,10 +229,26 @@ class PendingFlTest(CycleTestBase):
         with mock.patch.object(pipeline, "kv_set", side_effect=OSError("db")):
             pipeline.save_order(pipeline.ScoredOrder(order, None, "dk"), "pending")   # не падает
 
-    def test_store_body_is_capped(self):
-        order = self.pending_order(6, desc="я" * 5000)
-        stored = pipeline._feed_store_read()[str(order.order_id)]
-        self.assertEqual(len(stored["body"]), pipeline.FEED_STORE_BODY_LIMIT)
+    def test_store_keeps_exactly_what_ai_sees_and_no_contacts(self):
+        from freelance import ai_scorer
+        desc = ("Звоните +7 (999) 123-45-67, пишите ivan@mail.ru. Нужен парсер сайта. " * 80
+                + "ГЛАВНОЕ ТРЕБОВАНИЕ В КОНЦЕ")
+        order = self.pending_order(6, desc=desc)
+        stored = pipeline._feed_store_read()[str(order.order_id)]["body"]
+        seen_by_ai = ai_scorer.mask_contacts(order.body)[:ai_scorer.BODY_LIMIT]
+        self.assertEqual(stored, seen_by_ai)
+        self.assertNotIn("123-45-67", stored)
+        self.assertNotIn("ivan@mail.ru", stored)
+        # после восстановления AI получает тот же текст, что и без перезапуска
+        restored = pipeline._load_pending(self.floor(), set(), [])[order.order_id].order
+        self.assertEqual(ai_scorer.mask_contacts(restored.body)[:ai_scorer.BODY_LIMIT], seen_by_ai)
+
+    def test_store_follows_configured_body_limit(self):
+        from freelance import ai_scorer
+        with mock.patch.object(ai_scorer, "BODY_LIMIT", 3000):
+            order = self.pending_order(7, desc="я" * 5000)
+        stored = pipeline._feed_store_read()[str(order.order_id)]["body"]
+        self.assertEqual(len(stored), 3000)
 
 
 if __name__ == "__main__":
