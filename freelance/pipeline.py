@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 from config import (
     ALOT_SEED_ID,
+    FL_RSS_ENABLED,
     FREELANCE_MAX_AGE_HOURS,
     FREELANCE_MIN_FIT,
 )
@@ -43,12 +44,14 @@ from database import (
 from freelance import ai_scorer, pricing, yandex_budget
 from freelance.alot_client import (
     FreelanceOrder,
+    ScanResult,
     _fetch_items,
     _parse_item,
     fetch_new_orders,
     find_upper_bound,
     site_name,
 )
+from freelance.fl_client import fetch_fl_orders, is_fl_id
 from freelance.filters import is_candidate, norm_dedup_key, priority, reject_reason
 from health import monitor
 
@@ -206,8 +209,12 @@ def scored_from_row(row: dict) -> ScoredOrder:
     return ScoredOrder(order, ai, row.get("dedup_key") or "")
 
 
-def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOrder]:
-    """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает по id."""
+def _load_pending(threshold: datetime, sent_now: set[int],
+                  fl_orders: list[FreelanceOrder] | None = None) -> dict[int, ScoredOrder]:
+    """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает.
+
+    Заказы alot.pro дозапрашиваются по id, заказы FL.ru берутся из свежего RSS цикла
+    (fl_orders): выпавшие из ленты остаются pending до истечения срока."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
     # простое AI старые строки за пределами лимита висели бы pending
     rows = freelance_pending(PENDING_SCAN_LIMIT)
@@ -225,7 +232,7 @@ def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOr
     if not live:
         return {}
     items: list[dict] = []
-    ids = sorted(live, reverse=True)  # новые первыми: при сбое сети теряем хвост, а не голову
+    ids = sorted((i for i in live if not is_fl_id(i)), reverse=True)  # новые первыми: при сбое сети теряем хвост
     for i in range(0, len(ids), PENDING_BATCH):
         try:
             items += _fetch_items(ids[i:i + PENDING_BATCH])
@@ -233,12 +240,13 @@ def _load_pending(threshold: datetime, sent_now: set[int]) -> dict[int, ScoredOr
             # Сеть/alot недоступны: pending остаются в БД и будут запрошены в следующий раз
             logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
             break
-    if not items:
+    fetched = [o for o in (_parse_item(item) for item in items) if o]
+    fetched += [o for o in (fl_orders or []) if o.order_id in live]
+    if not fetched:
         return {}
     result: dict[int, ScoredOrder] = {}
-    for item in items:
-        order = _parse_item(item)
-        if order is None or order.order_id not in live:
+    for order in fetched:
+        if order.order_id not in live:
             continue
         row = live[order.order_id]
         if order.published_at < threshold:
@@ -297,6 +305,20 @@ def _prefilter(orders) -> list[FreelanceOrder]:
     return passed
 
 
+def _fetch_fl_orders() -> list[FreelanceOrder]:
+    """Заказы FL.ru. Сбой не роняет цикл: пишется в health (ключ flru), возвращается []."""
+    if not FL_RSS_ENABLED:
+        return []
+    try:
+        orders = fetch_fl_orders()
+    except Exception as e:
+        logging.exception("[FREELANCE] ошибка получения заказов FL.ru")
+        monitor.record("flru", 0, e, label="Источник фриланс-заказов FL.ru")
+        return []
+    monitor.record("flru", len(orders), label="Источник фриланс-заказов FL.ru")
+    return orders
+
+
 def _prepare_cycle() -> CycleResult:
     started = time.monotonic()
     res = CycleResult()
@@ -327,51 +349,60 @@ def _prepare_cycle() -> CycleResult:
             logging.info(f"[FREELANCE] первый запуск: граница id={top}, "
                          f"берём последние {FIRST_RUN_LOOKBACK} id")
         scan = fetch_new_orders(last_id, max_ahead=max_ahead)
+        alot_ok = True
     except Exception as e:
         logging.exception("[FREELANCE] ошибка получения заказов")
         monitor.record("alot", 0, e, label="Источник фриланс-заказов alot.pro")
-        res.error = f"{type(e).__name__}: {e}"
-        return res
+        alot_ok = False
+        fl_orders = _fetch_fl_orders()
+        if not fl_orders:
+            res.error = f"{type(e).__name__}: {e}"
+            return res
+        # alot лежит, но FL.ru отдал заказы: работаем по ним (курсор alot не трогаем)
+        scan = ScanResult()
+    if alot_ok:
+        fl_orders = _fetch_fl_orders()
 
-    # Скан, который раз за разом обрывается сбоем и не продвигает курсор, - не норма:
-    # новые заказы не загружаются. После PARTIAL_ALERT_CYCLES циклов - ошибка в health
-    # (оповещение) и счёт застоя, чтобы со временем пересчитать границу.
-    partial_streak = int(kv_get("freelance_partial", "0") or 0)
-    partial_streak = partial_streak + 1 if (scan.partial and scan.max_id <= last_id) else 0
-    kv_set("freelance_partial", partial_streak)
-    stuck = partial_streak >= PARTIAL_ALERT_CYCLES
-    if stuck:
-        monitor.record("alot", 0, RuntimeError(
-            f"скан обрывается сбоем alot.pro {partial_streak} циклов подряд, новые заказы не загружаются"),
-            label="Источник фриланс-заказов alot.pro")
-    else:
-        monitor.record("alot", scan.raw_count, label="Источник фриланс-заказов alot.pro")
-    res.raw_count = scan.raw_count
-    res.new_last_id = max(last_id, scan.max_id)  # курсор только вперёд
-    kv_set("freelance_last_raw", scan.raw_count)
-    stale = int(kv_get("freelance_stale", "0") or 0)
-    if scan.max_id > last_id:
-        kv_set("freelance_stale", 0)
-    elif not scan.partial or stuck:
-        # единичный оборванный скан не признак застоя: до границы просто не дошли
-        kv_set("freelance_stale", stale + 1)
+        # Скан, который раз за разом обрывается сбоем и не продвигает курсор, - не норма:
+        # новые заказы не загружаются. После PARTIAL_ALERT_CYCLES циклов - ошибка в health
+        # (оповещение) и счёт застоя, чтобы со временем пересчитать границу.
+        partial_streak = int(kv_get("freelance_partial", "0") or 0)
+        partial_streak = partial_streak + 1 if (scan.partial and scan.max_id <= last_id) else 0
+        kv_set("freelance_partial", partial_streak)
+        stuck = partial_streak >= PARTIAL_ALERT_CYCLES
+        if stuck:
+            monitor.record("alot", 0, RuntimeError(
+                f"скан обрывается сбоем alot.pro {partial_streak} циклов подряд, новые заказы не загружаются"),
+                label="Источник фриланс-заказов alot.pro")
+        else:
+            monitor.record("alot", scan.raw_count, label="Источник фриланс-заказов alot.pro")
+        res.new_last_id = max(last_id, scan.max_id)  # курсор только вперёд
+        stale = int(kv_get("freelance_stale", "0") or 0)
+        if scan.max_id > last_id:
+            kv_set("freelance_stale", 0)
+        elif not scan.partial or stuck:
+            # единичный оборванный скан не признак застоя: до границы просто не дошли
+            kv_set("freelance_stale", stale + 1)
+    res.raw_count = scan.raw_count + len(fl_orders)
+    kv_set("freelance_last_raw", res.raw_count)
 
     with _sent_lock:
         sent_now = set(_sent_ids)
 
-    # Свежесть, префильтр, уже виденные
+    # Свежесть, префильтр, уже виденные (заказы alot.pro и FL.ru - в одном потоке)
     threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
-    fresh = _prefilter(o for o in scan.orders if o.published_at >= threshold)
+    fresh = _prefilter(o for o in [*scan.orders, *fl_orders] if o.published_at >= threshold)
     seen = freelance_seen_ids([o.order_id for o in fresh])
     fresh = [o for o in fresh if o.order_id not in seen and o.order_id not in sent_now]
 
-    # Pending: дозапрашиваем по id и добавляем к кандидатам
-    pending = _load_pending(threshold, sent_now)
+    # Pending: alot дозапрашиваем по id, FL.ru берём из RSS этого цикла
+    pending = _load_pending(threshold, sent_now, fl_orders)
     res.pending_loaded = len(pending)
 
     pool_orders: list[tuple[FreelanceOrder, ScoredOrder | None]] = [(o, None) for o in fresh]
     pool_orders += [(sc.order, sc) for sc in pending.values()]
-    pool_orders.sort(key=lambda t: t[0].order_id, reverse=True)  # новые первыми
+    # новые первыми: по времени публикации (id FL.ru и alot.pro несравнимы), при равенстве по id
+    pool_orders.sort(key=lambda t: (t[0].published_at, t[0].order_id), reverse=True)
 
     # Дубли: в БД за DEDUP_DAYS и внутри самой выборки
     keys = {o.order_id: (sc.dedup if sc else norm_dedup_key(o)) for o, sc in pool_orders}
@@ -409,7 +440,8 @@ def _prepare_cycle() -> CycleResult:
     # Очередь: сначала группа приоритета 1 (см. filters.priority), внутри группы новые первыми.
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
-    to_score.sort(key=lambda sc: (priority(sc.order), -sc.order.order_id))
+    to_score.sort(key=lambda sc: (priority(sc.order), -sc.order.published_at.timestamp(),
+                                  -sc.order.order_id))
     # Квоты нет ни у кого: не дёргаем провайдеров (каждая попытка была бы «сбоем» и
     # через 3 цикла - ложным «AI не работает»), заказы ждут в pending
     res.quota_out = ai_scorer.quota_exhausted() if to_score else None
@@ -486,7 +518,7 @@ def _prepare_cycle() -> CycleResult:
 
     quota_note = f", квота пуста до {res.quota_out.astimezone(MSK):%H:%M}" if res.quota_out else ""
     logging.info(
-        f"[FREELANCE] скан: {scan.raw_count}, pending: {res.pending_loaded}, "
+        f"[FREELANCE] скан: {res.raw_count}, pending: {res.pending_loaded}, "
         f"кандидатов: {len(candidates)}, к отправке: {len(res.to_send)}, "
         f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)} "
         f"(из них в резерве квоты: {res.reserved}{quota_note}), "

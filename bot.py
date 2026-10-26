@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from config import (
     CHECK_INTERVAL_MINUTES,
+    FL_RSS_ENABLED,
     FREELANCE_INTERVAL_MINUTES,
     FREELANCE_MAX_AGE_HOURS,
     FREELANCE_MAX_PER_CYCLE,
@@ -111,7 +112,7 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 # Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
-FREELANCE_HEALTH_SOURCES = {"alot", "gemini", "memory"}  # memory - не парсер вакансий
+FREELANCE_HEALTH_SOURCES = {"alot", "flru", "gemini", "memory"}  # memory - не парсер вакансий
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -677,6 +678,13 @@ def _freelance_status_text() -> str:
         lines.append(f"🔴 alot.pro: неудачных проверок подряд: {streak} ({reason})")
     else:
         lines.append("🟢 alot.pro: работает")
+    if FL_RSS_ENABLED:
+        fl_streak = monitor.streak.get("flru", 0)
+        if fl_streak:
+            reason = html.escape(monitor.last_reason.get("flru", ""))
+            lines.append(f"🔴 FL.ru: неудачных проверок подряд: {fl_streak} ({reason})")
+        else:
+            lines.append("🟢 FL.ru: работает")
     return "\n".join(lines)
 
 

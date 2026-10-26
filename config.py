@@ -74,6 +74,9 @@ DB_PATH = os.getenv("DB_PATH", "vacancies.db")
 # Якорь для поиска верхней границы id (заведомо старше текущих заказов)
 ALOT_SEED_ID = 17328000
 FREELANCE_INTERVAL_MINUTES = 5
+# Второй источник заказов - RSS FL.ru (работает независимо от alot.pro; FL_RSS_ENABLED=0 выключает)
+FL_RSS_ENABLED = os.getenv("FL_RSS_ENABLED", "1").strip().lower() not in ("0", "false", "no", "")
+FL_RSS_URL = os.getenv("FL_RSS_URL", "https://www.fl.ru/rss/all.xml")
 # Минимальная AI-оценка (0-10), с которой заказ отправляется
 FREELANCE_MIN_FIT = 5
 # Заказы старше этого возраста не отправляются (API alot.pro не отдаёт статус
