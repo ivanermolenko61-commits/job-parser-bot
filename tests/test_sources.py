@@ -164,17 +164,14 @@ class CycleWithSwitchesTest(CycleTestBase):
         items.assert_not_called()
 
     def pending_feed_order(self, oid, site, hours_ago=1):
-        now = datetime.now(timezone.utc)
         order = make_order(oid)
-        order.site, order.published_at = site, now - timedelta(hours=hours_ago)
-        database.freelance_save(oid, site, order.title, f"https://x/{oid}", "", order.published_at.isoformat(),
-                                "dk" + site, None, "", "pending")
+        order.site, order.published_at = site, datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        pipeline.save_order(pipeline.ScoredOrder(order, None, "dk" + site), "pending")
         return order
 
     def test_pending_of_disabled_source_not_restored(self):
         fl = self.pending_feed_order(sources.FL_ID_OFFSET + 70, "flru")
         kw = self.pending_feed_order(sources.KWORK_ID_OFFSET + 71, "kworkru")
-        pipeline._remember_feed([fl, kw])
         floor = datetime.now(timezone.utc) - timedelta(hours=6)
         sources.set_enabled(sources.KWORK, False)
         self.assertEqual(list(pipeline._load_pending(floor, set(), [], fetch_alot=False)), [fl.order_id])
@@ -183,18 +180,12 @@ class CycleWithSwitchesTest(CycleTestBase):
         sources.set_enabled(sources.KWORK, True)
         self.assertEqual(list(pipeline._load_pending(floor, set(), [], fetch_alot=False)), [kw.order_id])
 
-    def test_kwork_pending_restored_from_memory_when_feed_missing(self):
+    def test_kwork_pending_restored_when_feed_missing(self):
         kw = self.pending_feed_order(sources.KWORK_ID_OFFSET + 55, "kworkru")
-        pipeline._remember_feed([kw])
         res = pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [],
                                      fetch_alot=False)
         self.assertEqual(list(res), [kw.order_id])
-        self.assertEqual(res[kw.order_id].order.site, "kworkru")
-
-    def test_cycle_remembers_feed_for_later_cycles(self):
-        order = self.kwork_order(9100)
-        self.run_cycle(feed=[order])
-        self.assertIn(order.order_id, pipeline._feed_cache)
+        self.assertEqual((res[kw.order_id].order.site, res[kw.order_id].order.body), ("kworkru", "нужен бот"))
 
 
 class AlotWakeUpHintTest(CycleTestBase):

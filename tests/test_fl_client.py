@@ -157,57 +157,82 @@ class PendingFlTest(CycleTestBase):
         self.assertEqual(list(res), [oid])
         self.assertEqual(res[oid].attempts, 1)
 
-    def save_pending(self, oid, published, attempts=2):
-        import database
-        database.freelance_save(oid, "flru", "Парсер сайта", f"https://www.fl.ru/projects/{oid}/",
-                                "3 000 ₽", published.isoformat(), "dk", None, "", "pending",
-                                attempts=attempts)
+    def pending_order(self, pid, desc="полное описание задачи", hours_ago=1, attempts=2):
+        """FL-заказ, сохранённый как pending обычным путём (save_order): в БД и в хранилище описаний."""
+        when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        order = fl_client.parse_rss(rss(item(oid=pid, desc=desc, when=when)))[0]
+        pipeline.save_order(pipeline.ScoredOrder(order, None, "dk", attempts), "pending")
+        return order
 
-    def test_fl_pending_fell_out_of_feed_is_restored_with_description(self):
-        # оценка отложена (квота), лента прокрутилась и заказа в ней уже нет, но он в памяти цикла
-        oid = fl_client.FL_ID_OFFSET + 778
-        now = datetime.now(timezone.utc)
-        order = fl_client.parse_rss(rss(item(oid=778, desc="полное описание задачи", when=now)))[0]
-        self.save_pending(oid, now - timedelta(hours=2))
-        pipeline._remember_feed([order])
-        res = pipeline._load_pending(now - timedelta(hours=6), set(), [])
-        self.assertEqual(list(res), [oid])
-        sc = res[oid]
-        self.assertEqual(sc.order.body, "полное описание задачи")     # не вслепую по названию
+    def floor(self):
+        return datetime.now(timezone.utc) - timedelta(hours=6)
+
+    def test_fell_out_of_feed_restored_with_description_after_restart(self):
+        # описание сохранено при записи pending; памяти процесса нет (перезапуск), в ленте заказа нет
+        order = self.pending_order(778)
+        res = pipeline._load_pending(self.floor(), set(), [])
+        self.assertEqual(list(res), [order.order_id])
+        sc = res[order.order_id]
+        self.assertEqual(sc.order.body, "полное описание задачи")     # исходное описание, не вслепую
+        self.assertEqual((sc.order.title, sc.order.site, sc.order.url),
+                         (order.title, "flru", order.url))
         self.assertEqual((sc.attempts, sc.dedup), (2, "dk"))
         self.assertIsNone(sc.ai)
 
-    def test_fl_pending_restored_when_feed_failed_this_cycle(self):
-        oid = fl_client.FL_ID_OFFSET + 779
-        now = datetime.now(timezone.utc)
-        order = fl_client.parse_rss(rss(item(oid=779, when=now)))[0]
-        self.save_pending(oid, now - timedelta(hours=1))
-        pipeline._remember_feed([order])
-        res = pipeline._load_pending(now - timedelta(hours=6), set(), None)
-        self.assertEqual(list(res), [oid])
+    def test_restored_when_feed_failed_this_cycle(self):
+        order = self.pending_order(779)
+        res = pipeline._load_pending(self.floor(), set(), None)
+        self.assertEqual(list(res), [order.order_id])
 
-    def test_fl_pending_without_description_is_not_scored_blind(self):
-        # после перезапуска памяти нет, описания в БД нет: заказ ждёт, а не оценивается по названию
+    def test_current_feed_wins_over_stored(self):
+        order = self.pending_order(782, desc="старое описание")
+        fresh = fl_client.parse_rss(rss(item(oid=782, desc="новое описание", when=order.published_at)))[0]
+        res = pipeline._load_pending(self.floor(), set(), [fresh])
+        self.assertEqual(res[order.order_id].order.body, "новое описание")
+
+    def test_pending_without_stored_description_is_not_scored_blind(self):
+        # запись в БД есть, описания нет нигде: заказ ждёт, а не оценивается по названию
         import database
         oid = fl_client.FL_ID_OFFSET + 781
-        now = datetime.now(timezone.utc)
-        self.save_pending(oid, now - timedelta(hours=1))
-        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
+        database.freelance_save(oid, "flru", "Парсер", "https://x", "", datetime.now(timezone.utc).isoformat(),
+                                "dk", None, "", "pending")
+        self.assertEqual(pipeline._load_pending(self.floor(), set(), []), {})
         self.assertEqual(database.freelance_get(oid)["status"], "pending")
 
-    def test_fl_pending_expired_is_marked_expired(self):
+    def test_expired_is_marked_expired(self):
         import database
-        oid = fl_client.FL_ID_OFFSET + 780
-        now = datetime.now(timezone.utc)
-        self.save_pending(oid, now - timedelta(hours=7))
-        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
-        self.assertEqual(database.freelance_get(oid)["status"], "expired")
+        order = self.pending_order(780, hours_ago=7)
+        self.assertEqual(pipeline._load_pending(self.floor(), set(), []), {})
+        self.assertEqual(database.freelance_get(order.order_id)["status"], "expired")
 
-    def test_remember_feed_prunes_old_orders(self):
-        fresh = fl_client.parse_rss(rss(item(oid=1, when=datetime.now(timezone.utc))))[0]
-        old = fl_client.parse_rss(rss(item(oid=2, when=datetime.now(timezone.utc) - timedelta(hours=9))))[0]
-        pipeline._remember_feed([fresh, old])
-        self.assertEqual(list(pipeline._feed_cache), [fresh.order_id])
+    def test_store_forgets_order_when_status_changes_and_prunes_old(self):
+        import database
+        keep = self.pending_order(1)
+        gone = self.pending_order(2)
+        pipeline.save_order(pipeline.ScoredOrder(gone, None, "dk"), "sent")
+        self.assertEqual(list(pipeline._feed_store_read()), [str(keep.order_id)])
+        old = self.pending_order(3, hours_ago=9)      # старше срока: не сохраняется в хранилище
+        self.assertNotIn(str(old.order_id), pipeline._feed_store_read())
+
+    def test_store_ignores_alot_orders(self):
+        pipeline.save_order(pipeline.ScoredOrder(make_order(1234), None, "dk"), "pending")
+        self.assertEqual(pipeline._feed_store_read(), {})
+
+    def test_store_survives_garbage_and_save_failure(self):
+        import database
+        database.kv_set(pipeline.FEED_STORE_KEY, "не json")
+        self.assertEqual(pipeline._feed_store_read(), {})
+        database.kv_set(pipeline.FEED_STORE_KEY, "[1, 2]")
+        self.assertEqual(pipeline._feed_store_read(), {})
+        order = self.pending_order(5)          # перезаписывает мусор нормальным значением
+        self.assertIn(str(order.order_id), pipeline._feed_store_read())
+        with mock.patch.object(pipeline, "kv_set", side_effect=OSError("db")):
+            pipeline.save_order(pipeline.ScoredOrder(order, None, "dk"), "pending")   # не падает
+
+    def test_store_body_is_capped(self):
+        order = self.pending_order(6, desc="я" * 5000)
+        stored = pipeline._feed_store_read()[str(order.order_id)]
+        self.assertEqual(len(stored["body"]), pipeline.FEED_STORE_BODY_LIMIT)
 
 
 if __name__ == "__main__":

@@ -209,17 +209,62 @@ def scored_from_row(row: dict) -> ScoredOrder:
     return ScoredOrder(order, ai, row.get("dedup_key") or "")
 
 
-# Полные заказы FL.ru/Kwork из последних лент (id -> заказ): описания в БД нет, а заказ, ждущий
-# AI-оценку, может выпасть из ленты. Живёт в памяти процесса, чистится по возрасту заказа.
-_feed_cache: dict[int, FreelanceOrder] = {}
+# Полные заказы FL.ru/Kwork со статусом pending. В таблице заказов описания нет, а заказ, ждущий
+# AI-оценку, может выпасть из ленты (всплеск заказов) или пережить перезапуск: оценивать его по
+# одному названию нельзя (отказ окончателен). Хранится одним ключом kv (без изменения схемы БД),
+# перезаписывается целиком и чистится по возрасту заказа - не растёт.
+FEED_STORE_KEY = "freelance_feed_pending"
+FEED_STORE_BODY_LIMIT = 2000
+_feed_store_lock = threading.Lock()
 
 
-def _remember_feed(orders: list[FreelanceOrder]) -> None:
+def _feed_store_read() -> dict[str, dict]:
+    try:
+        data = json.loads(kv_get(FEED_STORE_KEY, "") or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _order_to_dict(o: FreelanceOrder) -> dict:
+    return {"site": o.site, "title": o.title, "body": (o.body or "")[:FEED_STORE_BODY_LIMIT],
+            "price_text": o.price_text, "price_value": o.price_value, "categories": list(o.categories),
+            "published_at": o.published_at.isoformat(), "url": o.url}
+
+
+def _order_from_dict(order_id: int, d: dict) -> FreelanceOrder | None:
+    try:
+        published = _parse_dt(d["published_at"])
+        if published is None:
+            return None
+        return FreelanceOrder(
+            order_id=order_id, site=str(d["site"]), title=str(d["title"]), body=str(d.get("body") or ""),
+            price_text=str(d.get("price_text") or ""), price_value=float(d.get("price_value") or 0),
+            categories=[str(c) for c in d.get("categories") or []], published_at=published,
+            url=str(d["url"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _feed_store_update(order: FreelanceOrder, status: str) -> None:
+    """pending - запомнить полный заказ FL.ru/Kwork, любой другой статус - забыть."""
+    if not sources.is_feed_id(order.order_id):
+        return
     threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
-    for o in orders:
-        _feed_cache[o.order_id] = o
-    for oid in [i for i, o in _feed_cache.items() if o.published_at < threshold]:
-        del _feed_cache[oid]
+    try:
+        with _feed_store_lock:
+            data = _feed_store_read()
+            if status == "pending":
+                data[str(order.order_id)] = _order_to_dict(order)
+            else:
+                data.pop(str(order.order_id), None)
+            for key in [k for k, d in data.items()
+                        if not isinstance(d, dict) or (_parse_dt(d.get("published_at")) or threshold) < threshold]:
+                del data[key]
+            kv_set(FEED_STORE_KEY, json.dumps(data, ensure_ascii=False))
+    except Exception:
+        # заказ в таблице заказов уже записан; без описания он просто не будет оценён после выпадения из ленты
+        logging.exception("[FREELANCE] не удалось сохранить описание заказа FL.ru/Kwork")
 
 
 def _load_pending(threshold: datetime, sent_now: set[int],
@@ -229,7 +274,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
 
     Заказы alot.pro дозапрашиваются по id (fetch_alot=False - не трогать alot: выключен или
     лежит), заказы FL.ru и Kwork берутся из свежей ленты цикла (feed_orders), а выпавшие из
-    ленты - из памяти прошлых циклов (_feed_cache)."""
+    ленты - из сохранённых полных заказов (_feed_store_*)."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
     # простое AI старые строки за пределами лимита висели бы pending
     rows = freelance_pending(PENDING_SCAN_LIMIT)
@@ -256,12 +301,18 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
             break
     fetched = [o for o in (_parse_item(item) for item in items) if o]
-    # FL.ru/Kwork: заказ из свежей ленты; если он уже выпал из ленты (всплеск заказов) или лента не
-    # получена, а оценка ещё не прошла, - полный заказ (с описанием) из памяти прошлых циклов.
-    # Без описания заказ не оцениваем: ошибочный отказ по одному названию окончателен, а в БД
-    # описание не хранится (после перезапуска такой заказ ждёт, пока не истечёт срок). Заказы
-    # выключенного источника не берём: они тратили бы квоту AI вопреки переключателю
-    feed_by_id = {**_feed_cache, **{o.order_id: o for o in (feed_orders or [])}}
+    # FL.ru/Kwork: заказ из свежей ленты; выпавший из ленты (или лента не получена, или был
+    # перезапуск) - полный заказ с описанием из сохранённых. Без описания заказ не оцениваем, он
+    # ждёт, пока не истечёт срок. Заказы выключенного источника не берём: они тратили бы квоту AI
+    # вопреки переключателю
+    feed_by_id = {o.order_id: o for o in (feed_orders or [])}
+    stored = _feed_store_read() if any(sources.is_feed_id(i) and i not in feed_by_id for i in live) else {}
+    for oid in live:
+        if not sources.is_feed_id(oid) or oid in feed_by_id or str(oid) not in stored:
+            continue
+        o = _order_from_dict(oid, stored[str(oid)]) if isinstance(stored[str(oid)], dict) else None
+        if o is not None:
+            feed_by_id[oid] = o
     fetched += [o for oid, o in feed_by_id.items()
                 if oid in live and sources.is_enabled(sources.source_of(oid))]
     result: dict[int, ScoredOrder] = {}
@@ -430,7 +481,6 @@ def _prepare_cycle() -> CycleResult:
     else:
         monitor.reset_streak("alot")   # выключен намеренно: не поломка
     feed_orders = _fetch_feed_orders()   # FL.ru и Kwork (если включены)
-    _remember_feed(feed_orders)
     # Ошибка цикла - только когда брать заказы неоткуда. Пустая лента включённого FL.ru/Kwork -
     # нормальный исход: pending из БД (в том числе выпавшие из ленты) всё равно дообрабатываются
     if not alot_ok and not feed_orders and not any(
@@ -795,6 +845,7 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None) -> N
         budget=o.price_value if o.price_value and o.price_value > 0 else None,
         hours=(sc.ai or {}).get("hours") or None,
     )
+    _feed_store_update(o, status)
 
 
 def save_sent(sc: ScoredOrder, message_id: int | None) -> bool:
