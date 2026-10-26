@@ -268,12 +268,15 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             order, ai, row.get("dedup_key") or norm_dedup_key(order),
             attempts=int(row.get("attempts") or 0),
         )
-    # FL.ru: заказ выпал из ленты (всплеск заказов) или RSS не получен, а оценка ещё не прошла.
-    # Восстанавливаем из БД (название, ссылка, цена, время; описания там нет) - иначе он
-    # дожил бы до истечения срока, так и не получив оценки
+    # FL.ru/Kwork: заказ выпал из ленты (всплеск заказов) или лента не получена, а оценка ещё
+    # не прошла. Восстанавливаем из БД (название, ссылка, цена, время; описания там нет) - иначе
+    # он дожил бы до истечения срока, так и не получив оценки. Заказы выключенного источника не
+    # восстанавливаем: иначе они тратили бы квоту AI вопреки переключателю
     in_feed = {o.order_id for o in fetched}
     for oid, row in live.items():
         if not sources.is_feed_id(oid) or oid in in_feed:
+            continue
+        if not sources.is_enabled(sources.source_of(oid)):
             continue
         full = freelance_get(oid)
         if not full:
@@ -424,9 +427,12 @@ def _prepare_cycle() -> CycleResult:
     else:
         monitor.reset_streak("alot")   # выключен намеренно: не поломка
     feed_orders = _fetch_feed_orders()   # FL.ru и Kwork (если включены)
-    if not alot_ok and not feed_orders:
+    # Ошибка цикла - только когда брать заказы неоткуда. Пустая лента включённого FL.ru/Kwork -
+    # нормальный исход: pending из БД (в том числе выпавшие из ленты) всё равно дообрабатываются
+    if not alot_ok and not feed_orders and not any(
+            sources.is_enabled(n) for n in (sources.FLRU, sources.KWORK)):
         res.error = (f"{type(alot_err).__name__}: {alot_err}" if alot_err
-                     else "нет включённых источников или они не вернули заказов")
+                     else "нет включённых источников заказов")
         return res
     if alot_ok:
         # Скан, который раз за разом обрывается сбоем и не продвигает курсор, - не норма:

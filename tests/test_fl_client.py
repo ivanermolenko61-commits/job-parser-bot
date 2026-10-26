@@ -121,6 +121,9 @@ class TwoSourcesCycleTest(CycleTestBase):
         self.assertIn(fl.order_id, ids)
 
     def test_both_down_is_error(self):
+        # alot лежит, а прямых источников включённых нет - брать заказы неоткуда
+        sources.set_enabled(sources.FLRU, False)
+        sources.set_enabled(sources.KWORK, False)
         res, _ = self.run_cycle([], [], alot_error=RuntimeError("alot down"))
         self.assertIn("alot down", res.error)
 

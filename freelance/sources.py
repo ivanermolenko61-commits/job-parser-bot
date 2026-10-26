@@ -30,6 +30,15 @@ def is_feed_id(order_id: int) -> bool:
     return order_id >= FEED_ID_MIN
 
 
+def source_of(order_id: int) -> str:
+    """Источник заказа по его order_id (диапазоны смещений)."""
+    if order_id >= KWORK_ID_OFFSET:
+        return KWORK
+    if order_id >= FL_ID_OFFSET:
+        return FLRU
+    return ALOT
+
+
 def _disabled_in_db() -> set[str]:
     raw = kv_get(_OFF_KEY, "") or ""
     return {s for s in raw.split(",") if s in ALL_SOURCES}

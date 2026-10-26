@@ -50,6 +50,12 @@ class SourcesStateTest(CycleTestBase):
         with mock.patch.object(sources, "kv_get", side_effect=OSError("db")):
             self.assertTrue(sources.is_enabled(sources.ALOT))
 
+    def test_source_of(self):
+        self.assertEqual(sources.source_of(17360853), sources.ALOT)
+        self.assertEqual(sources.source_of(sources.FL_ID_OFFSET + 5), sources.FLRU)
+        self.assertEqual(sources.source_of(sources.KWORK_ID_OFFSET + 5), sources.KWORK)
+        self.assertEqual(sources.source_of(sources.KWORK_ID_OFFSET - 1), sources.FLRU)
+
     def test_feed_id_ranges(self):
         self.assertFalse(sources.is_feed_id(17360853))
         self.assertTrue(sources.is_feed_id(sources.FL_ID_OFFSET + 1))
@@ -95,10 +101,32 @@ class CycleWithSwitchesTest(CycleTestBase):
         reset.assert_any_call("alot")
 
     def test_all_sources_off_is_error(self):
-        sources.set_enabled(sources.ALOT, False)
-        res, scan, _ = self.run_cycle(feed=[])
+        for n in sources.ALL_SOURCES:
+            sources.set_enabled(n, False)
+        res, scan, pend = self.run_cycle(feed=[])
         scan.assert_not_called()
         self.assertIn("нет включённых источников", res.error)
+        pend.assert_not_called()
+
+    def test_alot_off_empty_feed_still_processes_pending(self):
+        # лента включённых FL.ru/Kwork пуста - это не ошибка: pending из БД дообрабатываются
+        sources.set_enabled(sources.ALOT, False)
+        res, scan, pend = self.run_cycle(feed=[])
+        scan.assert_not_called()
+        self.assertEqual(res.error, "")
+        pend.assert_called_once()
+
+    def test_alot_down_empty_feed_still_processes_pending(self):
+        res, _, pend = self.run_cycle(feed=[], alot_error=RuntimeError("down"))
+        self.assertEqual(res.error, "")
+        pend.assert_called_once()
+
+    def test_alot_down_and_no_feed_sources_reports_alot_error(self):
+        sources.set_enabled(sources.FLRU, False)
+        sources.set_enabled(sources.KWORK, False)
+        res, _, pend = self.run_cycle(feed=[], alot_error=RuntimeError("alot down"))
+        self.assertIn("alot down", res.error)
+        pend.assert_not_called()
 
     def test_alot_down_does_not_fetch_alot_pending(self):
         res, _, pend = self.run_cycle(feed=[self.kwork_order()], alot_error=RuntimeError("down"))
@@ -134,6 +162,22 @@ class CycleWithSwitchesTest(CycleTestBase):
                 mock.patch.object(pipeline, "_fetch_items") as items:
             self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False), {})
         items.assert_not_called()
+
+    def test_pending_of_disabled_source_not_restored(self):
+        now = datetime.now(timezone.utc)
+        fl = sources.FL_ID_OFFSET + 70
+        kw = sources.KWORK_ID_OFFSET + 71
+        for oid, site in ((fl, "flru"), (kw, "kworkru")):
+            database.freelance_save(oid, site, "Парсер", f"https://x/{oid}", "", (now - timedelta(hours=1)).isoformat(),
+                                    "dk" + site, None, "", "pending")
+        sources.set_enabled(sources.KWORK, False)
+        res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
+        self.assertEqual(list(res), [fl])                    # Kwork выключен - его заказ не воскресает
+        sources.set_enabled(sources.FLRU, False)
+        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False), {})
+        sources.set_enabled(sources.KWORK, True)
+        res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
+        self.assertEqual(list(res), [kw])
 
     def test_kwork_pending_restored_from_db_when_feed_missing(self):
         oid = sources.KWORK_ID_OFFSET + 55
