@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 from config import (
     ALOT_SEED_ID,
+    ALOT_STALE_HOURS,
     FREELANCE_MAX_AGE_HOURS,
     FREELANCE_MIN_FIT,
 )
@@ -297,6 +298,35 @@ def _prefilter(orders) -> list[FreelanceOrder]:
     return passed
 
 
+def feed_lag(orders, now: datetime | None = None):
+    """Насколько свежа выдача alot.pro: (время самого нового заказа, часов назад, время последнего заказа Youdo
+    или None, если его нет в просмотренном окне). None - окно пустое, судить не по чему."""
+    if not orders:
+        return None
+    now = now or datetime.now(timezone.utc)
+    newest = max(o.published_at for o in orders)
+    youdo = [o.published_at for o in orders if o.site == "youdoru"]
+    return newest, (now - newest).total_seconds() / 3600, (max(youdo) if youdo else None)
+
+
+def _report_feed_freshness(scan, now: datetime | None = None, threshold: float = ALOT_STALE_HOURS) -> None:
+    """Оповещение «выдача alot.pro отстаёт»: alot.pro сам запаздывает с заказами (например, на 5-7 часов), и тогда бот
+    «молчит» не по своей вине. Серия плохих проверок и сообщение о восстановлении - в health.monitor (в памяти процесса)."""
+    lag = feed_lag(scan.orders, now)
+    if lag is None:
+        return   # пустое окно: серию не трогаем (сбой скана учитывается отдельным источником "alot")
+    newest, hours, youdo = lag
+    stale = hours > threshold
+    reason = None
+    if stale:
+        youdo_text = f"заказ Youdo в выдаче: {youdo.astimezone(MSK):%d.%m %H:%M} МСК" if youdo else "заказов Youdo в просмотренном окне нет"
+        reason = (f"самый новый заказ в выдаче alot.pro опубликован {newest.astimezone(MSK):%d.%m %H:%M} МСК "
+                  f"({hours:.1f} ч назад, порог {threshold:g} ч); {youdo_text}. Новые заказы Youdo и других бирж "
+                  f"в бот не приходят, пока alot.pro не догонит: проверьте Youdo вручную")
+    monitor.record("alot_feed", 0 if stale else 1, label="Свежесть выдачи alot.pro", bad_text="выдача отстаёт",
+                   recovered_text="снова свежая", reason=reason)
+
+
 def _prepare_cycle() -> CycleResult:
     started = time.monotonic()
     res = CycleResult()
@@ -346,6 +376,10 @@ def _prepare_cycle() -> CycleResult:
             label="Источник фриланс-заказов alot.pro")
     else:
         monitor.record("alot", scan.raw_count, label="Источник фриланс-заказов alot.pro")
+    try:
+        _report_feed_freshness(scan)
+    except Exception:
+        logging.exception("[FREELANCE] не удалось проверить свежесть выдачи alot.pro")
     res.raw_count = scan.raw_count
     res.new_last_id = max(last_id, scan.max_id)  # курсор только вперёд
     kv_set("freelance_last_raw", scan.raw_count)

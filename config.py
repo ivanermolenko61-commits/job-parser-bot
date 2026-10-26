@@ -92,6 +92,11 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+# Выдача alot.pro «отстаёт»: самый новый заказ в ней старше стольких часов - бот пришлёт оповещение
+# (после нескольких проверок подряд, см. health.FAIL_THRESHOLD). env: ALOT_STALE_HOURS
+ALOT_STALE_HOURS = max(0.5, _env_float("ALOT_STALE_HOURS", 3))
+
+
 # Ставка за час работы с Claude Code, ₽
 def _rate_per_hour() -> float:
     value = _env_float("FREELANCE_RATE_PER_HOUR", 1000)

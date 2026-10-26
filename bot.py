@@ -111,7 +111,7 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 # Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
-FREELANCE_HEALTH_SOURCES = {"alot", "gemini", "memory"}  # memory - не парсер вакансий
+FREELANCE_HEALTH_SOURCES = {"alot", "alot_feed", "gemini", "memory"}  # memory - не парсер вакансий
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -677,6 +677,8 @@ def _freelance_status_text() -> str:
         lines.append(f"🔴 alot.pro: неудачных проверок подряд: {streak} ({reason})")
     else:
         lines.append("🟢 alot.pro: работает")
+    if monitor.streak.get("alot_feed", 0) >= monitor.threshold:
+        lines.append(f"🔴 Выдача alot.pro отстаёт: {html.escape(monitor.last_reason.get('alot_feed', ''))}")
     return "\n".join(lines)
 
 
