@@ -78,6 +78,18 @@ class WindowCoveredTest(unittest.TestCase):
         orders += [order(100, "youdoru", 1)]
         self.assertTrue(alot_coverage.window_covered(orders, threshold))
 
+    def test_single_old_order_is_not_enough(self):
+        threshold = NOW - timedelta(hours=12)
+        self.assertFalse(alot_coverage.window_covered([order(1, "youdoru", 40)], threshold))
+
+    def test_fresh_orders_behind_old_edge_do_not_change_the_edge_rule(self):
+        threshold = NOW - timedelta(hours=12)
+        old = [order(i, "youdoru", 40) for i in range(1, 21)]
+        fresh = [order(i, "youdoru", 1) for i in range(100, 110)]
+        self.assertTrue(alot_coverage.window_covered(old + fresh, threshold))
+        # но свежий заказ среди наименьших id снимает покрытие
+        self.assertFalse(alot_coverage.window_covered(old[:19] + [order(0, "youdoru", 1)] + fresh, threshold))
+
     def test_empty_is_not_covered(self):
         self.assertFalse(alot_coverage.window_covered([], NOW))
 

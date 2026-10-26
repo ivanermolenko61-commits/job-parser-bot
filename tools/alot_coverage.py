@@ -25,10 +25,11 @@ EDGE_ORDERS = 20  # сколько заказов с наименьшими id �
 
 def window_covered(orders, threshold) -> bool:
     """Окно покрыто, если самый «нижний» край просмотренных id уже старше порога.
-    Порядок дат по id не гарантирован (старый заказ может появиться позже), поэтому смотрим
-    не на один заказ, а на EDGE_ORDERS заказов с наименьшими id: все они старше порога."""
+    Порядок дат по id не гарантирован (старый заказ может появиться позже), а границы окна по
+    дате API не даёт, поэтому это эвристика, а не доказательство: нужно не меньше EDGE_ORDERS
+    заказов, и все наименьшие по id старше порога. Одного старого заказа недостаточно."""
     edge = sorted(orders, key=lambda o: o.order_id)[:EDGE_ORDERS]
-    return bool(edge) and all(o.published_at <= threshold for o in edge)
+    return len(edge) >= EDGE_ORDERS and all(o.published_at <= threshold for o in edge)
 
 
 def collect(hours: float):
@@ -80,7 +81,10 @@ def main() -> None:
 
     orders, top, covered, partial = collect(args.hours)
     print(f"Верхняя граница id: {top}. Заказов за {args.hours:g} ч: {len(orders)}")
-    if not covered:
+    if covered:
+        print("Окно: нижний край просмотренных id старше порога (эвристика: alot.pro не гарантирует "
+              "порядок дат по id, полнота не доказана)")
+    else:
         print("ВНИМАНИЕ: окно просмотрено не целиком (достигнут предел id или сбой alot.pro): "
               "цифры занижены")
     if partial:
