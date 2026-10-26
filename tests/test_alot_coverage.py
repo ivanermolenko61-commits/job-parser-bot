@@ -38,18 +38,48 @@ class FreshnessTest(unittest.TestCase):
 
 class CollectTest(unittest.TestCase):
     def test_keeps_only_orders_inside_window_and_stops_when_covered(self):
-        scan = ScanResult(orders=[order(1, "youdoru", 20), order(2, "youdoru", 3)], max_id=2, raw_count=2)
+        old = [order(i, "youdoru", 20) for i in range(1, 26)]
+        scan = ScanResult(orders=old + [order(30, "youdoru", 3)], max_id=30, raw_count=26)
         with mock.patch.object(alot_coverage, "find_upper_bound", return_value=100), \
                 mock.patch.object(alot_coverage, "fetch_new_orders", return_value=scan) as fetch, \
                 mock.patch.object(alot_coverage.time, "sleep"):
             with mock.patch.object(alot_coverage, "datetime") as dt:
                 dt.now.return_value = NOW
                 orders, top, covered, partial = alot_coverage.collect(12)
-        self.assertEqual([o.order_id for o in orders], [2])
+        self.assertEqual([o.order_id for o in orders], [30])
         self.assertEqual(top, 100)
         self.assertTrue(covered)
         self.assertFalse(partial)
         self.assertEqual(fetch.call_count, 1)
+
+
+    def test_accumulates_passes_and_keeps_earlier_orders_on_partial(self):
+        first = ScanResult(orders=[order(10, "youdoru", 2), order(11, "youdoru", 1)], max_id=11, raw_count=2)
+        second = ScanResult(orders=[order(5, "kworkru", 3)], max_id=5, raw_count=1, partial=True)
+        with mock.patch.object(alot_coverage, "find_upper_bound", return_value=100),                 mock.patch.object(alot_coverage, "fetch_new_orders", side_effect=[first, second]),                 mock.patch.object(alot_coverage.time, "sleep"):
+            with mock.patch.object(alot_coverage, "datetime") as dt:
+                dt.now.return_value = NOW
+                orders, _, covered, partial = alot_coverage.collect(12)
+        self.assertEqual([o.order_id for o in orders], [5, 10, 11])
+        self.assertTrue(partial)
+        self.assertFalse(covered)
+
+
+class WindowCoveredTest(unittest.TestCase):
+    def test_one_old_order_in_the_middle_does_not_prove_coverage(self):
+        threshold = NOW - timedelta(hours=12)
+        # старый заказ с поздним импортом (id 50) не должен закрывать окно: край (id 1..) свежий
+        orders = [order(1, "youdoru", 3), order(2, "youdoru", 2), order(50, "youdoru", 20)]
+        self.assertFalse(alot_coverage.window_covered(orders, threshold))
+
+    def test_covered_when_lowest_ids_are_older_than_threshold(self):
+        threshold = NOW - timedelta(hours=12)
+        orders = [order(i, "youdoru", 40 - i) for i in range(1, 25)]  # id 1..24: 39..16 ч назад
+        orders += [order(100, "youdoru", 1)]
+        self.assertTrue(alot_coverage.window_covered(orders, threshold))
+
+    def test_empty_is_not_covered(self):
+        self.assertFalse(alot_coverage.window_covered([], NOW))
 
 
 if __name__ == "__main__":

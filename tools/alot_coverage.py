@@ -20,21 +20,38 @@ from freelance.filters import reject_reason
 MAX_BACK_IDS = 20000
 
 
+EDGE_ORDERS = 20  # сколько заказов с наименьшими id должны быть старше окна, чтобы считать окно покрытым
+
+
+def window_covered(orders, threshold) -> bool:
+    """Окно покрыто, если самый «нижний» край просмотренных id уже старше порога.
+    Порядок дат по id не гарантирован (старый заказ может появиться позже), поэтому смотрим
+    не на один заказ, а на EDGE_ORDERS заказов с наименьшими id: все они старше порога."""
+    edge = sorted(orders, key=lambda o: o.order_id)[:EDGE_ORDERS]
+    return bool(edge) and all(o.published_at <= threshold for o in edge)
+
+
 def collect(hours: float):
-    """Заказы alot.pro, опубликованные за последние `hours` часов, и верхняя граница id."""
+    """Заказы alot.pro, опубликованные за последние `hours` часов, и верхняя граница id.
+    Расширяет просмотр назад, пока край окна не станет старше порога; результаты всех
+    проходов накапливаются: оборванный проход не стирает то, что уже получено."""
     threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     top = find_upper_bound()
     back = 1500
+    seen: dict[int, object] = {}
+    partial = False
     while True:
         time.sleep(REQUEST_PAUSE_SEC)
         scan = fetch_new_orders(top - back, max_ahead=back + 400, look_back=0)
-        oldest = min((o.published_at for o in scan.orders), default=None)
-        covered = oldest is not None and oldest <= threshold
+        for o in scan.orders:
+            seen[o.order_id] = o
+        partial = partial or scan.partial
+        covered = window_covered(list(seen.values()), threshold)
         if covered or back >= MAX_BACK_IDS or scan.partial:
             break
         back = min(back * 2, MAX_BACK_IDS)
-    orders = {o.order_id: o for o in scan.orders if o.published_at >= threshold}
-    return sorted(orders.values(), key=lambda o: o.order_id), top, covered, scan.partial
+    orders = [o for o in seen.values() if o.published_at >= threshold]
+    return sorted(orders, key=lambda o: o.order_id), top, covered, partial
 
 
 def print_freshness(orders, now=None) -> None:
