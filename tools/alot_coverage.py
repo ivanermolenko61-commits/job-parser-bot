@@ -20,6 +20,7 @@ from freelance.filters import reject_reason
 MAX_BACK_IDS = 20000
 
 
+SAFETY_MARGIN_IDS = 1500  # после того как край окна стал старше порога, просматриваем ещё столько id
 EDGE_ORDERS = 20  # сколько заказов с наименьшими id должны быть старше окна, чтобы считать окно покрытым
 
 
@@ -35,12 +36,16 @@ def window_covered(orders, threshold) -> bool:
 def collect(hours: float):
     """Заказы alot.pro, опубликованные за последние `hours` часов, и верхняя граница id.
     Расширяет просмотр назад, пока край окна не станет старше порога; результаты всех
-    проходов накапливаются: оборванный проход не стирает то, что уже получено."""
+    проходов накапливаются: оборванный проход не стирает то, что уже получено.
+    Остановка по краю окна - эвристика (alot.pro не гарантирует порядок дат по id), поэтому
+    после покрытия просматривается ещё SAFETY_MARGIN_IDS id: поздно импортированный свежий
+    заказ ниже края попадёт в результат, а покрытие пересчитается."""
     threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
     top = find_upper_bound()
     back = 1500
     seen: dict[int, object] = {}
     partial = False
+    covered_at = None  # глубина, на которой край окна впервые стал старше порога
     while True:
         time.sleep(REQUEST_PAUSE_SEC)
         scan = fetch_new_orders(top - back, max_ahead=back + 400, look_back=0)
@@ -48,9 +53,15 @@ def collect(hours: float):
             seen[o.order_id] = o
         partial = partial or scan.partial
         covered = window_covered(list(seen.values()), threshold)
-        if covered or back >= MAX_BACK_IDS or scan.partial:
+        if not covered:
+            covered_at = None  # свежий заказ на меньших id: край сдвинулся, покрытие пересчитываем
+        elif covered_at is None:
+            covered_at = back
+        if scan.partial or back >= MAX_BACK_IDS:
             break
-        back = min(back * 2, MAX_BACK_IDS)
+        if covered and back >= covered_at + SAFETY_MARGIN_IDS:
+            break  # край старше порога и ещё SAFETY_MARGIN_IDS id ниже него просмотрены
+        back = min(covered_at + SAFETY_MARGIN_IDS if covered else back * 2, MAX_BACK_IDS)
     orders = [o for o in seen.values() if o.published_at >= threshold]
     return sorted(orders, key=lambda o: o.order_id), top, covered, partial
 

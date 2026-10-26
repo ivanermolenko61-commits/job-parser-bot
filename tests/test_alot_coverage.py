@@ -37,7 +37,7 @@ class FreshnessTest(unittest.TestCase):
 
 
 class CollectTest(unittest.TestCase):
-    def test_keeps_only_orders_inside_window_and_stops_when_covered(self):
+    def test_keeps_only_orders_inside_window_and_stops_after_margin(self):
         old = [order(i, "youdoru", 20) for i in range(1, 26)]
         scan = ScanResult(orders=old + [order(30, "youdoru", 3)], max_id=30, raw_count=26)
         with mock.patch.object(alot_coverage, "find_upper_bound", return_value=100), \
@@ -50,7 +50,7 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(top, 100)
         self.assertTrue(covered)
         self.assertFalse(partial)
-        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_count, 2)  # покрытие + проход с запасом
 
 
     def test_accumulates_passes_and_keeps_earlier_orders_on_partial(self):
@@ -63,6 +63,37 @@ class CollectTest(unittest.TestCase):
         self.assertEqual([o.order_id for o in orders], [5, 10, 11])
         self.assertTrue(partial)
         self.assertFalse(covered)
+
+
+class SafetyMarginTest(unittest.TestCase):
+    def run_collect(self, fetch):
+        with mock.patch.object(alot_coverage, "find_upper_bound", return_value=10000),                 mock.patch.object(alot_coverage, "fetch_new_orders", side_effect=fetch) as f,                 mock.patch.object(alot_coverage.time, "sleep"):
+            with mock.patch.object(alot_coverage, "datetime") as dt:
+                dt.now.return_value = NOW
+                return alot_coverage.collect(12), f
+
+    def test_fresh_order_below_old_edge_is_collected(self):
+        """Край (20 старых заказов) уже виден, но ниже по id лежит свежий заказ: он должен попасть в результат."""
+        old_edge = [order(8500 + i, "youdoru", 40) for i in range(20)]
+        late_fresh = order(7600, "youdoru", 1)
+
+        def fetch(last_id, max_ahead=0, look_back=0):
+            orders = list(old_edge)
+            if last_id <= 7600:  # более глубокий проход дотягивается до свежего заказа
+                orders.append(late_fresh)
+            return ScanResult(orders=orders, max_id=10000, raw_count=len(orders))
+
+        (orders, _, covered, _), f = self.run_collect(fetch)
+        self.assertIn(7600, [o.order_id for o in orders])
+        self.assertGreaterEqual(f.call_count, 2)
+
+    def test_margin_scan_runs_after_edge_is_covered(self):
+        old = [order(9000 + i, "youdoru", 40) for i in range(25)]
+        scan = ScanResult(orders=old, max_id=10000, raw_count=25)
+        (orders, _, covered, _), f = self.run_collect([scan, scan])
+        self.assertTrue(covered)
+        self.assertEqual(f.call_count, 2)  # первый проход покрыл окно, второй - запас SAFETY_MARGIN_IDS
+        self.assertEqual(f.call_args_list[1].args[0], 10000 - (1500 + alot_coverage.SAFETY_MARGIN_IDS))
 
 
 class WindowCoveredTest(unittest.TestCase):
