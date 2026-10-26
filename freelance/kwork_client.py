@@ -91,9 +91,9 @@ def _parse_want(want: dict) -> FreelanceOrder | None:
         return None
 
 
-def parse_page(page_html: str) -> list[FreelanceOrder]:
-    """Заказы одной страницы. Нет window.stateData/списка проектов (капча, смена вёрстки) -
-    исключение: источник сломан, а не пуст."""
+def parse_page_counted(page_html: str) -> tuple[list[FreelanceOrder], int]:
+    """(заказы страницы, сколько проектов было на ней вообще). Нет window.stateData/списка
+    проектов (капча, смена вёрстки) - исключение: источник сломан, а не пуст."""
     start = page_html.find(_STATE_MARK)
     if start < 0:
         raise RuntimeError("Kwork: в странице нет window.stateData (блокировка или смена вёрстки)")
@@ -104,14 +104,19 @@ def parse_page(page_html: str) -> list[FreelanceOrder]:
         raise RuntimeError(f"Kwork: не удалось прочитать список проектов ({type(e).__name__})") from e
     if not isinstance(wants, list):
         raise RuntimeError("Kwork: список проектов не массив")
-    return [o for o in (_parse_want(w) for w in wants if isinstance(w, dict)) if o]
+    orders = [o for o in (_parse_want(w) for w in wants if isinstance(w, dict)) if o]
+    return orders, len(wants)
 
 
-def _fetch_page(page: int) -> list[FreelanceOrder]:
+def parse_page(page_html: str) -> list[FreelanceOrder]:
+    return parse_page_counted(page_html)[0]
+
+
+def _fetch_page(page: int) -> tuple[list[FreelanceOrder], int]:
     resp = requests.get(KWORK_URL, params={"c": DEV_CATEGORY, "page": page},
                         headers=HEADERS, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
-    return parse_page(resp.text)
+    return parse_page_counted(resp.text)
 
 
 def fetch_kwork_orders(pages: int = KWORK_PAGES) -> list[FreelanceOrder]:
@@ -122,15 +127,15 @@ def fetch_kwork_orders(pages: int = KWORK_PAGES) -> list[FreelanceOrder]:
         if page > 1:
             time.sleep(PAGE_PAUSE_SEC)
         try:
-            found = _fetch_page(page)
+            found, raw_count = _fetch_page(page)
         except (requests.RequestException, RuntimeError) as e:
             if not orders:
                 raise
             logging.warning(f"[KWORK] страница {page} не получена ({type(e).__name__}), "
                             f"собранные {len(orders)} заказов сохраняем")
             break
-        if not found and page > 1:
-            break
+        if raw_count == 0 and page > 1:
+            break   # проекты кончились; страница из одних неактивных/неразобранных - не конец
         for o in found:
             orders[o.order_id] = o
     return list(orders.values())

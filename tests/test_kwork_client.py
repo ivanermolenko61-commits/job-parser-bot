@@ -89,7 +89,8 @@ class FetchTest(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def orders(self, *pids):
-        return kwork_client.parse_page(page(*[want(pid=i) for i in pids]))
+        found = kwork_client.parse_page(page(*[want(pid=i) for i in pids]))
+        return found, len(pids)
 
     def test_collects_pages_and_dedups(self):
         pages = [self.orders(1, 2), self.orders(2, 3)]
@@ -108,8 +109,18 @@ class FetchTest(unittest.TestCase):
             got = kwork_client.fetch_kwork_orders(pages=3)
         self.assertEqual([o.order_id - KWORK_ID_OFFSET for o in got], [1])
 
+    def test_page_of_filtered_projects_does_not_stop_paging(self):
+        # на странице 2 есть проекты, но все неактивные: обход идёт дальше, на странице 3 есть заказ
+        archived = kwork_client.parse_page_counted(page(want(pid=7, status="archive"), want(pid=8, status="archive")))
+        self.assertEqual((archived[0], archived[1]), ([], 2))
+        with mock.patch.object(kwork_client, "_fetch_page",
+                               side_effect=[self.orders(1), archived, self.orders(9)]) as f:
+            got = kwork_client.fetch_kwork_orders(pages=3)
+        self.assertEqual(f.call_count, 3)
+        self.assertEqual(sorted(o.order_id - KWORK_ID_OFFSET for o in got), [1, 9])
+
     def test_empty_later_page_stops(self):
-        with mock.patch.object(kwork_client, "_fetch_page", side_effect=[self.orders(1), []]) as f:
+        with mock.patch.object(kwork_client, "_fetch_page", side_effect=[self.orders(1), ([], 0)]) as f:
             kwork_client.fetch_kwork_orders(pages=4)
         self.assertEqual(f.call_count, 2)
 
