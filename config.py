@@ -74,9 +74,17 @@ DB_PATH = os.getenv("DB_PATH", "vacancies.db")
 # Якорь для поиска верхней границы id (заведомо старше текущих заказов)
 ALOT_SEED_ID = 17328000
 FREELANCE_INTERVAL_MINUTES = 5
-# Второй источник заказов - RSS FL.ru (работает независимо от alot.pro; FL_RSS_ENABLED=0 выключает)
-FL_RSS_ENABLED = os.getenv("FL_RSS_ENABLED", "1").strip().lower() not in ("0", "false", "no", "")
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
+# Источники заказов: =0 выключает источник насовсем (иначе их включают из бота: Фриланс -> Источники)
+ALOT_ENABLED = _env_flag("ALOT_ENABLED")
+FL_RSS_ENABLED = _env_flag("FL_RSS_ENABLED")      # RSS FL.ru
+KWORK_ENABLED = _env_flag("KWORK_ENABLED")        # список проектов Kwork
 FL_RSS_URL = os.getenv("FL_RSS_URL", "https://www.fl.ru/rss/all.xml")
+KWORK_URL = os.getenv("KWORK_URL", "https://kwork.ru/projects")
+KWORK_PAGES = 4     # страниц по 12 проектов за цикл (категория «Разработка и IT»)
 # Минимальная AI-оценка (0-10), с которой заказ отправляется
 FREELANCE_MIN_FIT = 5
 # Заказы старше этого возраста не отправляются (API alot.pro не отдаёт статус

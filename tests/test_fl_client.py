@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from unittest import mock
 
-from freelance import alot_client, fl_client, pipeline
+from freelance import alot_client, fl_client, pipeline, sources
 from freelance.filters import is_candidate
 from tests.test_pipeline_cycle import CycleTestBase, ai_result, make_order
 
@@ -97,8 +97,7 @@ class TwoSourcesCycleTest(CycleTestBase):
                  if alot_error else
                  mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan(alot_orders)))
         with database_kv, fetch, mock.patch.object(pipeline, "kv_set"), \
-                mock.patch.object(pipeline, "FL_RSS_ENABLED", True), \
-                mock.patch.object(pipeline, "fetch_fl_orders", return_value=fl_orders), \
+                mock.patch.object(pipeline, "_fetch_feed_orders", return_value=fl_orders), \
                 mock.patch.object(pipeline, "_load_pending", return_value={}) as pend, \
                 mock.patch.object(pipeline.ai_scorer, "score_order", side_effect=lambda o, **k: ai_result(8),
                                   create=True):
@@ -126,8 +125,7 @@ class TwoSourcesCycleTest(CycleTestBase):
         self.assertIn("alot down", res.error)
 
     def test_fl_down_alot_still_works(self):
-        with mock.patch.object(pipeline, "FL_RSS_ENABLED", True), \
-                mock.patch.object(pipeline, "fetch_fl_orders", side_effect=RuntimeError("fl down")):
+        with mock.patch.object(pipeline, "fetch_fl_orders", side_effect=RuntimeError("fl down")):
             self.assertEqual(pipeline._fetch_fl_orders(), [])
         pipeline.monitor.record.assert_called_with(
             "flru", 0, mock.ANY, label="Источник фриланс-заказов FL.ru")
@@ -136,8 +134,8 @@ class TwoSourcesCycleTest(CycleTestBase):
         self.assertEqual(res.new_last_id, 1100)
 
     def test_fl_disabled_does_not_call_network(self):
-        with mock.patch.object(pipeline, "FL_RSS_ENABLED", False), \
-                mock.patch.object(pipeline, "fetch_fl_orders") as net:
+        sources.set_enabled(sources.FLRU, False)
+        with mock.patch.object(pipeline, "fetch_fl_orders") as net:
             self.assertEqual(pipeline._fetch_fl_orders(), [])
         net.assert_not_called()
 

@@ -17,8 +17,8 @@ import requests
 
 from config import FL_RSS_URL
 from freelance.alot_client import FreelanceOrder, _clean_body
+from freelance.sources import FL_ID_OFFSET, KWORK_ID_OFFSET
 
-FL_ID_OFFSET = 10 ** 10
 FL_SITE = "flru"
 REQUEST_TIMEOUT = 20
 HEADERS = {
@@ -32,7 +32,7 @@ _LINK_ID_RE = re.compile(r"/projects/(\d+)")
 
 
 def is_fl_id(order_id: int) -> bool:
-    return order_id >= FL_ID_OFFSET
+    return FL_ID_OFFSET <= order_id < KWORK_ID_OFFSET
 
 
 # Префильтр (freelance/filters.py) опирается на коды категорий alot.pro, а у FL.ru они

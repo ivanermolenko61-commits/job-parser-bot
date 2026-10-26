@@ -214,7 +214,7 @@ class PipelineTriageTest(unittest.TestCase):
         pipeline._triage_cache.clear()
         for p in (mock.patch.object(pipeline.monitor, "record"),
                   mock.patch.object(pipeline, "_report_ai_health"),
-                  mock.patch.object(pipeline, "fetch_fl_orders", return_value=[]),  # без сети
+                  mock.patch.object(pipeline, "_fetch_feed_orders", return_value=[]),  # FL.ru и Kwork без сети
                   mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True),
                   mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=None),
                   mock.patch.object(pipeline.ai_scorer, "quota_exhausted", return_value=None)):
