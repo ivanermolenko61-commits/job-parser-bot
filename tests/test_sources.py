@@ -163,30 +163,38 @@ class CycleWithSwitchesTest(CycleTestBase):
             self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False), {})
         items.assert_not_called()
 
-    def test_pending_of_disabled_source_not_restored(self):
+    def pending_feed_order(self, oid, site, hours_ago=1):
         now = datetime.now(timezone.utc)
-        fl = sources.FL_ID_OFFSET + 70
-        kw = sources.KWORK_ID_OFFSET + 71
-        for oid, site in ((fl, "flru"), (kw, "kworkru")):
-            database.freelance_save(oid, site, "Парсер", f"https://x/{oid}", "", (now - timedelta(hours=1)).isoformat(),
-                                    "dk" + site, None, "", "pending")
-        sources.set_enabled(sources.KWORK, False)
-        res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
-        self.assertEqual(list(res), [fl])                    # Kwork выключен - его заказ не воскресает
-        sources.set_enabled(sources.FLRU, False)
-        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False), {})
-        sources.set_enabled(sources.KWORK, True)
-        res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
-        self.assertEqual(list(res), [kw])
+        order = make_order(oid)
+        order.site, order.published_at = site, now - timedelta(hours=hours_ago)
+        database.freelance_save(oid, site, order.title, f"https://x/{oid}", "", order.published_at.isoformat(),
+                                "dk" + site, None, "", "pending")
+        return order
 
-    def test_kwork_pending_restored_from_db_when_feed_missing(self):
-        oid = sources.KWORK_ID_OFFSET + 55
-        now = datetime.now(timezone.utc)
-        database.freelance_save(oid, "kworkru", "Парсер", "https://kwork.ru/projects/55/view", "до 5 000 ₽",
-                                (now - timedelta(hours=1)).isoformat(), "dk", None, "", "pending", attempts=1)
-        res = pipeline._load_pending(now - timedelta(hours=6), set(), [], fetch_alot=False)
-        self.assertEqual(list(res), [oid])
-        self.assertEqual(res[oid].order.site, "kworkru")
+    def test_pending_of_disabled_source_not_restored(self):
+        fl = self.pending_feed_order(sources.FL_ID_OFFSET + 70, "flru")
+        kw = self.pending_feed_order(sources.KWORK_ID_OFFSET + 71, "kworkru")
+        pipeline._remember_feed([fl, kw])
+        floor = datetime.now(timezone.utc) - timedelta(hours=6)
+        sources.set_enabled(sources.KWORK, False)
+        self.assertEqual(list(pipeline._load_pending(floor, set(), [], fetch_alot=False)), [fl.order_id])
+        sources.set_enabled(sources.FLRU, False)
+        self.assertEqual(pipeline._load_pending(floor, set(), [], fetch_alot=False), {})
+        sources.set_enabled(sources.KWORK, True)
+        self.assertEqual(list(pipeline._load_pending(floor, set(), [], fetch_alot=False)), [kw.order_id])
+
+    def test_kwork_pending_restored_from_memory_when_feed_missing(self):
+        kw = self.pending_feed_order(sources.KWORK_ID_OFFSET + 55, "kworkru")
+        pipeline._remember_feed([kw])
+        res = pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [],
+                                     fetch_alot=False)
+        self.assertEqual(list(res), [kw.order_id])
+        self.assertEqual(res[kw.order_id].order.site, "kworkru")
+
+    def test_cycle_remembers_feed_for_later_cycles(self):
+        order = self.kwork_order(9100)
+        self.run_cycle(feed=[order])
+        self.assertIn(order.order_id, pipeline._feed_cache)
 
 
 class AlotWakeUpHintTest(CycleTestBase):

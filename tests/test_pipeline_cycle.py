@@ -34,6 +34,8 @@ class CycleTestBase(unittest.TestCase):
         database.DB_PATH = os.path.join(self.tmp.name, "t.db")
         database.init_db()
         self.addCleanup(self.tmp.cleanup)
+        pipeline._feed_cache.clear()
+        self.addCleanup(pipeline._feed_cache.clear)
         self.addCleanup(setattr, database, "DB_PATH", self.old_path)
         for p in (mock.patch.object(pipeline.monitor, "record"),
                   mock.patch.object(pipeline, "_report_ai_health"),

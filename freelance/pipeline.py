@@ -33,7 +33,6 @@ from config import (
 )
 from database import (
     freelance_dup_keys,
-    freelance_get,
     freelance_pending,
     freelance_save,
     freelance_seen_ids,
@@ -210,6 +209,19 @@ def scored_from_row(row: dict) -> ScoredOrder:
     return ScoredOrder(order, ai, row.get("dedup_key") or "")
 
 
+# Полные заказы FL.ru/Kwork из последних лент (id -> заказ): описания в БД нет, а заказ, ждущий
+# AI-оценку, может выпасть из ленты. Живёт в памяти процесса, чистится по возрасту заказа.
+_feed_cache: dict[int, FreelanceOrder] = {}
+
+
+def _remember_feed(orders: list[FreelanceOrder]) -> None:
+    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
+    for o in orders:
+        _feed_cache[o.order_id] = o
+    for oid in [i for i, o in _feed_cache.items() if o.published_at < threshold]:
+        del _feed_cache[oid]
+
+
 def _load_pending(threshold: datetime, sent_now: set[int],
                   feed_orders: list[FreelanceOrder] | None = None,
                   fetch_alot: bool = True) -> dict[int, ScoredOrder]:
@@ -217,7 +229,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
 
     Заказы alot.pro дозапрашиваются по id (fetch_alot=False - не трогать alot: выключен или
     лежит), заказы FL.ru и Kwork берутся из свежей ленты цикла (feed_orders), а выпавшие из
-    ленты восстанавливаются из БД."""
+    ленты - из памяти прошлых циклов (_feed_cache)."""
     # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
     # простое AI старые строки за пределами лимита висели бы pending
     rows = freelance_pending(PENDING_SCAN_LIMIT)
@@ -244,7 +256,14 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
             break
     fetched = [o for o in (_parse_item(item) for item in items) if o]
-    fetched += [o for o in (feed_orders or []) if o.order_id in live]
+    # FL.ru/Kwork: заказ из свежей ленты; если он уже выпал из ленты (всплеск заказов) или лента не
+    # получена, а оценка ещё не прошла, - полный заказ (с описанием) из памяти прошлых циклов.
+    # Без описания заказ не оцениваем: ошибочный отказ по одному названию окончателен, а в БД
+    # описание не хранится (после перезапуска такой заказ ждёт, пока не истечёт срок). Заказы
+    # выключенного источника не берём: они тратили бы квоту AI вопреки переключателю
+    feed_by_id = {**_feed_cache, **{o.order_id: o for o in (feed_orders or [])}}
+    fetched += [o for oid, o in feed_by_id.items()
+                if oid in live and sources.is_enabled(sources.source_of(oid))]
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
         if order.order_id not in live:
@@ -268,22 +287,6 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             order, ai, row.get("dedup_key") or norm_dedup_key(order),
             attempts=int(row.get("attempts") or 0),
         )
-    # FL.ru/Kwork: заказ выпал из ленты (всплеск заказов) или лента не получена, а оценка ещё
-    # не прошла. Восстанавливаем из БД (название, ссылка, цена, время; описания там нет) - иначе
-    # он дожил бы до истечения срока, так и не получив оценки. Заказы выключенного источника не
-    # восстанавливаем: иначе они тратили бы квоту AI вопреки переключателю
-    in_feed = {o.order_id for o in fetched}
-    for oid, row in live.items():
-        if not sources.is_feed_id(oid) or oid in in_feed:
-            continue
-        if not sources.is_enabled(sources.source_of(oid)):
-            continue
-        full = freelance_get(oid)
-        if not full:
-            continue
-        restored = scored_from_row(full)
-        restored.attempts = int(row.get("attempts") or 0)
-        result[oid] = restored
     return result
 
 
@@ -427,6 +430,7 @@ def _prepare_cycle() -> CycleResult:
     else:
         monitor.reset_streak("alot")   # выключен намеренно: не поломка
     feed_orders = _fetch_feed_orders()   # FL.ru и Kwork (если включены)
+    _remember_feed(feed_orders)
     # Ошибка цикла - только когда брать заказы неоткуда. Пустая лента включённого FL.ru/Kwork -
     # нормальный исход: pending из БД (в том числе выпавшие из ленты) всё равно дообрабатываются
     if not alot_ok and not feed_orders and not any(

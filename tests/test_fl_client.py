@@ -163,33 +163,51 @@ class PendingFlTest(CycleTestBase):
                                 "3 000 ₽", published.isoformat(), "dk", None, "", "pending",
                                 attempts=attempts)
 
-    def test_fl_pending_fell_out_of_feed_is_restored_from_db(self):
-        # оценка отложена (квота), лента прокрутилась и заказа в ней уже нет
+    def test_fl_pending_fell_out_of_feed_is_restored_with_description(self):
+        # оценка отложена (квота), лента прокрутилась и заказа в ней уже нет, но он в памяти цикла
         oid = fl_client.FL_ID_OFFSET + 778
         now = datetime.now(timezone.utc)
+        order = fl_client.parse_rss(rss(item(oid=778, desc="полное описание задачи", when=now)))[0]
         self.save_pending(oid, now - timedelta(hours=2))
+        pipeline._remember_feed([order])
         res = pipeline._load_pending(now - timedelta(hours=6), set(), [])
         self.assertEqual(list(res), [oid])
         sc = res[oid]
-        self.assertEqual((sc.order.title, sc.order.site, sc.order.price_text),
-                         ("Парсер сайта", "flru", "3 000 ₽"))
+        self.assertEqual(sc.order.body, "полное описание задачи")     # не вслепую по названию
         self.assertEqual((sc.attempts, sc.dedup), (2, "dk"))
         self.assertIsNone(sc.ai)
 
-    def test_fl_pending_restored_when_rss_failed(self):
+    def test_fl_pending_restored_when_feed_failed_this_cycle(self):
         oid = fl_client.FL_ID_OFFSET + 779
         now = datetime.now(timezone.utc)
+        order = fl_client.parse_rss(rss(item(oid=779, when=now)))[0]
         self.save_pending(oid, now - timedelta(hours=1))
+        pipeline._remember_feed([order])
         res = pipeline._load_pending(now - timedelta(hours=6), set(), None)
         self.assertEqual(list(res), [oid])
 
-    def test_fl_pending_expired_is_not_restored(self):
+    def test_fl_pending_without_description_is_not_scored_blind(self):
+        # после перезапуска памяти нет, описания в БД нет: заказ ждёт, а не оценивается по названию
+        import database
+        oid = fl_client.FL_ID_OFFSET + 781
+        now = datetime.now(timezone.utc)
+        self.save_pending(oid, now - timedelta(hours=1))
+        self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
+        self.assertEqual(database.freelance_get(oid)["status"], "pending")
+
+    def test_fl_pending_expired_is_marked_expired(self):
         import database
         oid = fl_client.FL_ID_OFFSET + 780
         now = datetime.now(timezone.utc)
         self.save_pending(oid, now - timedelta(hours=7))
         self.assertEqual(pipeline._load_pending(now - timedelta(hours=6), set(), []), {})
         self.assertEqual(database.freelance_get(oid)["status"], "expired")
+
+    def test_remember_feed_prunes_old_orders(self):
+        fresh = fl_client.parse_rss(rss(item(oid=1, when=datetime.now(timezone.utc))))[0]
+        old = fl_client.parse_rss(rss(item(oid=2, when=datetime.now(timezone.utc) - timedelta(hours=9))))[0]
+        pipeline._remember_feed([fresh, old])
+        self.assertEqual(list(pipeline._feed_cache), [fresh.order_id])
 
 
 if __name__ == "__main__":
