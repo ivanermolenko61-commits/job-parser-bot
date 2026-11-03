@@ -656,18 +656,27 @@ def freelance_expired_messages(ttl_hours: int, limit: int = 200) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def freelance_pending(limit: int = 100) -> list[dict]:
-    """Заказы со статусом pending (не оценены или не отправлены), новые первыми."""
+def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None = None,
+                      exclude_ranges: bool = False) -> list[dict]:
+    """Заказы со статусом pending (не оценены или не отправлены), новые первыми.
+
+    id_ranges - полуинтервалы [от, до) order_id: по умолчанию выбираются только заказы из них,
+    с exclude_ranges=True - все, кроме них (так лимит не занимают заказы неактивных источников)."""
+    where, params = "status = 'pending'", []
+    if id_ranges:
+        cond = " OR ".join("(order_id >= ? AND order_id < ?)" for _ in id_ranges)
+        where += f" AND {'NOT ' if exclude_ranges else ''}({cond})"
+        params = [v for r in id_ranges for v in r]
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT order_id, attempts, ai_json, published_at, dedup_key
             FROM freelance_orders
-            WHERE status = 'pending'
+            WHERE {where}
             ORDER BY order_id DESC
             LIMIT ?
             """,
-            (limit,),
+            (*params, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

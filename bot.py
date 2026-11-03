@@ -49,7 +49,7 @@ from database import (
     reset_db,
     stats,
 )
-from freelance import ai_scorer, deal_wait, pricing
+from freelance import ai_scorer, deal_wait, pricing, sources
 from freelance.alot_client import site_name
 from freelance.pipeline import (
     LAST_ID_KEY,
@@ -111,7 +111,7 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 # Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
-FREELANCE_HEALTH_SOURCES = {"alot", "alot_feed", "gemini", "memory"}  # memory - не парсер вакансий
+FREELANCE_HEALTH_SOURCES = {"alot", "alot_feed", "flru", "kwork", "gemini", "memory"}  # memory - не парсер вакансий
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -342,6 +342,7 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Статус", callback_data="fl_status"),
         ],
         [InlineKeyboardButton(text="📊 Точность цен", callback_data="fl_accuracy")],
+        [InlineKeyboardButton(text="🔌 Источники", callback_data="fl_src")],
     ])
 
 
@@ -671,13 +672,17 @@ def _freelance_status_text() -> str:
         f"🤖 AI: {ai_state}",
         f"Порог fit: {FREELANCE_MIN_FIT}, интервал: {FREELANCE_INTERVAL_MINUTES} мин",
     ]
-    streak = monitor.streak.get("alot", 0)
-    if streak:
-        reason = html.escape(monitor.last_reason.get("alot", ""))
-        lines.append(f"🔴 alot.pro: неудачных проверок подряд: {streak} ({reason})")
-    else:
-        lines.append("🟢 alot.pro: работает")
-    if monitor.streak.get("alot_feed", 0) >= monitor.threshold:
+    for name, title, on, forced in sources.states():
+        if not on:
+            lines.append(f"⚪ {title}: выключен" + (" (в настройках сервера)" if forced else ""))
+            continue
+        streak = monitor.streak.get(name, 0)
+        if streak:
+            reason = html.escape(monitor.last_reason.get(name, ""))
+            lines.append(f"🔴 {title}: неудачных проверок подряд: {streak} ({reason})")
+        else:
+            lines.append(f"🟢 {title}: работает")
+    if sources.is_enabled(sources.ALOT) and monitor.streak.get("alot_feed", 0) >= monitor.threshold:
         lines.append(f"🔴 Выдача alot.pro отстаёт: {html.escape(monitor.last_reason.get('alot_feed', ''))}")
     return "\n".join(lines)
 
@@ -1036,6 +1041,56 @@ async def cb_fl_status(call: CallbackQuery):
         logging.exception("[FREELANCE] fl_status")
         text = "⚠️ Не удалось собрать статус."
     await call.message.answer(text, parse_mode="HTML")
+
+
+SOURCES_HELP = (
+    "🔌 <b>Источники заказов</b>\n"
+    "alot.pro собирает заказы с разных бирж (в том числе FL.ru и Kwork). Пока он работает, "
+    "прямые FL.ru и Kwork дублируют его заказы и тратят квоту AI - их можно выключить. "
+    "Если alot.pro молчит, оставьте включёнными FL.ru и Kwork.\n"
+    "Нажмите на источник, чтобы переключить."
+)
+
+
+def _sources_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for name, title, on, forced in sources.states():
+        if forced:
+            label, data = f"⛔ {title}: выключен в настройках сервера", "fl_src_noop"
+        else:
+            label, data = (f"🟢 {title}: включён" if on else f"⚪ {title}: выключен"), f"fl_src_t:{name}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=data)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "fl_src")
+async def cb_fl_sources(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(SOURCES_HELP, parse_mode="HTML", reply_markup=_sources_kb())
+
+
+@dp.callback_query(F.data == "fl_src_noop")
+async def cb_fl_sources_noop(call: CallbackQuery):
+    await call.answer("Выключен переменной окружения на сервере", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("fl_src_t:"))
+async def cb_fl_sources_toggle(call: CallbackQuery):
+    try:
+        name = call.data.split(":", 1)[1]
+        if name not in sources.ALL_SOURCES:
+            await call.answer("Неизвестный источник")
+            return
+        now_on = await asyncio.to_thread(sources.is_enabled, name)
+        ok = await asyncio.to_thread(sources.set_enabled, name, not now_on)
+        if not ok:
+            await call.answer("Этот источник выключен на сервере", show_alert=True)
+            return
+        await call.answer(f"{sources.TITLES[name]}: {'выключен' if now_on else 'включён'}")
+        await call.message.edit_reply_markup(reply_markup=_sources_kb())
+    except Exception:
+        logging.exception("[FREELANCE] fl_src_t")
+        await call.answer("Ошибка, см. лог")
 
 
 # ---------- Общая логика /list ----------
