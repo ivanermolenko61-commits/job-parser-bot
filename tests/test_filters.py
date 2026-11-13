@@ -23,8 +23,8 @@ class ServiceOfferTest(unittest.TestCase):
         "Помогу с настройкой сервера",
     ]
     ORDERS = [
-        "Создать сайт", "Сделать бота", "Разработать чат-бот для телеграм",
-        "Нужно создать лендинг", "Нужно сделать парсер", "Разработка сайта",
+        "Сделать бота", "Разработать чат-бот для телеграм",
+        "Нужно сделать парсер", "Настроить формулы в таблице",
         "Создание бота", "Предлагаю работу: сделать бота для записи",
     ]
 
@@ -83,6 +83,27 @@ class RejectReasonTest(unittest.TestCase):
         self.assertEqual(reject_reason(make_cat("Сайт", suspicious=True)), "reports")
         self.assertEqual(reject_reason(make_cat("Создам бота за час")), "service_offer")
         self.assertEqual(reject_reason(make_cat("Купить диван")), "no_include")
+
+    def test_remote_job_boards_excluded(self):
+        for site in ("trulyremotework", "himalayas", "weworkremotelycom"):
+            self.assertEqual(reject_reason(make_cat("Web Developer", ["WEB"], site=site)), "excluded_site", site)
+        self.assertIsNone(reject_reason(make_cat("Таблица в Google Sheets", ["WEB"], site="flru")))
+
+    def test_site_only_rejected_before_ai(self):
+        for title in ("Создание сайта", "Нужен лендинг", "Правки на Tilda", "Сверстать страницу"):
+            self.assertEqual(reject_reason(make_cat(title, ["WEB"])), "site_only", title)
+
+    def test_site_with_profile_work_passes(self):
+        for title, body in (("Парсер сайта в Google Таблицу", ""),
+                            ("Форма с сайта в Telegram-бот", ""),
+                            ("Доработка сайта", "заявки с формы нужно передавать в amoCRM"),
+                            ("Сайт", "нужна выгрузка заказов в таблицу")):
+            self.assertIsNone(reject_reason(make_cat(title, ["WEB"], body=body)), title)
+
+    def test_profile_words_pass_without_dev_category(self):
+        for title in ("Настроить формулы в таблице", "Скрипт Apps Script для отчёта",
+                      "Отчёт по продажам Wildberries", "Дашборд по данным Ozon"):
+            self.assertIsNone(reject_reason(make_cat(title)), title)
 
     def test_hard_stop_word_still_rejects_bot(self):
         why = reject_reason(make_cat("Бот для накрутки подписчиков", ["PROG_OTHER"]))

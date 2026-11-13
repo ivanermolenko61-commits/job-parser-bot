@@ -62,9 +62,14 @@ def _split_budget(raw_title: str) -> tuple[str, str]:
     return title[:m.start()].strip(), re.sub(r"\s+", " ", m.group(1)).strip()
 
 
+_NUMBER_RE = re.compile(r"\d(?:[\d   ]*\d)?")
+
+
 def _price_value(price_text: str) -> float:
-    digits = re.sub(r"[^\d]", "", price_text)
-    return float(digits) if digits else 0.0
+    """Верхняя граница бюджета. Диапазон «5 000 ₽ – 10 000 ₽» - два числа (раньше цифры склеивались
+    в 500010000 и бюджет получался в миллиарды), как у alot.pro (internalPrice) и Kwork («до N»)."""
+    values = [float(re.sub(r"\D", "", n)) for n in _NUMBER_RE.findall(price_text)]
+    return max(values, default=0.0)
 
 
 def _parse_item(item: ET.Element) -> FreelanceOrder | None:

@@ -8,6 +8,10 @@ EXCLUDED_SITES = {
     "hhru", "habrcareer", "geekjobru", "trudvsemru", "superjobru",
     "getmatchru", "remotejobru", "kadrofru", "joblabru", "workspaceru",
     "hirehiru",
+    # Англоязычные доски удалённых вакансий (полная занятость, не заказы). По базе сервера
+    # 30.10-01.11.2026: 241 из 554 прошедших префильтр, средний fit 0.1, отправлено 3 -
+    # занимали ~40% квоты AI, пока заказы FL.ru/Kwork/Freelancehunt истекали без оценки
+    "trulyremotework", "himalayas", "weworkremotelycom",
 }
 
 # Категории alot.pro, относящиеся к разработке
@@ -29,7 +33,33 @@ INCLUDE_WORDS = [
     "google таблиц", "гугл таблиц", "google sheets", "excel", "макрос",
     "crm", "mini app", "мини-апп", "расширение для браузер", "плагин",
     "приложени", "разработ", "программист",
+    "таблиц", "apps script", "формул", "vba", "отчет", "отчёт", "дашборд",
+    "wildberries", "вайлдберриз", "ozon", "озон", "маркетплейс", "n8n", "sql",
+    "нейросет", "gpt",
 ]
+
+# Профиль исполнителя - таблицы, боты, автоматизация; сайты не делает. Заказ, где в названии
+# сайт, а ни в названии, ни в начале текста нет ничего из профиля, отсеивается до AI
+# (по базе сервера 30.10-01.11.2026 сайты - больше половины заказов, ушедших на оценку).
+# Сайт как источник данных («парсер сайта») или форма сайта в таблицу/бот/CRM - проходят.
+SITE_WORDS = [
+    "сайт", "лендинг", "landing", "интернет-магазин", "веб-приложен",
+    "wordpress", "вордпресс", "tilda", "тильд", "opencart", "вёрстк", "верстк",
+    "сверстать", "html", "css",
+]
+STRENGTH_WORDS = [
+    "бот", "бота", "боты", "ботов", "боту", "ботом", "чат-бот", "чатбот",
+    "telegram", "телеграм", "тг", "tg", "whatsapp", "вотсап",
+    "парсер", "парсинг", "спарсить", "скрапинг", "выгрузк", "скрипт", "python", "питон",
+    "автоматизац", "api", "интеграц", "crm", "amocrm", "амо",
+    "таблиц", "google sheets", "excel", "эксел", "apps script", "формул", "макрос",
+    "отчет", "отчёт", "дашборд", "wildberries", "вайлдберриз", "ozon", "озон",
+    "маркетплейс", "n8n", "sql", "нейросет", "gpt",
+]
+
+_INCLUDE_RE = _compile(INCLUDE_WORDS)
+_SITE_RE = _compile(SITE_WORDS)
+_STRENGTH_RE = _compile(STRENGTH_WORDS)
 
 # Явно не наше (проверяется по title)
 EXCLUDE_WORDS = [
@@ -53,7 +83,6 @@ DEV_INTENT_WORDS = [
     "парсер", "парсинг", "скрипт", "python", "питон", "api", "разработ", "программист",
 ]
 
-_INCLUDE_RE = _compile(INCLUDE_WORDS)
 _EXCLUDE_RE = _compile(EXCLUDE_WORDS)
 _DEV_INTENT_RE = _compile(DEV_INTENT_WORDS)
 
@@ -81,7 +110,7 @@ def is_service_offer(title: str) -> bool:
 def reject_reason(order) -> str | None:
     """Почему префильтр отсеял заказ (None - прошёл). Причина нужна для лога: иначе
     потерянный заказ нельзя отличить от заказа, которого не было в выдаче alot.
-    Коды: excluded_site, reports, service_offer, stop_word:<слово>, no_include."""
+    Коды: excluded_site, reports, service_offer, stop_word:<слово>, site_only, no_include."""
     if order.site in EXCLUDED_SITES:
         return "excluded_site"
     if order.is_suspicious:
@@ -97,6 +126,8 @@ def reject_reason(order) -> str | None:
         return f"stop_word:{hard[0]}"
     if hits and not _DEV_INTENT_RE.search(title):
         return f"stop_word:{hits[0]}"
+    if _SITE_RE.search(title) and not _STRENGTH_RE.search(f"{title}\n{(order.body or '')[:600]}"):
+        return "site_only"
     if DEV_CATEGORIES.intersection(order.categories):
         return None
     if _INCLUDE_RE.search(f"{title}\n{(order.body or '')[:600]}"):

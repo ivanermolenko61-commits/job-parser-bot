@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 import database
 from freelance import ai_scorer, alot_client, pipeline
 from freelance.alot_client import FreelanceOrder
-from freelance.filters import is_candidate
+from freelance.filters import is_candidate, reject_reason
 from parsers.filters import LEVEL_PATTERN, is_allowed_level
 from parsers.habr_parser import HabrParser
 
@@ -63,7 +63,8 @@ class DesignWordTest(unittest.TestCase):
         for title in ("Вёрстка сайта по готовому дизайну", "Сверстать сайт, дизайн готов",
                       "Сделать сайт по макету, дизайн есть", "Нужен лендинг по утверждённому дизайну"):
             with self.subTest(title=title):
-                self.assertTrue(is_candidate(order(title)))
+                # слово «дизайн» не отсеивает (сайт без работы по профилю отсеивается отдельно: site_only)
+                self.assertFalse((reject_reason(order(title)) or "").startswith("stop_word"))
 
     def test_ordering_design_still_excluded(self):
         for title in ("Нужен дизайн сайта", "Дизайн логотипа и сайт", "Разработать дизайн лендинга",

@@ -49,6 +49,11 @@ class ParseRssTest(unittest.TestCase):
         (o,) = fl_client.parse_rss(rss(item(title="Сайт (Бюджет: По договоренности)")))
         self.assertEqual((o.title, o.price_text, o.price_value), ("Сайт", "По договоренности", 0.0))
 
+    def test_budget_range_takes_upper_bound(self):
+        for text, expected in (("5 000 ₽ – 10 000 ₽", 10000.0), ("56 000 ₽ – 100 000 ₽", 100000.0),
+                               ("3 000 ₽", 3000.0), ("3 000 ₽", 3000.0), ("", 0.0)):
+            self.assertEqual(fl_client._price_value(text), expected, text)
+
     def test_no_budget_in_title(self):
         (o,) = fl_client.parse_rss(rss(item(title="Скрипт &amp; бот")))
         self.assertEqual((o.title, o.price_text), ("Скрипт & бот", ""))

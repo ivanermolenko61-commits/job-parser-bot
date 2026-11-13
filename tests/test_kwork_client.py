@@ -64,7 +64,7 @@ class ParsePageTest(unittest.TestCase):
         (o,) = kwork_client.parse_page(page(want(name="ИИ-видео про исторические места",
                                                  desc="нужны ролики", category="41")))
         self.assertFalse(is_candidate(o))
-        (s,) = kwork_client.parse_page(page(want(name="Доработка сайта", desc="нужна правка",
+        (s,) = kwork_client.parse_page(page(want(name="Доработка проекта", desc="нужна правка",
                                                  category="38")))
         self.assertTrue(is_candidate(s))
 
