@@ -14,14 +14,17 @@ import re
 import sqlite3
 import statistics
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from config import DB_PATH, DUPLICATE_WINDOW_DAYS, FREELANCE_MIN_FIT, SENT_HISTORY_DAYS
+from config import (
+    DB_PATH, DUPLICATE_WINDOW_DAYS, FREELANCE_JOURNAL_DAYS, FREELANCE_MIN_FIT, SENT_HISTORY_DAYS,
+)
+from freelance import journal as jr
 from parsers.filters import dedup_key
 
 
 # Сколько дней хранить заказы фриланса
-FREELANCE_KEEP_DAYS = 14
+FREELANCE_KEEP_DAYS = FREELANCE_JOURNAL_DAYS
 # Строки с бюджетом заказчика нужны для статистики рынка - хранятся дольше
 FREELANCE_MARKET_DAYS = 90
 # Строки со сделкой (deal_price) - для ставки и точности цен
@@ -327,16 +330,22 @@ def cleanup_old(days: int = 5) -> int:
             """,
             (f'-{FREELANCE_KEEP_DAYS} days',),
         )
+        # Технический журнал живёт FREELANCE_JOURNAL_DAYS; активные лиды (сохранён, откликнулся,
+        # обсуждаем, договорились) чистка не трогает, как и строки со сделкой и рыночные бюджеты
+        active = ",".join("?" * len(jr.LEAD_ACTIVE))
         conn.execute(
-            """
+            f"""
             DELETE FROM freelance_orders
             WHERE seen_at < datetime('now', ?)
+              AND COALESCE(lead, '') NOT IN ({active})
               AND NOT (COALESCE(budget, 0) > 0 AND COALESCE(fit, 0) >= ? AND seen_at >= datetime('now', ?))
               AND NOT (COALESCE(deal_price, 0) > 0 AND seen_at >= datetime('now', ?))
             """,
-            (f'-{FREELANCE_KEEP_DAYS} days', FREELANCE_MIN_FIT, f'-{FREELANCE_MARKET_DAYS} days',
-             f'-{FREELANCE_DEAL_DAYS} days'),
+            (f'-{FREELANCE_KEEP_DAYS} days', *jr.LEAD_ACTIVE, FREELANCE_MIN_FIT,
+             f'-{FREELANCE_MARKET_DAYS} days', f'-{FREELANCE_DEAL_DAYS} days'),
         )
+        conn.execute("DELETE FROM freelance_funnel_daily WHERE day < date('now', ?)",
+                     (f'-{FREELANCE_KEEP_DAYS * 2} days',))
         conn.commit()
         return deleted
 
@@ -390,6 +399,21 @@ def _init_freelance(conn) -> None:
                      ("hours", "REAL"), ("deal_price", "REAL")):
         if col not in cols:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
+    # Журнал увиденных заказов (freelance/journal.py): три независимых измерения вместо одного status
+    for col, ddl in (
+        ("origin", "TEXT"), ("title_key", "TEXT"), ("content_hash", "TEXT"), ("snippet", "TEXT"),
+        ("pub_unreliable", "INTEGER DEFAULT 0"), ("tech", "TEXT"), ("queue_reason", "TEXT"),
+        ("reject_reason", "TEXT"), ("verdict", "TEXT"), ("dup_of", "INTEGER"), ("delivery", "TEXT"),
+        ("assessed_at", "TEXT"), ("delivered_at", "TEXT"), ("card_deleted_at", "TEXT"),
+        ("stale_at", "TEXT"), ("stale_reason", "TEXT"), ("desc_changed", "INTEGER DEFAULT 0"),
+        ("lead", "TEXT"), ("lead_reason", "TEXT"), ("lead_at", "TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
+    _backfill_journal(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_title_key ON freelance_orders(title_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_tech ON freelance_orders(tech)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_lead ON freelance_orders(lead)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
     )
@@ -400,11 +424,55 @@ def _init_freelance(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_fl_status ON freelance_orders(status)"
     )
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_funnel_daily (
+            day TEXT, site TEXT, reason TEXT, n INTEGER DEFAULT 0,
+            PRIMARY KEY (day, site, reason)
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
+
+
+def _backfill_journal(conn) -> None:
+    """Старые строки (до журнала) получают новые измерения из status. Без выдумывания истории:
+    время оценки и удаления карточки неизвестно (NULL / 'unknown'), «rejected» с высоким fit - это
+    сводка «ещё N» либо дубль оценённого, различить нельзя (delivery='unknown'), «rejected» без
+    оценки - tech='legacy' с причиной legacy_unknown. Идемпотентно: трогает только tech IS NULL."""
+    if conn.execute("SELECT 1 FROM freelance_orders WHERE tech IS NULL LIMIT 1").fetchone() is None:
+        return
+    conn.execute(
+        """
+        UPDATE freelance_orders SET
+          origin = CASE WHEN order_id >= 20000000000 THEN 'kwork'
+                        WHEN order_id >= 10000000000 THEN 'flru' ELSE 'alot' END,
+          tech = CASE
+            WHEN status = 'pending' AND fit IS NULL THEN 'queued'
+            WHEN status = 'expired' AND sent_at IS NULL THEN 'stale'
+            WHEN status = 'rejected' AND fit IS NULL THEN 'legacy'
+            WHEN status IN ('pending', 'sent', 'taken', 'dismissed', 'expired', 'rejected') THEN 'assessed'
+            ELSE 'legacy' END,
+          queue_reason = CASE WHEN status = 'pending' AND fit IS NULL
+                              THEN CASE WHEN COALESCE(attempts, 0) > 0 THEN 'ai_error' ELSE 'ai_wait' END END,
+          verdict = CASE WHEN fit IS NULL THEN CASE WHEN sent_at IS NOT NULL THEN 'no_ai' END
+                         WHEN fit < ? THEN 'low_fit' ELSE 'ok' END,
+          delivery = CASE WHEN sent_at IS NOT NULL THEN 'card'
+                          WHEN status = 'pending' AND fit IS NOT NULL THEN 'pending'
+                          WHEN status = 'rejected' AND fit >= ? THEN 'unknown'
+                          ELSE 'none' END,
+          delivered_at = sent_at,
+          lead = CASE status WHEN 'taken' THEN 'agreed' WHEN 'dismissed' THEN 'lost' END,
+          lead_reason = CASE WHEN status = 'dismissed' THEN 'не подходит' END,
+          card_deleted_at = CASE WHEN status = 'expired' AND sent_at IS NOT NULL THEN 'unknown' END,
+          stale_reason = CASE WHEN status = 'expired' AND sent_at IS NULL THEN 'legacy_expired' END,
+          reject_reason = CASE WHEN status = 'rejected' AND fit IS NULL THEN 'legacy_unknown' END
+        WHERE tech IS NULL
+        """,
+        (FREELANCE_MIN_FIT, FREELANCE_MIN_FIT),
+    )
 
 
 def kv_get(key: str, default: str | None = None) -> str | None:
@@ -469,6 +537,56 @@ def freelance_dup_keys(keys: list[str], days: int, sent_only: bool = False,
     return found
 
 
+def _now_sql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def freelance_dup_candidates(title_key: str, days: int, exclude_id: int | None = None) -> list[dict]:
+    """Оригиналы, с которыми можно сравнить новый заказ: та же биржа и название (title_key),
+    увиденные за последние days дней, сами не дубли и не отсеянные правилом. Для сравнения
+    текста нужен snippet; строки старой схемы без него ничего не совпадут."""
+    if not title_key:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT order_id, origin, snippet, COALESCE(budget, 0) AS price, published_at,
+                   COALESCE(pub_unreliable, 0) AS unreliable, content_hash
+            FROM freelance_orders
+            WHERE title_key = ? AND seen_at >= datetime('now', ?)
+              AND tech IN ('queued', 'assessed', 'stale') AND order_id != ?
+            ORDER BY seen_at
+            """,
+            (title_key, f"-{int(days)} days", exclude_id or -1),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_known(order_ids: list[int]) -> dict[int, dict]:
+    """Уже виденные заказы: {order_id: {content_hash, tech, desc_changed}} (для обнаружения правки описания)."""
+    found: dict[int, dict] = {}
+    if not order_ids:
+        return found
+    with _connect() as conn:
+        for i in range(0, len(order_ids), 500):
+            chunk = order_ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT order_id, content_hash, tech, COALESCE(desc_changed, 0) AS desc_changed "
+                f"FROM freelance_orders WHERE order_id IN ({marks})", chunk).fetchall()
+            found.update((r["order_id"], dict(r)) for r in rows)
+    return found
+
+
+_SAVE_COLUMNS = (
+    "site", "title", "url", "price_text", "fit", "ai_json", "published_at", "dedup_key", "attempts",
+    "message_id", "category", "budget", "hours", "sent_at", "status", "origin", "title_key",
+    "content_hash", "snippet", "pub_unreliable", "tech", "queue_reason", "reject_reason", "verdict",
+    "dup_of", "delivery", "assessed_at", "delivered_at", "card_deleted_at", "stale_at", "stale_reason",
+    "desc_changed", "lead", "lead_reason", "lead_at",
+)
+
+
 def freelance_save(
     order_id: int,
     site: str,
@@ -485,49 +603,169 @@ def freelance_save(
     category: str | None = None,
     budget: float | None = None,
     hours: float | None = None,
+    *,
+    origin: str | None = None,
+    title_key: str | None = None,
+    content_hash: str | None = None,
+    snippet: str | None = None,
+    pub_unreliable: bool | None = None,
+    tech: str | None = None,
+    queue_reason: str | None = None,
+    reject_reason: str | None = None,
+    verdict: str | None = None,
+    dup_of: int | None = None,
+    delivery: str | None = None,
+    stale_reason: str | None = None,
 ) -> None:
-    """Запоминает заказ (upsert).
+    """Запоминает заказ (upsert) и ведёт три независимых измерения (freelance/journal.py).
 
-    status: pending (ждёт оценки/отправки), sent, taken, dismissed, expired,
-    rejected (просмотрен, но не отправлен: низкий fit, дубль, сводка).
-    Уже закрытый пользователем/очисткой статус (taken/dismissed/expired) повторной
-    записью не затирается. message_id и sent_at, однажды записанные, сохраняются.
+    Состояния можно задать явно (tech/delivery/verdict/queue_reason/reject_reason/dup_of/stale_reason);
+    не заданные берутся из старого status (pending, sent, taken, dismissed, expired, rejected) -
+    совместимость. Однажды достигнутое не откатывается: доставка (card/digest), этап сделки (lead),
+    оценка (assessed не возвращается в queued), устаревание (stale не возвращается в очередь);
+    message_id и sent_at, однажды записанные, сохраняются. Время оценки и доставки пишется один раз.
     category/budget/hours - для статистики рынка и ставки (None не затирает записанное).
+    Поле status - зеркало для старых запросов (jr.legacy_status).
     """
+    guess = jr.status_to_states(status, fit, attempts)
+    now = _now_sql()
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")   # чтение-слияние-запись без гонки между потоками оценки
+        row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
+        old = dict(row) if row else {}
+        new_tech = tech or guess["tech"] or jr.LEGACY
+        old_tech = old.get("tech")
+        if old_tech == jr.ASSESSED and new_tech in (jr.QUEUED, jr.FILTERED, jr.DUPLICATE, jr.STALE):
+            new_tech = old_tech               # оценка уже получена и стоила квоты
+        elif old_tech == jr.STALE and new_tech == jr.QUEUED:
+            new_tech = old_tech               # устаревший не возвращается в очередь
+        new_delivery = delivery or guess["delivery"]
+        if old.get("delivery") in (jr.D_CARD, jr.D_DIGEST) and new_delivery in (
+                None, jr.D_NONE, jr.D_PENDING, jr.D_UNKNOWN):
+            new_delivery = old["delivery"]    # доставленное не откатывается
+        new_delivery = new_delivery or old.get("delivery") or jr.D_NONE
+        new_lead = old.get("lead") or guess["lead"]
+        new_verdict = verdict or guess["verdict"] or old.get("verdict")
+        values = {
+            "site": site, "title": title, "url": url, "price_text": price_text,
+            "fit": fit if fit is not None else old.get("fit"),
+            "ai_json": ai_json if ai_json != "" else (old.get("ai_json") or ""),
+            "published_at": published_at, "dedup_key": dedup, "attempts": attempts,
+            "message_id": message_id if message_id is not None else old.get("message_id"),
+            "category": category if category is not None else old.get("category"),
+            "budget": budget if budget is not None else old.get("budget"),
+            "hours": hours if hours is not None else old.get("hours"),
+            "sent_at": old.get("sent_at") or (now if new_delivery == jr.D_CARD else None),
+            "origin": origin or old.get("origin"),
+            "title_key": title_key or old.get("title_key"),
+            "content_hash": content_hash or old.get("content_hash"),
+            "snippet": snippet if snippet is not None else old.get("snippet"),
+            "pub_unreliable": int(pub_unreliable) if pub_unreliable is not None
+            else int(old.get("pub_unreliable") or 0),
+            "tech": new_tech,
+            "queue_reason": (queue_reason or guess["queue_reason"]) if new_tech == jr.QUEUED else None,
+            "reject_reason": reject_reason or old.get("reject_reason"),
+            "verdict": new_verdict,
+            "dup_of": dup_of if dup_of is not None else old.get("dup_of"),
+            "delivery": new_delivery,
+            "assessed_at": old.get("assessed_at") or (now if new_tech == jr.ASSESSED else None),
+            "delivered_at": old.get("delivered_at") or (
+                now if new_delivery in (jr.D_CARD, jr.D_DIGEST) else None),
+            "card_deleted_at": old.get("card_deleted_at"),
+            "stale_at": old.get("stale_at") or (now if new_tech == jr.STALE else None),
+            "stale_reason": stale_reason or old.get("stale_reason"),
+            "desc_changed": int(old.get("desc_changed") or 0),
+            "lead": new_lead,
+            "lead_reason": old.get("lead_reason"),
+            "lead_at": old.get("lead_at") or (now if new_lead else None),
+        }
+        values["status"] = jr.legacy_status(new_tech, new_delivery, new_lead,
+                                            bool(values["card_deleted_at"]))
+        cols = ("order_id", *_SAVE_COLUMNS)
+        marks = ",".join("?" * len(cols))
+        updates = ",".join(f"{c} = excluded.{c}" for c in _SAVE_COLUMNS)
         conn.execute(
-            """
-            INSERT INTO freelance_orders
-                (order_id, site, title, url, price_text, fit, ai_json,
-                 published_at, dedup_key, status, attempts, message_id,
-                 category, budget, hours, sent_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    CASE WHEN ? IN ('sent', 'taken', 'dismissed')
-                         THEN CURRENT_TIMESTAMP ELSE NULL END)
-            ON CONFLICT(order_id) DO UPDATE SET
-                site = excluded.site, title = excluded.title, url = excluded.url,
-                price_text = excluded.price_text,
-                fit = COALESCE(excluded.fit, freelance_orders.fit),
-                ai_json = CASE WHEN excluded.ai_json != '' THEN excluded.ai_json
-                               ELSE freelance_orders.ai_json END,
-                published_at = excluded.published_at,
-                dedup_key = excluded.dedup_key,
-                attempts = excluded.attempts,
-                message_id = COALESCE(excluded.message_id, freelance_orders.message_id),
-                category = COALESCE(excluded.category, freelance_orders.category),
-                budget = COALESCE(excluded.budget, freelance_orders.budget),
-                hours = COALESCE(excluded.hours, freelance_orders.hours),
-                sent_at = COALESCE(freelance_orders.sent_at, excluded.sent_at),
-                status = CASE
-                    WHEN freelance_orders.status IN ('taken', 'dismissed', 'expired')
-                         AND excluded.status IN ('sent', 'pending', 'rejected')
-                    THEN freelance_orders.status
-                    ELSE excluded.status END
-            """,
-            (order_id, site, title, url, price_text, fit, ai_json,
-             published_at, dedup, status, attempts, message_id,
-             category, budget, hours, status),
+            f"INSERT INTO freelance_orders ({','.join(cols)}) VALUES ({marks}) "
+            f"ON CONFLICT(order_id) DO UPDATE SET {updates}",
+            (order_id, *(values[c] for c in _SAVE_COLUMNS)),
         )
+
+
+def _update_states(order_id: int, **fields) -> bool:
+    """Точечная правка состояний заказа с пересчётом зеркала status. True - заказ найден."""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
+        if row is None:
+            return False
+        merged = {**dict(row), **fields}
+        merged["status"] = jr.legacy_status(
+            merged.get("tech"), merged.get("delivery"), merged.get("lead"), bool(merged.get("card_deleted_at")))
+        names = [*fields, "status"]
+        conn.execute(
+            f"UPDATE freelance_orders SET {','.join(f'{n} = ?' for n in names)} WHERE order_id = ?",
+            (*(merged[n] for n in names), order_id),
+        )
+        return True
+
+
+def freelance_mark_stale(order_id: int, reason: str) -> bool:
+    """Заказ устарел (не оценён/не доставлен до предела очереди): состояние с причиной, без удаления.
+    Уже доставленный, дубль и отсеянный остаются как есть."""
+    with _connect() as conn:
+        row = conn.execute("SELECT tech, delivery FROM freelance_orders WHERE order_id = ?",
+                           (order_id,)).fetchone()
+    if row is None:
+        return False
+    if row["delivery"] in (jr.D_CARD, jr.D_DIGEST) or row["tech"] in (jr.STALE, jr.DUPLICATE, jr.FILTERED):
+        return True
+    # оценка (fit, assessed_at) остаётся: в отчёте видно, что заказ оценили, но не доставили
+    return _update_states(order_id, tech=jr.STALE, delivery=jr.D_NONE, stale_reason=reason,
+                          stale_at=_now_sql(), queue_reason=None)
+
+
+def freelance_mark_filtered(order_id: int, reason: str) -> bool:
+    """Отсеян правилом (например, после смены фильтра ожидающий заказ больше не проходит)."""
+    return _update_states(order_id, tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
+
+
+def freelance_mark_card_deleted(order_id: int) -> bool:
+    """Карточка удалена из чата по сроку. Ни технический статус, ни этап сделки не меняются."""
+    return _update_states(order_id, card_deleted_at=_now_sql())
+
+
+def freelance_mark_desc_changed(order_id: int, content_hash: str, snippet: str | None = None) -> bool:
+    """Заказчик поправил описание уже оценённого заказа: оценка не повторяется, пометка остаётся
+    (в карточке и отчёте); отпечаток обновлён, чтобы не срабатывать каждый цикл."""
+    fields: dict = {"desc_changed": 1, "content_hash": content_hash}
+    if snippet is not None:
+        fields["snippet"] = snippet
+    return _update_states(order_id, **fields)
+
+
+def freelance_requeue(order_id: int, content_hash: str, snippet: str, queue_reason: str = jr.Q_WAIT) -> bool:
+    """Отсеянный заказ получил новое описание: снова в очередь на оценку."""
+    return _update_states(order_id, tech=jr.QUEUED, queue_reason=queue_reason, reject_reason=None,
+                          content_hash=content_hash, snippet=snippet, desc_changed=1)
+
+
+def freelance_set_queue_reason(order_id: int, reason: str, attempts: int | None = None) -> bool:
+    """Причина, по которой заказ ещё не оценён (нет квоты, ошибка AI, резерв, ждёт очереди)."""
+    with _connect() as conn:
+        row = conn.execute("SELECT tech FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
+    if row is None or row["tech"] != jr.QUEUED:
+        return False
+    fields: dict = {"queue_reason": reason}
+    if attempts is not None:
+        fields["attempts"] = attempts
+    return _update_states(order_id, **fields)
+
+
+def freelance_set_lead(order_id: int, lead: str | None, reason: str | None = None) -> bool:
+    """Этап сделки (решение пользователя). Не зависит от доставки и удаления карточки."""
+    if lead is not None and lead not in jr.LEAD_STAGES:
+        raise ValueError(f"неизвестный этап сделки: {lead}")
+    return _update_states(order_id, lead=lead, lead_reason=reason, lead_at=_now_sql() if lead else None)
 
 
 def freelance_get(order_id: int) -> dict | None:
@@ -540,13 +778,21 @@ def freelance_get(order_id: int) -> dict | None:
 
 
 def freelance_set_status(order_id: int, status: str) -> bool:
-    """Меняет статус заказа. True, если заказ найден."""
-    with _connect() as conn:
-        cur = conn.execute(
-            "UPDATE freelance_orders SET status = ? WHERE order_id = ?",
-            (status, order_id),
-        )
-        return cur.rowcount > 0
+    """Совместимость со старым API статусов (True, если заказ найден). taken/dismissed - это этап
+    сделки (lead), expired - карточка удалена из чата (или заказ устарел, если не доставлялся);
+    остальные старые статусы выводятся из tech/delivery и напрямую не ставятся."""
+    if status == "taken":
+        return freelance_set_lead(order_id, jr.LEAD_AGREED)
+    if status == "dismissed":
+        return freelance_set_lead(order_id, jr.LEAD_LOST, "не подходит")
+    if status == "expired":
+        row = freelance_get(order_id)
+        if row is None:
+            return False
+        if row.get("delivery") == jr.D_CARD:
+            return freelance_mark_card_deleted(order_id)
+        return freelance_mark_stale(order_id, jr.S_QUEUE_EXPIRED)
+    return freelance_get(order_id) is not None
 
 
 def freelance_set_deal_price(order_id: int, price: float | None) -> bool:
@@ -640,29 +886,33 @@ def freelance_set_message(order_id: int, message_id: int) -> None:
 
 
 def freelance_expired_messages(ttl_hours: int, limit: int = 200) -> list[dict]:
-    """Отправленные (status='sent', не «Взял») сообщения старше ttl_hours — под удаление."""
+    """Карточки старше ttl_hours - под удаление из чата. Карточки активных лидов (сохранён,
+    откликнулся, обсуждаем, договорились) остаются; сам лид удаление карточки не закрывает."""
+    marks = ",".join("?" * len(jr.LEAD_ACTIVE))
     with _connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT order_id, message_id
             FROM freelance_orders
-            WHERE status = 'sent' AND message_id IS NOT NULL
+            WHERE delivery = 'card' AND message_id IS NOT NULL AND card_deleted_at IS NULL
+              AND COALESCE(lead, '') NOT IN ({marks})
               AND sent_at < datetime('now', ?)
             ORDER BY sent_at
             LIMIT ?
             """,
-            (f"-{ttl_hours} hours", limit),
+            (*jr.LEAD_ACTIVE, f"-{ttl_hours} hours", limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None = None,
                       exclude_ranges: bool = False) -> list[dict]:
-    """Заказы со статусом pending (не оценены или не отправлены), новые первыми.
+    """Ожидающие заказы (не оценены - tech=queued, либо оценены и ждут доставки), новые первыми
+    по времени публикации (order_id разных источников несравнимы).
 
     id_ranges - полуинтервалы [от, до) order_id: по умолчанию выбираются только заказы из них,
     с exclude_ranges=True - все, кроме них (так лимит не занимают заказы неактивных источников)."""
-    where, params = "status = 'pending'", []
+    where, params = "(tech = 'queued' OR (tech = 'assessed' AND delivery = 'pending'))", []
     if id_ranges:
         cond = " OR ".join("(order_id >= ? AND order_id < ?)" for _ in id_ranges)
         where += f" AND {'NOT ' if exclude_ranges else ''}({cond})"
@@ -670,10 +920,11 @@ def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None 
     with _connect() as conn:
         rows = conn.execute(
             f"""
-            SELECT order_id, attempts, ai_json, published_at, dedup_key
+            SELECT order_id, attempts, ai_json, published_at, dedup_key, seen_at, queue_reason,
+                   tech, delivery, COALESCE(pub_unreliable, 0) AS pub_unreliable
             FROM freelance_orders
             WHERE {where}
-            ORDER BY order_id DESC
+            ORDER BY published_at DESC, order_id DESC
             LIMIT ?
             """,
             (*params, limit),
@@ -682,7 +933,7 @@ def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None 
 
 
 def freelance_recent(limit: int = 10, ttl_hours: int | None = None) -> list[dict]:
-    """Последние отправленные заказы, сообщения которых ещё не удалены по TTL."""
+    """Последние заказы, доставленные карточкой (карточка не удалена по TTL, лид не закрыт отказом)."""
     if ttl_hours is None:
         from config import FREELANCE_MESSAGE_TTL_HOURS
         ttl_hours = FREELANCE_MESSAGE_TTL_HOURS
@@ -691,7 +942,8 @@ def freelance_recent(limit: int = 10, ttl_hours: int | None = None) -> list[dict
             """
             SELECT order_id, site, title, url, price_text, fit, published_at
             FROM freelance_orders
-            WHERE status = 'sent' AND sent_at >= datetime('now', ?)
+            WHERE delivery = 'card' AND card_deleted_at IS NULL AND COALESCE(lead, '') != 'lost'
+              AND sent_at >= datetime('now', ?)
             ORDER BY order_id DESC
             LIMIT ?
             """,
@@ -715,40 +967,61 @@ def freelance_stats() -> dict:
 
 
 def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
-    """Итог фриланс-сводки за последние hours часов: сколько заказов прошло префильтр
-    и чем кончилось. «Отправлено» считается по sent_at (как в /status), остальное по seen_at.
-    «Отсеяно AI» - rejected с fit ниже порога (rejected с высоким fit - заказы из сводки
-    по лимиту и дубли оценённых). near_miss - лучшие из отсеянных AI."""
+    """Итог фриланс-сводки за последние hours часов по журналу. Измерения не смешиваются:
+    техническая обработка (filtered/duplicate/queued/assessed/stale), итог оценки (ok/low_fit/...),
+    доставка (card/digest/pending). Заказы из сводки «ещё N» - оценены хорошо и доставлены строкой,
+    отвергнутыми AI они не считаются. near_miss - лучшие из отсеянных AI (fit ниже порога)."""
     since = f"-{int(hours)} hours"
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT status, fit, sent_at IS NOT NULL FROM freelance_orders "
-            "WHERE seen_at >= datetime('now', ?)",
-            (since,),
-        ).fetchall()
-        counts = {"total": len(rows), "sent": 0, "rejected_ai": 0, "rejected_other": 0, "pending": 0}
-        for status, fit, was_sent in rows:
-            if was_sent:
-                continue  # отправленные считаем отдельно, по времени отправки
-            if status == "pending":
-                counts["pending"] += 1
-            elif status == "rejected" and fit is not None and fit < FREELANCE_MIN_FIT:
-                counts["rejected_ai"] += 1
-            else:  # дубли, сводка по лимиту, просроченные без оценки
-                counts["rejected_other"] += 1
-        counts["sent"] = conn.execute(
-            "SELECT COUNT(*) FROM freelance_orders WHERE sent_at >= datetime('now', ?)",
-            (since,),
+        c = {"total": 0, "filtered": 0, "duplicate": 0, "queued": 0, "assessed": 0, "stale": 0, "legacy": 0,
+             "low_fit": 0, "good": 0, "card": 0, "digest": 0, "delivery_pending": 0, "delivery_unknown": 0}
+        for tech, verdict, delivery, n in conn.execute(
+                "SELECT tech, verdict, delivery, COUNT(*) FROM freelance_orders "
+                "WHERE seen_at >= datetime('now', ?) GROUP BY tech, verdict, delivery", (since,)):
+            c["total"] += n
+            c[tech if tech in c else "legacy"] += n
+            if tech == jr.ASSESSED:
+                if verdict in (jr.V_LOW, jr.V_TRIAGE):
+                    c["low_fit"] += n
+                else:
+                    c["good"] += n
+                if delivery == jr.D_CARD:
+                    c["card"] += n
+                elif delivery == jr.D_DIGEST:
+                    c["digest"] += n
+                elif delivery == jr.D_PENDING:
+                    c["delivery_pending"] += n
+                elif delivery == jr.D_UNKNOWN:
+                    c["delivery_unknown"] += n
+        c["excluded"] = conn.execute(
+            "SELECT COALESCE(SUM(n), 0) FROM freelance_funnel_daily WHERE day >= date('now', ?)",
+            (f"-{max(1, int(hours) // 24)} days",)).fetchone()[0]
+        # «Отправлено» считается по времени отправки карточки (как в /status), остальное - по seen_at
+        c["sent"] = conn.execute(
+            "SELECT COUNT(*) FROM freelance_orders WHERE sent_at >= datetime('now', ?)", (since,)
         ).fetchone()[0]
         best = conn.execute(
             "SELECT title, url, fit FROM freelance_orders "
-            "WHERE seen_at >= datetime('now', ?) AND status = 'rejected' "
-            "AND fit IS NOT NULL AND fit < ? AND sent_at IS NULL "
-            "ORDER BY fit DESC, order_id DESC LIMIT ?",
-            (since, FREELANCE_MIN_FIT, near_miss),
+            "WHERE seen_at >= datetime('now', ?) AND tech = 'assessed' AND verdict IN ('low_fit', 'triage_low') "
+            "AND fit IS NOT NULL AND sent_at IS NULL "
+            "ORDER BY fit DESC, published_at DESC LIMIT ?",
+            (since, near_miss),
         ).fetchall()
-        counts["near_miss"] = [{"title": r[0], "url": r[1], "fit": r[2]} for r in best]
-        return counts
+        c["near_miss"] = [{"title": r[0], "url": r[1], "fit": r[2]} for r in best]
+        return c
+
+
+def freelance_count_excluded(day: str, counts: dict[str, int]) -> None:
+    """Счётчики заказов, отсеянных по площадке (вакансионные доски): строк журнала для них нет,
+    но воронка должна знать, сколько их было. counts: {site: n}."""
+    with _connect() as conn:
+        for site, n in counts.items():
+            if n > 0:
+                conn.execute(
+                    "INSERT INTO freelance_funnel_daily (day, site, reason, n) VALUES (?, ?, 'excluded_site', ?) "
+                    "ON CONFLICT(day, site, reason) DO UPDATE SET n = n + excluded.n",
+                    (day, site, int(n)),
+                )
 
 
 if __name__ == "__main__":
