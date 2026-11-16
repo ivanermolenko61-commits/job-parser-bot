@@ -15,6 +15,7 @@
     сбой записи в БД не привёл к дублю.
 """
 import html
+import hashlib
 import json
 import logging
 import math
@@ -132,7 +133,12 @@ TRIAGE_AUDIT_KEY = "triage_audit_approval"
 # В режиме on каждый TRIAGE_CONTROL_EVERY-й заказ (по id) всё равно оценивается полной моделью, даже если триаж
 # его отсёк бы: так пропуски продолжают измеряться, а первый же пропуск возвращает режим shadow
 TRIAGE_CONTROL_EVERY = 10
-_EVIDENCE_FIELDS = ("n", "good", "miss", "lab_good", "lab_bad", "lab_miss")
+# n - сравнений с полной оценкой; good - из них подходящих (полная >= порога); cut - сравнений, где триаж отсёк бы заказ
+# (быстрая <= TRIAGE_REJECT_MAX); miss - подходящие среди отсекаемых (cut AND good); extra - расхождение в другую сторону
+# (триаж пропустил заказ, полная модель его отклонила: лишний расход квоты, не потеря); ctl_cut/ctl_miss - то же только
+# для контрольного среза режима on. Три разные величины: доля подходящих среди отсекаемых = miss/cut, доля пропущенных
+# среди подходящих = miss/good, расхождения с полной моделью = miss + extra из n
+_EVIDENCE_FIELDS = ("n", "good", "miss", "lab_good", "lab_bad", "lab_miss", "cut", "extra", "ctl_cut", "ctl_miss")
 _triage_evidence_lock = threading.Lock()
 _triage_warned = {"on": False}
 LAST_ID_KEY = "alot_last_id"
@@ -828,7 +834,7 @@ def _prepare_cycle() -> CycleResult:
         shadow_ok = (triage_mode == "shadow" and will_score
                      and ai_scorer.triage_today() < TRIAGE_SHADOW_MAX_PER_DAY)
         triage = _triage(sc) if (triage_mode == "on" or shadow_ok) else None
-        control = triage_mode == "on" and sc.order.order_id % TRIAGE_CONTROL_EVERY == 0
+        control = triage_mode == "on" and _is_control(sc.order.order_id)
         if triage_mode == "on" and not control and triage is not None and triage <= TRIAGE_REJECT_MAX:
             return {"fit": triage, "triage": True, "model": f"triage:{ai_scorer.TRIAGE_MODEL}",
                     "summary": "отсеян быстрым фильтром"}
@@ -842,7 +848,7 @@ def _prepare_cycle() -> CycleResult:
         if result is not None:
             _save_scored_now(sc, result)
         if (triage_mode == "shadow" or control) and triage is not None and result is not None:
-            _log_triage_shadow(sc, triage, result)
+            _log_triage_shadow(sc, triage, result, control)
         return result
 
     with ThreadPoolExecutor(AI_WORKERS) as pool:
@@ -979,13 +985,30 @@ def _save_evidence(ev: dict) -> None:
     kv_set(TRIAGE_EVIDENCE_KEY, json.dumps({**{k: ev[k] for k in _EVIDENCE_FIELDS}, "sig": ev["sig"]}))
 
 
-def _record_triage_evidence(miss: bool, good: bool, order_id: int | None = None, triage: int | None = None) -> None:
+def _is_control(order_id: int) -> bool:
+    """Контрольный срез режима on: каждый ~10-й заказ (по хэшу id и отпечатка настроек) оценивается полной моделью,
+    даже если триаж его отсёк бы. Без состояния в памяти, поэтому одинаков после рестарта. Выборка детерминированная
+    (систематическая), не случайная: не защищает от закономерностей, привязанных к самому хэшу; при смене настроек
+    срез меняется. Расход квоты: ~10% отсекаемых заказов оцениваются полной моделью"""
+    h = hashlib.sha1(f"{order_id}|{_evidence_signature()}".encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "big") % TRIAGE_CONTROL_EVERY == 0
+
+
+def _record_triage_evidence(miss: bool, good: bool, order_id: int | None = None, triage: int | None = None,
+                            control: bool = False) -> None:
     try:
         with _triage_evidence_lock:
             ev = triage_evidence()   # при смене настроек начинается с нуля
             ev["n"] += 1
             ev["good"] += 1 if good else 0
             ev["miss"] += 1 if miss else 0
+            if triage is not None:
+                cut = int(triage) <= TRIAGE_REJECT_MAX
+                ev["cut"] += 1 if cut else 0
+                ev["extra"] += 1 if (not cut and not good) else 0
+                if control and cut:
+                    ev["ctl_cut"] += 1
+                    ev["ctl_miss"] += 1 if miss else 0
             _save_evidence(ev)
             if order_id is not None and triage is not None:
                 scores = _load_scores()
@@ -1057,51 +1080,102 @@ def triage_allowed() -> tuple[bool, str]:
                   f"{ev['lab_good']} подходящих и {ev['lab_bad']} отклонённых")
 
 
-def triage_approval() -> dict:
-    """Подтверждение владельца для ТЕКУЩИХ настроек триажа (отпечаток): valid - можно, why - почему нет."""
+def _audit_state() -> dict:
+    """Состояние выборки владельца для ТЕКУЩИХ настроек: issued - все выданные заказы (уникальные), pending - выданная
+    и ещё не подтверждённая партия, reviewed - подтверждённые, suitable - из них отмеченные подходящими.
+    При смене настроек (отпечаток) состояние начинается с нуля."""
+    sig = _evidence_signature()
     try:
         data = json.loads(kv_get(TRIAGE_AUDIT_KEY, "") or "{}")
     except (ValueError, TypeError):
         data = {}
-    if not isinstance(data, dict) or data.get("sig") != _evidence_signature():
-        return {"valid": False, "checked": 0, "suitable": 0,
-                "why": f"нет подтверждения владельца для этих настроек: просмотрите выборку /triage_audit "
-                       f"(не меньше {TRIAGE_AUDIT_MIN} заказов) и внесите итог /triage_approve"}
-    checked, suitable = int(data.get("checked") or 0), int(data.get("suitable") or 0)
+    if not isinstance(data, dict) or data.get("sig") != sig:
+        return {"sig": sig, "issued": [], "pending": [], "code": "", "reviewed": [], "suitable": []}
+    out = {"sig": sig}
+    for k in ("issued", "pending", "reviewed", "suitable"):
+        v = data.get(k)
+        out[k] = [int(x) for x in v] if isinstance(v, list) else []
+    out["code"] = str(data.get("code") or "")
+    return out
+
+
+def _batch_code(sig: str, ids: list[int]) -> str:
+    return hashlib.sha1(f"{sig}|{','.join(map(str, sorted(ids)))}".encode("utf-8")).hexdigest()[:4]
+
+
+def triage_approval() -> dict:
+    """Подтверждение владельца для ТЕКУЩИХ настроек триажа (отпечаток): valid - можно, why - почему нет.
+    Считаются только уникальные заказы, выданные ботом и подтверждённые по коду партии."""
+    st = _audit_state()
+    checked, suitable = len(set(st["reviewed"])), len(set(st["suitable"]))
+    base = {"checked": checked, "suitable": suitable, "issued": len(set(st["issued"])), "pending": len(st["pending"])}
     if suitable:
-        return {"valid": False, "checked": checked, "suitable": suitable,
+        return {**base, "valid": False,
                 "why": f"выборка владельца нашла подходящих среди отсекаемых: {suitable} из {checked}"}
     if checked < TRIAGE_AUDIT_MIN:
-        return {"valid": False, "checked": checked, "suitable": 0,
-                "why": f"просмотрено {checked} из {TRIAGE_AUDIT_MIN} заказов выборки"}
-    return {"valid": True, "checked": checked, "suitable": 0, "why": ""}
+        return {**base, "valid": False,
+                "why": f"нет подтверждения владельца для этих настроек: просмотрено {checked} из {TRIAGE_AUDIT_MIN} "
+                       f"уникальных заказов выборки (/triage_audit, затем /triage_approve)"}
+    return {**base, "valid": True, "why": ""}
 
 
-def approve_triage(checked: int, suitable: int) -> str:
-    """Внести итог просмотра выборки отсекаемых заказов (привязывается к текущим настройкам триажа)."""
-    if checked < 0 or suitable < 0 or suitable > checked:
-        return "Числа некорректны: нужно /triage_approve <просмотрено> <из них подходящих>."
-    kv_set(TRIAGE_AUDIT_KEY, json.dumps({"sig": _evidence_signature(), "checked": checked, "suitable": suitable}))
+def approve_triage(code: str, suitable_ids: list[int] | None = None) -> str:
+    """Подтвердить просмотр ВЫДАННОЙ партии выборки: code - код партии из /triage_audit, suitable_ids - заказы партии,
+    которые владелец счёл подходящими (остальные считаются просмотренными и неподходящими). Произвольные числа не
+    принимаются: партия должна быть выдана ботом при текущих настройках, id - из этой партии. Что владелец действительно
+    открыл заказы, бот проверить не может: подтверждение остаётся его ответственностью"""
+    suitable_ids = [int(x) for x in (suitable_ids or [])]
+    with _triage_evidence_lock:
+        st = _audit_state()
+        if not st["pending"]:
+            return "Нет выданной партии для текущих настроек: сначала /triage_audit."
+        if str(code).strip().lower() != st["code"]:
+            return "Код партии не совпадает с выданным в /triage_audit: подтверждение не принято."
+        bad = [x for x in suitable_ids if x not in st["pending"]]
+        if bad:
+            return f"Заказы не из выданной партии: {bad}. Подтверждение не принято."
+        st["reviewed"] = sorted(set(st["reviewed"]) | set(st["pending"]))
+        st["suitable"] = sorted(set(st["suitable"]) | set(suitable_ids))
+        n = len(st["pending"])
+        st["pending"], st["code"] = [], ""
+        kv_set(TRIAGE_AUDIT_KEY, json.dumps(st))
     ok, why = triage_allowed()
-    return (f"Итог принят: просмотрено {checked}, подходящих {suitable}. "
+    ap = triage_approval()
+    return (f"Партия принята: {n} заказов, подходящих {len(suitable_ids)}. Всего уникальных просмотрено "
+            f"{ap['checked']} из {TRIAGE_AUDIT_MIN}, подходящих {ap['suitable']}. "
             + ("Остальные условия выполнены, отсечение разрешено (если запрошен on)." if ok
                else f"Отсечение пока не разрешено: {why}."))
 
 
-def triage_audit_sample(k: int = 20) -> list[dict]:
-    """Случайная выборка заказов, которые триаж отсёк бы при текущих настройках (быстрая оценка <= порога)."""
+def triage_audit_sample(k: int = 20) -> dict:
+    """Партия случайной выборки заказов, которые триаж отсёк бы при текущих настройках (быстрая оценка <= порога).
+    Выдаются только ещё не выданные заказы: повторный вызов до подтверждения возвращает ту же партию и не увеличивает
+    число уникальных наблюдений. Выборка - из последних TRIAGE_SCORES_MAX заказов, у которых было сравнение с полной
+    оценкой (не из истёкших без оценки). Полная оценка модели владельцу не показывается (чтобы не подсказывала решение)."""
     import random
-    sig = _evidence_signature()
-    ids = [int(oid) for oid, rec in _load_scores().items()
-           if rec and rec[1] == sig and int(rec[0]) <= TRIAGE_REJECT_MAX]
-    random.shuffle(ids)
-    out = []
-    for oid in ids[:k]:
+    with _triage_evidence_lock:
+        st = _audit_state()
+        if st["pending"]:
+            ids = list(st["pending"])
+        else:
+            seen = set(st["issued"])
+            cand = [int(oid) for oid, rec in _load_scores().items()
+                    if rec and rec[1] == st["sig"] and int(rec[0]) <= TRIAGE_REJECT_MAX and int(oid) not in seen
+                    and freelance_get(int(oid))]
+            random.SystemRandom().shuffle(cand)
+            ids = cand[:k]
+            if ids:
+                st["pending"] = ids
+                st["issued"] = sorted(seen | set(ids))
+                st["code"] = _batch_code(st["sig"], ids)
+                kv_set(TRIAGE_AUDIT_KEY, json.dumps(st))
+        code = st["code"] if st["pending"] else ""
+    rows = []
+    for oid in ids:
         row = freelance_get(oid)
         if row:
-            out.append({"order_id": oid, "title": row.get("title") or "", "url": row.get("url") or "",
-                        "fit": row.get("fit")})
-    return out
+            rows.append({"order_id": oid, "title": row.get("title") or "", "url": row.get("url") or ""})
+    return {"code": code, "rows": rows}
 
 
 def triage_report() -> str:
@@ -1118,11 +1192,14 @@ def triage_report() -> str:
         lines.append("  прежняя статистика устарела (модель, промпт или пороги изменились): счёт начат заново")
     lines.append(f"  сравнений с полной оценкой {ev['n']}/{TRIAGE_MIN_SAMPLE}, подходящих {ev['good']}/"
                  f"{TRIAGE_MIN_GOOD}, пропусков {ev['miss']}")
+    lines.append(f"  отсекаемых {ev['cut']}: подходящих среди них {ev['miss']}; пропущенных среди подходящих "
+                 f"{ev['miss']} из {ev['good']}; лишних оценок (триаж пропустил, полная отклонила) {ev['extra']}")
+    lines.append(f"  контрольный срез on: отсекаемых {ev['ctl_cut']}, пропусков {ev['ctl_miss']}")
     lines.append(f"  отметки владельца: подходящих {ev['lab_good']}/{TRIAGE_MIN_LABELED}, отклонённых "
                  f"{ev['lab_bad']}, пропусков {ev['lab_miss']}")
     appr = triage_approval()
-    lines.append(f"  выборка отсекаемых: просмотрено {appr['checked']}/{TRIAGE_AUDIT_MIN}, "
-                 f"подходящих {appr['suitable']}")
+    lines.append(f"  выборка отсекаемых: выдано уникальных {appr['issued']}, просмотрено {appr['checked']}/"
+                 f"{TRIAGE_AUDIT_MIN}, подходящих {appr['suitable']}, ждёт подтверждения {appr['pending']}")
     return "\n".join(lines)
 
 
@@ -1139,14 +1216,14 @@ def effective_triage_mode() -> str:
     return "on"
 
 
-def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict) -> None:
+def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict, control: bool = False) -> None:
     """Сравнение быстрой и полной оценки (режим shadow): по этим строкам решаем, включать ли триаж."""
     try:
         full = int(result["fit"])
     except (KeyError, TypeError, ValueError):
         return
     miss = triage <= TRIAGE_REJECT_MAX and full >= FREELANCE_MIN_FIT
-    _record_triage_evidence(miss, full >= FREELANCE_MIN_FIT, sc.order.order_id, triage)
+    _record_triage_evidence(miss, full >= FREELANCE_MIN_FIT, sc.order.order_id, triage, control)
     title = ai_scorer.mask_contacts(sc.order.title or "")[:60]
     logging.info(f"[TRIAGE] заказ {sc.order.order_id}: быстрая {triage}, полная {full}"
                  f"{' - ПРОПУСТИЛ БЫ ХОРОШИЙ' if miss else ''} {title!r}")

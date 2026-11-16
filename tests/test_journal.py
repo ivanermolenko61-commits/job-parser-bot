@@ -24,6 +24,28 @@ def order(oid, title="Выгрузка заказов из Wildberries в Google
                           list(cats), datetime.now(timezone.utc) - timedelta(hours=age_h), f"https://x/{oid}")
 
 
+def seed_cut_orders(n, start=70000, triage=1):
+    """n заказов с быстрой оценкой <= порога (триаж их отсёк бы) при ТЕКУЩИХ настройках: в БД и в выборке сравнений."""
+    scores = pipeline._load_scores()
+    sig = pipeline._evidence_signature()
+    for i in range(n):
+        oid = start + i
+        database.freelance_save(oid, "flru", f"Отсекаемый заказ {oid}", f"https://x/{oid}", "", "2026-11-16T10:00:00",
+                                f"cut{oid}", 5, "", "pending", 0, None)
+        scores[str(oid)] = [triage, sig]
+    database.kv_set(pipeline.TRIAGE_SCORES_KEY, __import__("json").dumps(scores))
+
+
+def approve_audit(n=None):
+    """Пройти выборку владельца честно: выдача партий и подтверждение каждой по коду (подходящих нет)."""
+    n = n or pipeline.TRIAGE_AUDIT_MIN
+    seed_cut_orders(n)
+    while pipeline.triage_approval()["checked"] < n:
+        batch = pipeline.triage_audit_sample(20)
+        assert batch["rows"], "выборка кончилась раньше времени"
+        pipeline.approve_triage(batch["code"], [])
+
+
 class PureJournalTest(unittest.TestCase):
     def sl(self, a, b):
         return jr.same_listing(a, b)
@@ -317,7 +339,7 @@ class TriageGuardTest(CycleTestBase):
             # числа достигнуты, но без подтверждения владельца по выборке отсекаемых режим остаётся shadow
             self.assertEqual(pipeline.effective_triage_mode(), "shadow")
             self.assertIn("подтверждения владельца", pipeline.triage_allowed()[1])
-            pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
+            approve_audit()
             self.assertEqual(pipeline.effective_triage_mode(), "on")
 
     def test_shadow_triage_limited_per_day(self):

@@ -1198,27 +1198,29 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("triage_audit"))
 async def cmd_triage_audit(message: Message):
-    """Случайные заказы, которые быстрый триаж отсёк бы: просмотрите, нет ли среди них подходящих."""
-    rows = await asyncio.to_thread(triage_audit_sample, 20)
+    """Партия случайных заказов, которые быстрый триаж отсёк бы: просмотрите, нет ли среди них подходящих."""
+    batch = await asyncio.to_thread(triage_audit_sample, 20)
+    rows = batch["rows"]
     if not rows:
-        await message.answer("Пока нет заказов, которые триаж отсёк бы при текущих настройках.")
+        await message.answer("Нет новых заказов, которые триаж отсёк бы при текущих настройках (или все уже выданы).")
         return
-    lines = ["Выборка заказов, которые триаж отсёк бы. Сколько просмотрели и сколько из них подходящих - "
-             "внесите: /triage_approve <просмотрено> <подходящих>"]
+    lines = [f"Партия заказов, которые триаж отсёк бы (код {batch['code']}). Откройте и оцените каждый сами. "
+             f"Подтверждение: /triage_approve {batch['code']} [id подходящих через пробел]. "
+             "Повторный запрос выдаёт ту же партию."]
     for r in rows:
-        lines.append(f"- {html.escape(r['title'][:80])} (полная оценка {r['fit']}) {html.escape(r['url'])}")
+        lines.append(f"- {r['order_id']}: {html.escape(r['title'][:80])} {html.escape(r['url'])}")
     for chunk in _split_messages("\n".join(lines)):
         await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message(Command("triage_approve"))
 async def cmd_triage_approve(message: Message):
-    """/triage_approve <просмотрено> <из них подходящих>: итог просмотра выборки отсекаемых заказов."""
+    """/triage_approve <код партии> [id подходящих]: итог просмотра выданной партии отсекаемых заказов."""
     parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        await message.answer("Формат: /triage_approve <просмотрено> <из них подходящих>")
+    if len(parts) < 2 or not all(x.isdigit() for x in parts[2:]):
+        await message.answer("Формат: /triage_approve <код партии> [id подходящих заказов партии]")
         return
-    await message.answer(await asyncio.to_thread(approve_triage, int(parts[1]), int(parts[2])))
+    await message.answer(await asyncio.to_thread(approve_triage, parts[1], [int(x) for x in parts[2:]]))
 
 
 @dp.message(Command("funnel"))
