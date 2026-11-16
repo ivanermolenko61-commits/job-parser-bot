@@ -437,16 +437,16 @@ def _full_snippet(o: FreelanceOrder) -> str:
 
 
 def _journal_new(o: FreelanceOrder, tech: str, *, full: bool, **states) -> None:
-    """Первая запись об увиденном заказе. Название в строках без карточки (отсеян, дубль, устарел)
-    маскируется: контакты заказчика в журнал не попадают."""
+    """Первая запись об увиденном заказе. Название маскируется всегда (телефон, почта, токен -> метка):
+    карточка из БД показывает обезличенное название, контакты заказчика в журнал не попадают."""
     origin = sources.source_of(o.order_id)
     snippet = _full_snippet(o)
     if not full:
         snippet = snippet[:jr.SNIPPET_FILTERED]
-    title = o.title if full else ai_scorer.mask_contacts(o.title or "")
+    title = ai_scorer.mask_contacts(o.title or "")   # контакты заказчика в БД не попадают ни в каком виде
     freelance_save(
-        o.order_id, o.site, title, o.url, o.price_text, o.published_at.isoformat(),
-        norm_dedup_key(o), None, "", "pending", 0, None,
+        o.order_id, o.site, title, o.url, ai_scorer.mask_contacts(o.price_text or ""),
+        o.published_at.isoformat(), norm_dedup_key(o), None, "", "pending", 0, None,
         budget=o.price_value if o.price_value and o.price_value > 0 else None,
         origin=origin, title_key=jr.title_key(o.site, o.title),
         content_hash=jr.content_hash(o.title, o.body), snippet=snippet,
@@ -1135,7 +1135,8 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
         states["delivery"] = delivery
     origin = sources.source_of(o.order_id)
     freelance_save(
-        o.order_id, o.site, o.title, o.url, o.price_text,
+        o.order_id, o.site, ai_scorer.mask_contacts(o.title or ""), o.url,
+        ai_scorer.mask_contacts(o.price_text or ""),
         o.published_at.isoformat(), sc.dedup, sc.fit,
         json.dumps(sc.ai, ensure_ascii=False) if sc.ai else "",
         status, sc.attempts, message_id,
