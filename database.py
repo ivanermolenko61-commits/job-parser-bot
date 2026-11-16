@@ -637,12 +637,14 @@ def freelance_save(
         old_tech = old.get("tech")
         if old_tech == jr.ASSESSED and new_tech in (jr.QUEUED, jr.FILTERED, jr.DUPLICATE, jr.STALE):
             new_tech = old_tech               # оценка уже получена и стоила квоты
-        elif old_tech == jr.STALE and new_tech == jr.QUEUED:
-            new_tech = old_tech               # устаревший не возвращается в очередь
+        elif old_tech == jr.STALE:
+            new_tech = old_tech               # устаревший терминален: запоздавшая оценка не возвращает его в обработку
         new_delivery = delivery or guess["delivery"]
         if old.get("delivery") in (jr.D_CARD, jr.D_DIGEST) and new_delivery in (
                 None, jr.D_NONE, jr.D_PENDING, jr.D_UNKNOWN):
             new_delivery = old["delivery"]    # доставленное не откатывается
+        elif old_tech == jr.STALE and new_delivery not in (jr.D_CARD, jr.D_DIGEST):
+            new_delivery = old.get("delivery") or jr.D_NONE   # оценка сохраняется, очередь доставки не воскресает
         new_delivery = new_delivery or old.get("delivery") or jr.D_NONE
         new_lead = old.get("lead") or guess["lead"]
         new_verdict = verdict or guess["verdict"] or old.get("verdict")
@@ -691,13 +693,17 @@ def freelance_save(
         )
 
 
-def _update_states(order_id: int, **fields) -> bool:
-    """Точечная правка состояний заказа с пересчётом зеркала status. True - заказ найден."""
+def _update_states(order_id: int, _guard=None, **fields) -> bool:
+    """Точечная правка состояний заказа с пересчётом зеркала status. True - заказ найден.
+    _guard(row) -> bool проверяется в той же транзакции, что и запись: False - строка не меняется
+    (конкурентная доставка или устаревание не затираются); заказ при этом считается найденным."""
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
         if row is None:
             return False
+        if _guard is not None and not _guard(dict(row)):
+            return True
         merged = {**dict(row), **fields}
         merged["status"] = jr.legacy_status(
             merged.get("tech"), merged.get("delivery"), merged.get("lead"), bool(merged.get("card_deleted_at")))
@@ -712,21 +718,21 @@ def _update_states(order_id: int, **fields) -> bool:
 def freelance_mark_stale(order_id: int, reason: str) -> bool:
     """Заказ устарел (не оценён/не доставлен до предела очереди): состояние с причиной, без удаления.
     Уже доставленный, дубль и отсеянный остаются как есть."""
-    with _connect() as conn:
-        row = conn.execute("SELECT tech, delivery FROM freelance_orders WHERE order_id = ?",
-                           (order_id,)).fetchone()
-    if row is None:
-        return False
-    if row["delivery"] in (jr.D_CARD, jr.D_DIGEST) or row["tech"] in (jr.STALE, jr.DUPLICATE, jr.FILTERED):
-        return True
-    # оценка (fit, assessed_at) остаётся: в отчёте видно, что заказ оценили, но не доставили
-    return _update_states(order_id, tech=jr.STALE, delivery=jr.D_NONE, stale_reason=reason,
-                          stale_at=_now_sql(), queue_reason=None)
+    # оценка (fit, assessed_at) остаётся: в отчёте видно, что заказ оценили, но не доставили;
+    # проверка и запись - одна транзакция: доставка, состоявшаяся между ними, не затирается
+    return _update_states(
+        order_id,
+        lambda r: r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST)
+        and r.get("tech") not in (jr.STALE, jr.DUPLICATE, jr.FILTERED),
+        tech=jr.STALE, delivery=jr.D_NONE, stale_reason=reason, stale_at=_now_sql(), queue_reason=None)
 
 
 def freelance_mark_filtered(order_id: int, reason: str) -> bool:
     """Отсеян правилом (например, после смены фильтра ожидающий заказ больше не проходит)."""
-    return _update_states(order_id, tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
+    return _update_states(
+        order_id, lambda r: r.get("tech") in (jr.QUEUED, jr.ASSESSED)
+        and r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST),
+        tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
 
 
 def freelance_mark_card_deleted(order_id: int) -> bool:
@@ -745,7 +751,8 @@ def freelance_mark_desc_changed(order_id: int, content_hash: str, snippet: str |
 
 def freelance_requeue(order_id: int, content_hash: str, snippet: str, queue_reason: str = jr.Q_WAIT) -> bool:
     """Отсеянный заказ получил новое описание: снова в очередь на оценку."""
-    return _update_states(order_id, tech=jr.QUEUED, queue_reason=queue_reason, reject_reason=None,
+    return _update_states(order_id, lambda r: r.get("tech") == jr.FILTERED,
+                          tech=jr.QUEUED, queue_reason=queue_reason, reject_reason=None,
                           content_hash=content_hash, snippet=snippet, desc_changed=1)
 
 
