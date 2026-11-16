@@ -196,6 +196,25 @@ class IntakeTest(CycleTestBase):
         self.assertEqual(row["desc_changed"], 1)
         self.assertEqual(row["tech"], "assessed")
 
+    def test_edit_of_assessed_order_is_saved_detected_once_and_keeps_old_score(self):
+        """Контракт desc_changed: оценка относится к ПРЕЖНЕМУ описанию; правка сохраняется (отпечаток, текст),
+        обнаруживается один раз, повторной оценки нет (её вопрос - требования Ф06)."""
+        self.cycle(alot=[order(603, site="flru")])
+        before = database.freelance_get(603)
+        edited = order(603, site="flru", body=LONG_BODY + " Срок - до пятницы.")
+        res, score = self.cycle(alot=[edited])
+        row = database.freelance_get(603)
+        self.assertEqual(res.intake.get("updated"), 1)
+        self.assertEqual(row["desc_changed"], 1)
+        self.assertNotEqual(row["content_hash"], before["content_hash"])
+        self.assertEqual(row["content_hash"], jr.content_hash(edited.title, edited.body))
+        self.assertIn("до пятницы", row["snippet"])
+        self.assertEqual((row["tech"], row["fit"]), (before["tech"], before["fit"]))   # оценка прежняя
+        res2, score2 = self.cycle(alot=[edited])                                         # тот же текст ещё раз
+        score2.assert_not_called()
+        self.assertEqual(res2.intake.get("updated", 0), 0)
+        self.assertEqual(database.freelance_get(603)["content_hash"], row["content_hash"])
+
     def test_updated_description_lets_filtered_order_through(self):
         o = order(602, title="Нужна помощь", body="Купить диван", site="youdoru")
         self.cycle(alot=[o])
