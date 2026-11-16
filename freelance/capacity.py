@@ -168,21 +168,30 @@ def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_sh
                 rest.append(item)
         pending = rest
     out: dict = {"groups": {}, "days": days - warmup_days}
-    lost_good = arrived_good = 0.0
+    lost_good = arrived_good = triage_lost = total_good = 0.0
+    window = days - warmup_days
     for g in groups:
         st = stat[g]
         waits = sorted(st["waits"])
         left = sum(1 for it in pending if it[1] == g and it[0] >= warm)
         gs = good_share.get(g, 0.0)
+        # все подходящие группы за окно и те из них, что триаж ошибочно снял (triage_miss - ДОПУЩЕНИЕ: доля
+        # ВСЕХ подходящих заказов группы, потерянных триажем; замера нет). Остальные подходящие идут в очередь
+        group_good = demand_per_day * mix.get(g, 0.0) / total_mix * window * gs
+        lost_by_triage = group_good * triage_miss if skip_share.get(g, 0.0) > 0 else 0.0
+        q_share = gs if not lost_by_triage else ((group_good - lost_by_triage) / st["arrived"]
+                                                 if st["arrived"] else 0.0)
+        triage_lost += lost_by_triage
+        total_good += group_good
         # потеря - только истёкшие без оценки; ещё ждущие (хвост на конец прогона) показаны отдельно
         unscored = st["expired"]
-        lost_good += unscored * gs
-        arrived_good += st["arrived"] * gs
+        lost_good += unscored * q_share
+        arrived_good += st["arrived"] * q_share
         out["groups"][g] = {
             "arrived": st["arrived"], "scored": st["scored"], "expired": st["expired"], "waiting": left,
             "wait_median_h": waits[len(waits) // 2] if waits else None,
             "wait_p90_h": waits[int(len(waits) * 0.9)] if waits else None,
-            "lost_good": round(unscored * gs, 1),
+            "lost_good": round(unscored * q_share, 1),
         }
     arrived = sum(v["arrived"] for v in out["groups"].values())
     out["arrived"] = arrived
@@ -192,14 +201,6 @@ def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_sh
     out["good_arrived"] = round(arrived_good, 1)
     out["good_lost"] = round(lost_good, 1)
     out["good_lost_share"] = round(lost_good / arrived_good, 3) if arrived_good else None
-    # заказы, снятые триажем до очереди: доля подходящих среди них и потери от пропусков самого триажа
-    # (triage_miss - ДОПУЩЕНИЕ о доле пропущенных подходящих, замера нет)
-    window = days - warmup_days
-    skipped_good = sum(demand_per_day * mix.get(g, 0.0) / total_mix * window * skip_share.get(g, 0.0)
-                       * good_share.get(g, 0.0) for g in groups)
-    triage_lost = skipped_good * triage_miss
-    total_good = arrived_good + skipped_good
-    out["good_skipped"] = round(skipped_good, 1)
     out["triage_good_lost"] = round(triage_lost, 1)
     out["good_total"] = round(total_good, 1)
     out["loss_total_share"] = round((lost_good + triage_lost) / total_good, 3) if total_good else None

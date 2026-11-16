@@ -39,14 +39,18 @@ class SimulateQueueTest(unittest.TestCase):
         skipped = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4})
         self.assertLess(skipped["expired"], base["expired"])
 
-    def test_triage_own_losses_counted_against_total(self):
-        r = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4, 2: 0.25}, triage_miss=0.1)
-        self.assertGreater(r["good_skipped"], 0)
-        self.assertAlmostEqual(r["triage_good_lost"], r["good_skipped"] * 0.1, delta=0.1)
-        self.assertAlmostEqual(r["good_total"], r["good_arrived"] + r["good_skipped"], delta=0.1)
-        self.assertGreaterEqual(r["loss_total_share"], r["good_lost"] / r["good_total"] - 0.001)
-        none = capacity.simulate_queue(127, 86, MIX, GOOD)
-        self.assertEqual((none["good_skipped"], none["triage_good_lost"]), (0.0, 0.0))
+    def test_triage_miss_is_share_of_all_good_in_trimmed_groups(self):
+        # ёмкости с запасом: потери только от триажа, и они равны заданной доле подходящих группы
+        r = capacity.simulate_queue(100, 500, {1: 0.0, 2: 0.0, 3: 1.0}, {1: 0.0, 2: 0.0, 3: 0.2},
+                                    skip_share={3: 0.4}, triage_miss=0.05)
+        self.assertAlmostEqual(r["good_total"], 100 * r["days"] * 0.2, delta=0.1)
+        self.assertAlmostEqual(r["triage_good_lost"], r["good_total"] * 0.05, delta=0.1)
+        self.assertAlmostEqual(r["loss_total_share"], 0.05, delta=0.002)
+        self.assertEqual(r["good_lost"], 0)
+
+    def test_no_triage_means_no_triage_losses(self):
+        none = capacity.simulate_queue(127, 86, MIX, GOOD, triage_miss=0.5)
+        self.assertEqual(none["triage_good_lost"], 0.0)
 
     def test_deterministic(self):
         self.assertEqual(capacity.simulate_queue(127, 86, MIX, GOOD), capacity.simulate_queue(127, 86, MIX, GOOD))
