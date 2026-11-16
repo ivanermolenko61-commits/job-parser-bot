@@ -39,6 +39,15 @@ class SimulateQueueTest(unittest.TestCase):
         skipped = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4})
         self.assertLess(skipped["expired"], base["expired"])
 
+    def test_triage_own_losses_counted_against_total(self):
+        r = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4, 2: 0.25}, triage_miss=0.1)
+        self.assertGreater(r["good_skipped"], 0)
+        self.assertAlmostEqual(r["triage_good_lost"], r["good_skipped"] * 0.1, delta=0.1)
+        self.assertAlmostEqual(r["good_total"], r["good_arrived"] + r["good_skipped"], delta=0.1)
+        self.assertGreaterEqual(r["loss_total_share"], r["good_lost"] / r["good_total"] - 0.001)
+        none = capacity.simulate_queue(127, 86, MIX, GOOD)
+        self.assertEqual((none["good_skipped"], none["triage_good_lost"]), (0.0, 0.0))
+
     def test_deterministic(self):
         self.assertEqual(capacity.simulate_queue(127, 86, MIX, GOOD), capacity.simulate_queue(127, 86, MIX, GOOD))
 
@@ -78,25 +87,30 @@ class CapacityToolTest(CycleTestBase):
             self.assertEqual(capacity_report.main(["--db", database.DB_PATH]), 0)
         text = buf.getvalue()
         self.assertIn("симуляция очереди", text)
-        self.assertIn("ДОПУЩЕНИЕ", text)
+        self.assertIn("ДОПУЩЕНИЯ", text)
         self.assertIn("потеряно подходящих", text)
-        self.assertIn("НЕ учтены", text)
+        self.assertIn("СЦЕНАРИИ", text)
+        self.assertIn("OpenRouter не отвечает", text)
+        self.assertIn("БЕЗ триажа", text)
+        self.assertIn("у триажа", text)
 
 
 class TriageEvidenceStaleTest(CycleTestBase):
     def fill(self, labeled=True):
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
-            pipeline._record_triage_evidence(miss=False, good=(i < 30), order_id=100 + i, triage=7)
+            pipeline._record_triage_evidence(miss=False, good=(i < 60), order_id=100 + i, triage=7)
         if labeled:
             for i in range(pipeline.TRIAGE_MIN_LABELED):
                 pipeline.record_triage_label(100 + i, True)
 
     def test_clean_evidence_allows(self):
         self.fill()
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
         self.assertTrue(pipeline.triage_allowed()[0])
 
     def test_model_change_discards_statistics(self):
         self.fill()
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
         with mock.patch.object(ai_scorer, "TRIAGE_MODEL", "другая-модель"):
             ok, why = pipeline.triage_allowed()
             self.assertFalse(ok)
@@ -130,10 +144,82 @@ class TriageEvidenceStaleTest(CycleTestBase):
         self.assertFalse(pipeline.triage_allowed()[0])
 
 
+class OwnerApprovalTest(CycleTestBase):
+    """Числа в настройках сервера не включают отсечение без подтверждения владельца по выборке отсекаемых."""
+
+    def fill_all(self):
+        for i in range(pipeline.TRIAGE_MIN_SAMPLE):
+            pipeline._record_triage_evidence(miss=False, good=(i < pipeline.TRIAGE_MIN_GOOD), order_id=100 + i, triage=7)
+        for i in range(pipeline.TRIAGE_MIN_LABELED):
+            pipeline.record_triage_label(100 + i, True)
+
+    def test_thresholds_without_approval_stay_shadow(self):
+        self.fill_all()
+        with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+            self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+        self.assertFalse(pipeline.triage_approval()["valid"])
+
+    def test_too_small_or_positive_sample_does_not_approve(self):
+        self.fill_all()
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN - 1, 0)
+        self.assertFalse(pipeline.triage_allowed()[0])
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 1)
+        self.assertIn("подходящих среди отсекаемых", pipeline.triage_allowed()[1])
+        self.assertIn("некорректны", pipeline.approve_triage(5, 9))
+
+    def test_approval_is_dropped_when_settings_change(self):
+        self.fill_all()
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
+        self.assertTrue(pipeline.triage_allowed()[0])
+        with mock.patch.object(pipeline, "TRIAGE_REJECT_MAX", pipeline.TRIAGE_REJECT_MAX + 1):
+            self.assertFalse(pipeline.triage_approval()["valid"])
+
+    def test_audit_sample_contains_only_would_cut_orders(self):
+        for oid, tr in ((1, 1), (2, 7), (3, 2)):
+            database.freelance_save(oid, "flru", f"Заказ {oid}", f"https://x/{oid}", "", "2026-11-16T10:00:00",
+                                    f"k{oid}", 5, "", "pending", 0, None)
+            pipeline._record_triage_evidence(miss=False, good=False, order_id=oid, triage=tr)
+        ids = {r["order_id"] for r in pipeline.triage_audit_sample(10)}
+        self.assertEqual(ids, {1, 3})
+
+    def test_report_names_requested_effective_reason_and_counters(self):
+        self.fill_all()
+        with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+            text = pipeline.triage_report()
+        self.assertIn("запрошен on, применяется shadow", text)
+        self.assertIn("заблокировано", text)
+        self.assertIn(f"сравнений с полной оценкой {pipeline.TRIAGE_MIN_SAMPLE}/", text)
+        self.assertIn("отметки владельца", text)
+
+    def test_report_marks_stale_statistics(self):
+        self.fill_all()
+        with mock.patch.object(ai_scorer, "TRIAGE_MODEL", "другая-модель"):
+            self.assertIn("устарела", pipeline.triage_report())
+
+    def test_control_slice_still_scored_in_on_mode(self):
+        self.fill_all()
+        pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
+        from tests.test_journal import order
+        from tests.test_pipeline_cycle import ai_result
+        o_cut = order(1101, site="youdoru")      # не контрольный: отсекается
+        o_ctl = order(1100, "Парсер цен конкурентов в таблицу", "Нужен скрипт на Python, который собирает цены с сайтов конкурентов раз в сутки и пишет их в Google Таблицу с историей изменений.", site="youdoru")      # id кратен TRIAGE_CONTROL_EVERY: оценивается полной моделью
+        database.kv_set(pipeline.LAST_ID_KEY, 100)
+        scored = []
+
+        def full(o):
+            scored.append(o.order_id)
+            return ai_result(9)
+        with mock.patch.object(pipeline, "TRIAGE_MODE", "on"),                 mock.patch.object(pipeline, "_triage", return_value=1),                 mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan([o_cut, o_ctl])),                 mock.patch.object(pipeline.ai_scorer, "score_order", side_effect=full):
+            pipeline._prepare_cycle()
+        self.assertEqual(scored, [1100])
+        # контрольный заказ дал пропуск (быстрая 1, полная 9): отсечение снова заблокировано
+        self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+
+
 class OwnerLabelTest(CycleTestBase):
     def test_label_miss_blocks_triage(self):
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
-            pipeline._record_triage_evidence(miss=False, good=(i < 30), order_id=100 + i, triage=1 if i == 0 else 7)
+            pipeline._record_triage_evidence(miss=False, good=(i < 60), order_id=100 + i, triage=1 if i == 0 else 7)
         for i in range(pipeline.TRIAGE_MIN_LABELED):
             pipeline.record_triage_label(100 + i, True)   # у заказа 100 быстрая оценка 1: пропуск
         ok, why = pipeline.triage_allowed()

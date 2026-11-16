@@ -57,10 +57,10 @@ from freelance.pipeline import (
     LAST_ID_KEY,
     MSK,
     PREPARE_TIMEOUT_SEC,
-    TRIAGE_MODE,
     TRIAGE_SHADOW_MAX_PER_DAY,
-    effective_triage_mode,
-    triage_allowed,
+    approve_triage,
+    triage_audit_sample,
+    triage_report,
     finish_cycle,
     format_order,
     format_order_plain,
@@ -691,9 +691,7 @@ def _freelance_status_text() -> str:
         cover = f", покрытие {fc['coverage'] * 100:.0f}%" if fc["coverage"] is not None else ""
         lines.append(f"📉 Без Yandex ({fc['yandex_until']}): ≈{fc['net_without_yandex']:.0f} оценок/сутки "
                      f"при спросе ≈{fc['demand_per_day']:.0f}{cover}")
-        ok, why = triage_allowed()
-        lines.append(f"Триаж: запрошен {TRIAGE_MODE}, применяется {effective_triage_mode()}"
-                     f"{'' if ok else ' (' + html.escape(why) + ')'}")
+        lines.append(html.escape(triage_report()))
     except Exception:
         logging.exception("[FREELANCE] не удалось посчитать ёмкость для статуса")
     for name, title, on, forced in sources.states():
@@ -1196,6 +1194,31 @@ async def cmd_start(message: Message):
     )
 
     asyncio.create_task(check_vacancies())
+
+
+@dp.message(Command("triage_audit"))
+async def cmd_triage_audit(message: Message):
+    """Случайные заказы, которые быстрый триаж отсёк бы: просмотрите, нет ли среди них подходящих."""
+    rows = await asyncio.to_thread(triage_audit_sample, 20)
+    if not rows:
+        await message.answer("Пока нет заказов, которые триаж отсёк бы при текущих настройках.")
+        return
+    lines = ["Выборка заказов, которые триаж отсёк бы. Сколько просмотрели и сколько из них подходящих - "
+             "внесите: /triage_approve <просмотрено> <подходящих>"]
+    for r in rows:
+        lines.append(f"- {html.escape(r['title'][:80])} (полная оценка {r['fit']}) {html.escape(r['url'])}")
+    for chunk in _split_messages("\n".join(lines)):
+        await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.message(Command("triage_approve"))
+async def cmd_triage_approve(message: Message):
+    """/triage_approve <просмотрено> <из них подходящих>: итог просмотра выборки отсекаемых заказов."""
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer("Формат: /triage_approve <просмотрено> <из них подходящих>")
+        return
+    await message.answer(await asyncio.to_thread(approve_triage, int(parts[1]), int(parts[2])))
 
 
 @dp.message(Command("funnel"))

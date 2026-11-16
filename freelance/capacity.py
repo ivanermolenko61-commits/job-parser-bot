@@ -112,7 +112,8 @@ def measure_overhead(days: int = 7) -> float | None:
 def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_share: dict,
                    *, days: int = 14, warmup_days: int = 3, reserve: dict | None = None,
                    aging_hours: float = 12.0, aging_boost: float = 1.0, queue_max_hours: float = 48.0,
-                   quota_reset_hour: int = 3, skip_share: dict | None = None) -> dict:
+                   quota_reset_hour: int = 3, skip_share: dict | None = None,
+                   triage_miss: float = 0.0) -> dict:
     """Устойчивый спрос выше ёмкости: что успевает оцениваться, сколько ждёт и сколько истекает.
 
     Почасовая модель правил очереди бота: группы приоритета 1-3 (mix - доли спроса), ранг = группа минус
@@ -191,6 +192,17 @@ def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_sh
     out["good_arrived"] = round(arrived_good, 1)
     out["good_lost"] = round(lost_good, 1)
     out["good_lost_share"] = round(lost_good / arrived_good, 3) if arrived_good else None
+    # заказы, снятые триажем до очереди: доля подходящих среди них и потери от пропусков самого триажа
+    # (triage_miss - ДОПУЩЕНИЕ о доле пропущенных подходящих, замера нет)
+    window = days - warmup_days
+    skipped_good = sum(demand_per_day * mix.get(g, 0.0) / total_mix * window * skip_share.get(g, 0.0)
+                       * good_share.get(g, 0.0) for g in groups)
+    triage_lost = skipped_good * triage_miss
+    total_good = arrived_good + skipped_good
+    out["good_skipped"] = round(skipped_good, 1)
+    out["triage_good_lost"] = round(triage_lost, 1)
+    out["good_total"] = round(total_good, 1)
+    out["loss_total_share"] = round((lost_good + triage_lost) / total_good, 3) if total_good else None
     return out
 
 

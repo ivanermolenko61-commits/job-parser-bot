@@ -36,6 +36,7 @@ from config import (
 from database import (
     freelance_count_excluded,
     freelance_dup_candidates,
+    freelance_get,
     freelance_known,
     freelance_mark_desc_changed,
     freelance_mark_filtered,
@@ -112,7 +113,9 @@ except ValueError:
 # пропусков хороших заказов он остаётся в shadow. Нужно: выборка не меньше TRIAGE_MIN_SAMPLE,
 # среди неё не меньше TRIAGE_MIN_GOOD подходящих (fit >= порога) и ни одного пропуска
 TRIAGE_MIN_SAMPLE = 150
-TRIAGE_MIN_GOOD = 15
+# 0 пропусков среди 60 подходящих: верхняя граница доли пропусков ~5% (правило трёх, доверие 95%).
+# Прежние 15 давали лишь <=20% и не доказывали полноту
+TRIAGE_MIN_GOOD = 60
 TRIAGE_EVIDENCE_KEY = "triage_shadow_stats"
 # Совпадение с полной AI-оценкой НЕ доказывает полноту: полная оценка сама может ошибаться. Поэтому отсечение
 # требует ещё независимой разметки - решений владельца по кнопкам («Взял» = подходит, «Не подходит» = отказ)
@@ -120,6 +123,15 @@ TRIAGE_EVIDENCE_KEY = "triage_shadow_stats"
 TRIAGE_MIN_LABELED = 8
 TRIAGE_SCORES_KEY = "triage_shadow_scores"   # order_id -> быстрая оценка, последние TRIAGE_SCORES_MAX заказов
 TRIAGE_SCORES_MAX = 400
+# Подтверждение владельца: случайная выборка заказов, которые триаж отсёк бы (быстрая оценка <= TRIAGE_REJECT_MAX),
+# просматривается глазами (/triage_audit), итог вносится /triage_approve. Только числа в настройках сервера
+# (FREELANCE_TRIAGE=on) отсечение не включают. TRIAGE_AUDIT_MIN просмотренных без единого подходящего: верхняя
+# граница доли подходящих среди отсекаемых ~6% (3/50, доверие 95%) - только для этой выборки и этих настроек
+TRIAGE_AUDIT_MIN = 50
+TRIAGE_AUDIT_KEY = "triage_audit_approval"
+# В режиме on каждый TRIAGE_CONTROL_EVERY-й заказ (по id) всё равно оценивается полной моделью, даже если триаж
+# его отсёк бы: так пропуски продолжают измеряться, а первый же пропуск возвращает режим shadow
+TRIAGE_CONTROL_EVERY = 10
 _EVIDENCE_FIELDS = ("n", "good", "miss", "lab_good", "lab_bad", "lab_miss")
 _triage_evidence_lock = threading.Lock()
 _triage_warned = {"on": False}
@@ -816,7 +828,8 @@ def _prepare_cycle() -> CycleResult:
         shadow_ok = (triage_mode == "shadow" and will_score
                      and ai_scorer.triage_today() < TRIAGE_SHADOW_MAX_PER_DAY)
         triage = _triage(sc) if (triage_mode == "on" or shadow_ok) else None
-        if triage_mode == "on" and triage is not None and triage <= TRIAGE_REJECT_MAX:
+        control = triage_mode == "on" and sc.order.order_id % TRIAGE_CONTROL_EVERY == 0
+        if triage_mode == "on" and not control and triage is not None and triage <= TRIAGE_REJECT_MAX:
             return {"fit": triage, "triage": True, "model": f"triage:{ai_scorer.TRIAGE_MODEL}",
                     "summary": "отсеян быстрым фильтром"}
         if not will_score:
@@ -828,7 +841,7 @@ def _prepare_cycle() -> CycleResult:
             return None
         if result is not None:
             _save_scored_now(sc, result)
-        if triage_mode == "shadow" and triage is not None and result is not None:
+        if (triage_mode == "shadow" or control) and triage is not None and result is not None:
             _log_triage_shadow(sc, triage, result)
         return result
 
@@ -1037,8 +1050,80 @@ def triage_allowed() -> tuple[bool, str]:
     if ev["lab_good"] < TRIAGE_MIN_LABELED:
         return False, (f"нет независимой разметки: подходящих по решению владельца {ev['lab_good']} "
                        f"из {TRIAGE_MIN_LABELED} (совпадение с полной оценкой полноту не доказывает)")
+    appr = triage_approval()
+    if not appr["valid"]:
+        return False, appr["why"]
     return True, (f"пропусков нет: {ev['n']} сравнений с полной оценкой, по разметке владельца "
                   f"{ev['lab_good']} подходящих и {ev['lab_bad']} отклонённых")
+
+
+def triage_approval() -> dict:
+    """Подтверждение владельца для ТЕКУЩИХ настроек триажа (отпечаток): valid - можно, why - почему нет."""
+    try:
+        data = json.loads(kv_get(TRIAGE_AUDIT_KEY, "") or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict) or data.get("sig") != _evidence_signature():
+        return {"valid": False, "checked": 0, "suitable": 0,
+                "why": f"нет подтверждения владельца для этих настроек: просмотрите выборку /triage_audit "
+                       f"(не меньше {TRIAGE_AUDIT_MIN} заказов) и внесите итог /triage_approve"}
+    checked, suitable = int(data.get("checked") or 0), int(data.get("suitable") or 0)
+    if suitable:
+        return {"valid": False, "checked": checked, "suitable": suitable,
+                "why": f"выборка владельца нашла подходящих среди отсекаемых: {suitable} из {checked}"}
+    if checked < TRIAGE_AUDIT_MIN:
+        return {"valid": False, "checked": checked, "suitable": 0,
+                "why": f"просмотрено {checked} из {TRIAGE_AUDIT_MIN} заказов выборки"}
+    return {"valid": True, "checked": checked, "suitable": 0, "why": ""}
+
+
+def approve_triage(checked: int, suitable: int) -> str:
+    """Внести итог просмотра выборки отсекаемых заказов (привязывается к текущим настройкам триажа)."""
+    if checked < 0 or suitable < 0 or suitable > checked:
+        return "Числа некорректны: нужно /triage_approve <просмотрено> <из них подходящих>."
+    kv_set(TRIAGE_AUDIT_KEY, json.dumps({"sig": _evidence_signature(), "checked": checked, "suitable": suitable}))
+    ok, why = triage_allowed()
+    return (f"Итог принят: просмотрено {checked}, подходящих {suitable}. "
+            + ("Остальные условия выполнены, отсечение разрешено (если запрошен on)." if ok
+               else f"Отсечение пока не разрешено: {why}."))
+
+
+def triage_audit_sample(k: int = 20) -> list[dict]:
+    """Случайная выборка заказов, которые триаж отсёк бы при текущих настройках (быстрая оценка <= порога)."""
+    import random
+    sig = _evidence_signature()
+    ids = [int(oid) for oid, rec in _load_scores().items()
+           if rec and rec[1] == sig and int(rec[0]) <= TRIAGE_REJECT_MAX]
+    random.shuffle(ids)
+    out = []
+    for oid in ids[:k]:
+        row = freelance_get(oid)
+        if row:
+            out.append({"order_id": oid, "title": row.get("title") or "", "url": row.get("url") or "",
+                        "fit": row.get("fit")})
+    return out
+
+
+def triage_report() -> str:
+    """Состояние триажа для /status: запрошенный и фактический режим, основания, счётчики, устаревание."""
+    ev = triage_evidence()
+    ok, why = triage_allowed()
+    eff = effective_triage_mode()
+    lines = [f"Триаж: запрошен {TRIAGE_MODE}, применяется {eff}"]
+    if TRIAGE_MODE == "on" and eff != "on":
+        lines.append(f"  отсечение заблокировано: {why}")
+    elif TRIAGE_MODE != "on" and ok:
+        lines.append("  условия отсечения выполнены, но режим on не запрошен")
+    if ev["stale"]:
+        lines.append("  прежняя статистика устарела (модель, промпт или пороги изменились): счёт начат заново")
+    lines.append(f"  сравнений с полной оценкой {ev['n']}/{TRIAGE_MIN_SAMPLE}, подходящих {ev['good']}/"
+                 f"{TRIAGE_MIN_GOOD}, пропусков {ev['miss']}")
+    lines.append(f"  отметки владельца: подходящих {ev['lab_good']}/{TRIAGE_MIN_LABELED}, отклонённых "
+                 f"{ev['lab_bad']}, пропусков {ev['lab_miss']}")
+    appr = triage_approval()
+    lines.append(f"  выборка отсекаемых: просмотрено {appr['checked']}/{TRIAGE_AUDIT_MIN}, "
+                 f"подходящих {appr['suitable']}")
+    return "\n".join(lines)
 
 
 def effective_triage_mode() -> str:

@@ -295,7 +295,7 @@ class TriageGuardTest(CycleTestBase):
 
     def test_misses_block_on(self):
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
-            pipeline._record_triage_evidence(miss=(i == 0), good=(i < 30))
+            pipeline._record_triage_evidence(miss=(i == 0), good=(i < 60))
         with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
             self.assertEqual(pipeline.effective_triage_mode(), "shadow")
             self.assertIn("пропуски", pipeline.triage_allowed()[1])
@@ -303,17 +303,21 @@ class TriageGuardTest(CycleTestBase):
     def test_agreement_with_full_ai_alone_does_not_allow_on(self):
         # совпадение с полной AI-оценкой не доказывает полноту: нужна ещё разметка владельца
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
-            pipeline._record_triage_evidence(miss=False, good=(i < 30))
+            pipeline._record_triage_evidence(miss=False, good=(i < 60))
         with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
             self.assertEqual(pipeline.effective_triage_mode(), "shadow")
             self.assertIn("разметки", pipeline.triage_allowed()[1])
 
     def test_enough_clean_evidence_with_owner_labels_allows_on(self):
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
-            pipeline._record_triage_evidence(miss=False, good=(i < 30), order_id=9000 + i, triage=7)
+            pipeline._record_triage_evidence(miss=False, good=(i < 60), order_id=9000 + i, triage=7)
         for i in range(pipeline.TRIAGE_MIN_LABELED):
             self.assertEqual(pipeline.record_triage_label(9000 + i, True), "good")
         with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+            # числа достигнуты, но без подтверждения владельца по выборке отсекаемых режим остаётся shadow
+            self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+            self.assertIn("подтверждения владельца", pipeline.triage_allowed()[1])
+            pipeline.approve_triage(pipeline.TRIAGE_AUDIT_MIN, 0)
             self.assertEqual(pipeline.effective_triage_mode(), "on")
 
     def test_shadow_triage_limited_per_day(self):
