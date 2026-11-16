@@ -2,8 +2,9 @@
 
 Запуск из корня проекта: python -m unittest tests.test_triage_capacity -v
 """
+import json
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import database
@@ -177,6 +178,119 @@ class TriageEvidenceStaleTest(CycleTestBase):
         # вернули прежние настройки: старые счётчики перезаписаны, прежний набор не воскресает
         self.assertEqual(pipeline.triage_evidence()["n"], 0)
         self.assertFalse(pipeline.triage_allowed()[0])
+
+
+class TriageEvidenceAgeTest(CycleTestBase):
+    """Давность наблюдений: набор статистики и подтверждение владельца действуют ограниченное время. Совпадение
+    отпечатка настроек (в том числе при возврате к ним) эти ограничения не обходит; найденные пропуски остаются."""
+
+    def setUp(self):
+        super().setUp()
+        self.t0 = datetime.now(timezone.utc)
+
+    def at(self, days):
+        return mock.patch.object(pipeline, "_now", return_value=self.t0 + timedelta(days=days))
+
+    def fill(self, **first):
+        for i in range(pipeline.TRIAGE_MIN_SAMPLE):
+            kw = first if i == 0 else {}
+            pipeline._record_triage_evidence(miss=kw.get("miss", False), good=(i < 60), order_id=100 + i,
+                                             triage=kw.get("triage", 7))
+        for i in range(pipeline.TRIAGE_MIN_LABELED):
+            pipeline.record_triage_label(100 + i, True)
+
+    def test_fresh_set_is_valid_inside_limits(self):
+        self.fill()
+        approve_audit()
+        with self.at(pipeline.TRIAGE_EVIDENCE_MAX_IDLE_DAYS - 1):
+            self.assertTrue(pipeline.triage_allowed()[0])
+
+    def test_pause_longer_than_limit_discards_set_with_same_fingerprint(self):
+        self.fill()
+        approve_audit()
+        with self.at(pipeline.TRIAGE_EVIDENCE_MAX_IDLE_DAYS + 1):
+            ok, why = pipeline.triage_allowed()
+            self.assertFalse(ok)
+            self.assertIn("наблюдения устарели", why)
+            ev = pipeline.triage_evidence()
+            self.assertEqual((ev["n"], ev["good"], ev["expired"]), (0, 0, True))
+            appr = pipeline.triage_approval()
+            self.assertFalse(appr["valid"])
+            self.assertEqual(appr["checked"], 0)
+            with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+                self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+
+    def test_return_of_settings_after_gap_does_not_bypass_age(self):
+        self.fill()
+        approve_audit()
+        with self.at(1), mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"):
+            self.assertFalse(pipeline.triage_allowed()[0])          # другие настройки, записей нет
+        with self.at(pipeline.TRIAGE_EVIDENCE_MAX_IDLE_DAYS + 5):    # вернули прежние спустя время
+            ok, why = pipeline.triage_allowed()
+            self.assertFalse(ok)
+            self.assertIn("наблюдения устарели", why)
+        with self.at(3):                                             # быстрый возврат прежние данные оживляет
+            self.assertTrue(pipeline.triage_allowed()[0])
+
+    def test_total_age_limit_applies_even_with_continuous_records(self):
+        self.fill()
+        step = pipeline.TRIAGE_EVIDENCE_MAX_IDLE_DAYS - 2
+        for day in range(step, pipeline.TRIAGE_EVIDENCE_MAX_AGE_DAYS, step):
+            with self.at(day):
+                pipeline._record_triage_evidence(miss=False, good=True, order_id=900 + day, triage=7)
+                self.assertGreaterEqual(pipeline.triage_evidence()["n"], pipeline.TRIAGE_MIN_SAMPLE)
+        with self.at(pipeline.TRIAGE_EVIDENCE_MAX_AGE_DAYS + 1):
+            self.assertTrue(pipeline.triage_evidence()["expired"])
+            pipeline._record_triage_evidence(miss=False, good=True, order_id=5000, triage=7)
+            self.assertEqual(pipeline.triage_evidence()["n"], 1)      # набор начат заново, а не продолжен
+
+    def test_legacy_set_without_timestamps_is_not_trusted(self):
+        sig = pipeline._evidence_signature()
+        stored = {k: 0 for k in pipeline._EVIDENCE_FIELDS}
+        stored.update(n=500, good=200, lab_good=20, sig=sig)
+        database.kv_set(pipeline.TRIAGE_EVIDENCE_KEY, json.dumps(stored))
+        ev = pipeline.triage_evidence()
+        self.assertEqual((ev["n"], ev["expired"]), (0, True))
+        self.assertFalse(pipeline.triage_allowed()[0])
+
+    def test_future_timestamp_is_not_trusted(self):
+        self.fill()
+        with self.at(-30):
+            self.assertTrue(pipeline.triage_evidence()["expired"])
+
+    def test_found_miss_survives_settings_round_trip(self):
+        self.fill(miss=True, triage=1)                 # подходящий заказ, который триаж отсёк бы
+        approve_audit()
+        before = pipeline.triage_allowed()
+        self.assertFalse(before[0])
+        self.assertIn("пропуски", before[1])
+        with mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"):
+            self.assertFalse(pipeline.triage_allowed()[0])
+        after = pipeline.triage_allowed()
+        self.assertFalse(after[0])
+        self.assertEqual(pipeline.triage_evidence()["miss"], 1)
+        self.assertIn("пропуски", after[1])
+
+    def test_owner_label_miss_survives_settings_round_trip(self):
+        self.fill()
+        pipeline._record_triage_evidence(miss=False, good=False, order_id=777, triage=1)
+        self.assertEqual(pipeline.record_triage_label(777, True), "miss")
+        approve_audit()
+        with mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"):
+            self.assertFalse(pipeline.triage_allowed()[0])
+        ok, why = pipeline.triage_allowed()
+        self.assertFalse(ok)
+        self.assertIn("разметка владельца показала пропуски", why)
+        self.assertEqual(pipeline.triage_evidence()["lab_miss"], 1)
+
+    def test_new_records_after_expiry_cannot_inherit_old_good_counts(self):
+        self.fill()
+        approve_audit()
+        with self.at(pipeline.TRIAGE_EVIDENCE_MAX_AGE_DAYS + 5):
+            pipeline._record_triage_evidence(miss=False, good=True, order_id=1, triage=5)
+            ev = pipeline.triage_evidence()
+            self.assertEqual((ev["n"], ev["good"], ev["lab_good"]), (1, 1, 0))
+            self.assertFalse(pipeline.triage_allowed()[0])
 
 
 class OwnerApprovalTest(CycleTestBase):

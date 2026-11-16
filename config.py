@@ -139,6 +139,17 @@ def _min_price(cat: str, default: float) -> float:
 
 FREELANCE_MIN_RATE_PER_HOUR = _min_rate_per_hour()
 FREELANCE_RATE_PER_HOUR = max(_rate_per_hour(), FREELANCE_MIN_RATE_PER_HOUR)
+# Доля работы сверх компонентов, если среди них нет уточнения, проверки, правок или передачи результата
+def _overhead_share() -> float:
+    value = _env_float("FREELANCE_OVERHEAD_SHARE", 0.2)
+    return value if math.isfinite(value) and 0 <= value <= 1 else 0.2
+
+
+FREELANCE_OVERHEAD_SHARE = _overhead_share()
+# Курсы валют для сравнения иностранного бюджета: JSON {"USD": {"rate": число, "source": текст, "date": "ГГГГ-ММ-ДД"}}.
+# Пусто - иностранный бюджет с ценой не сравнивается (freelance/fx.py)
+FREELANCE_FX_RATES = os.environ.get("FREELANCE_FX_RATES", "")
+
 # Ширина вилки вокруг рекомендуемой цены (0.15 = ±15%)
 FREELANCE_PRICE_SPREAD = _price_spread()
 # Минимальная цена по категории, ₽ (ниже не работаем); env: FREELANCE_MIN_PRICE_<КАТЕГОРИЯ>

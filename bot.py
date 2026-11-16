@@ -35,10 +35,12 @@ from config import (
 )
 from database import (
     cleanup_old,
+    freelance_actuals_rows,
     freelance_deal_rows,
     freelance_expired_messages,
     freelance_get,
     freelance_recent,
+    freelance_set_actuals,
     freelance_set_deal_price,
     freelance_mark_card_deleted,
     freelance_set_status,
@@ -547,6 +549,17 @@ async def check_freelance(manual: bool = False) -> dict | None:
                 logging.exception("[MEM] trim после фриланса не удался")
 
 
+async def _send_reassess_notes(res) -> None:
+    """Повторные уведомления: описание доставленного заказа изменилось и оценка заметно изменилась. Право на
+    уведомление занято в БД до отправки (одно на версию текста), поэтому сбой отправки дубля не даёт."""
+    for text in getattr(res, "reassess_notes", None) or []:
+        try:
+            await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+        except Exception:
+            logging.exception("[FREELANCE] не удалось отправить уведомление об обновлённой оценке")
+
+
 async def _check_freelance_impl(manual: bool = False) -> dict | None:
     if not manual and not await _freelance_subscribed():
         logging.info("[FREELANCE] пауза, пропуск")
@@ -594,6 +607,7 @@ async def _check_freelance_impl(manual: bool = False) -> dict | None:
         except Exception:
             logging.exception("[FREELANCE] finish_cycle упал")
             return {"error": "не удалось сохранить итог цикла", "sent": len(d["sent"]), "extra": 0}
+        await _send_reassess_notes(res)
         return {"error": "", "sent": len(d["sent"]), "extra": len(d["skipped"]),
                 "failed": len(d["retry"]), "scanned": res.raw_count}
 
@@ -819,6 +833,7 @@ def _accuracy_text() -> str:
         rows.append({"category": r["category"], "deal_price": r["deal_price"],
                      "price_mid": ai.get("price_mid") if isinstance(ai, dict) else 0})
     rep = pricing.accuracy_report(rows)
+    calibration = pricing.hours_calibration(freelance_actuals_rows())
     if not rep["total"]:
         return ("📊 <b>Точность цен</b>\n\nСделок с ценой и расчётом пока нет. "
                 "Нажимайте «Взял» и отвечайте, за сколько договорились.")
@@ -827,7 +842,39 @@ def _accuracy_text() -> str:
         direction = "завышаем" if c["bias"] > 0 else "занижаем"
         lines.append(f"• {html.escape(cat)}: {c['n']} шт., ошибка {c['mape']:.0f}% "
                      f"({direction} в среднем на {abs(c['bias']):.0f}%)")
-    return "\n".join(lines)
+    return "\n".join(lines + _calibration_lines(calibration))
+
+
+def _calibration_lines(calibration: dict) -> list[str]:
+    """Строки калибровки часов по фактическим данным (/actual): по категории, где точек не меньше порога."""
+    if not calibration:
+        return ["", "⏱ Часы: фактических данных пока мало (нужно не меньше "
+                    f"{pricing.MIN_POINTS} заказов категории; запись: /actual номер часы [расходы])."]
+    lines = ["", "⏱ Часы по фактам:"]
+    for cat, c in sorted(calibration.items(), key=lambda kv: -kv[1]["n"]):
+        word = "занижаем" if c["ratio"] > 1 else "завышаем"
+        lines.append(f"• {html.escape(cat)}: {c['n']} шт., факт/оценка {c['ratio']:.2f} ({word})")
+    return lines
+
+
+@dp.message(Command("actual"))
+async def cmd_actual(message: Message):
+    """/actual <номер заказа> <часы> [расходы, ₽] - фактические часы и расходы по заказу (для калибровки оценок)."""
+    parts = (message.text or "").split()[1:]
+    try:
+        order_id = int(parts[0])
+        hours = float(parts[1].replace(",", "."))
+        expenses = float(parts[2].replace(",", ".")) if len(parts) > 2 else None
+    except (IndexError, ValueError):
+        await message.answer("Формат: /actual номер_заказа часы [расходы_₽]\nНапример: /actual 12345 6.5 800")
+        return
+    try:
+        ok = await asyncio.to_thread(freelance_set_actuals, order_id, hours, expenses)
+    except Exception:
+        logging.exception("[FREELANCE] actual")
+        await message.answer("⚠️ Не удалось записать, подробности в логе.")
+        return
+    await message.answer("✅ Записано." if ok else "⚠️ Заказ не найден или значения неверны (нужны неотрицательные числа).")
 
 
 @dp.callback_query(F.data == "fl_accuracy")

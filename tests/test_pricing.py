@@ -7,15 +7,23 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from unittest import mock
+from unittest import addModuleCleanup, mock
 from datetime import datetime, timezone
 
 import config
 import database
 from freelance import deal_wait, pricing
 from freelance.ai_scorer import parse_ai_json
+from freelance.budget import parse_budget
 from freelance.alot_client import FreelanceOrder
 from freelance.pipeline import ScoredOrder, format_order
+
+
+def setUpModule():
+    """Формула проверяется без доли на этапы (она отдельно в tests/test_money.py): часы здесь равны часам модели."""
+    patcher = mock.patch.object(pricing, "FREELANCE_OVERHEAD_SHARE", 0.0)
+    patcher.start()
+    addModuleCleanup(patcher.stop)
 
 
 def ai(hours=4.0, category="tg_bot", clarity="ясно", unknowns=()):
@@ -49,54 +57,33 @@ class CalcPriceTest(unittest.TestCase):
         r = pricing.calc_price(ai(0.5, "что-то"), rate=1000)
         self.assertEqual(r["price_mid"], 1500)
 
-    def test_budget_caps_price(self):
+    def test_budget_never_caps_price(self):
         r = pricing.calc_price(ai(6, "tg_bot"), budget=5000, rate=1000)
-        self.assertEqual(r["price_mid"], 5500)   # бюджет × 1.1
-        self.assertTrue(r["budget_capped"])
-        self.assertFalse(r["budget_low"])        # 6000 < 5000 × 1.5
+        self.assertEqual(r["price_mid"], 6000)
+        for gone in ("budget_capped", "budget_raised", "budget_low", "price_own"):
+            self.assertNotIn(gone, r)
 
-    def test_budget_low_flag(self):
+    def test_low_budget_does_not_lower_price(self):
+        base = pricing.calc_price(ai(10, "tg_bot"), rate=1000)
         r = pricing.calc_price(ai(10, "tg_bot"), budget=3000, rate=1000)
-        self.assertTrue(r["budget_low"])         # 10000 > 4500
-        # 3300 = 330 ₽/ч - ниже минимальной ставки: предлагаем минимум 10 × 775
-        self.assertEqual(r["price_mid"], 7800)
-        self.assertFalse(r["budget_capped"])
+        self.assertEqual(r["price_mid"], base["price_mid"])
+        self.assertEqual(r["price_mid"], 10000)
 
-    def test_budget_above_own_pulls_up(self):
+    def test_high_budget_does_not_raise_price(self):
         r = pricing.calc_price(ai(4, "tg_bot"), budget=20000, rate=1000)
-        self.assertEqual(r["price_mid"], 12000)  # середина между 4000 и 20000
-        self.assertFalse(r["budget_capped"])
-        self.assertTrue(r["budget_raised"])
-        self.assertEqual(r["price_own"], 4000)
+        self.assertEqual(r["price_mid"], 4000)
 
     def test_big_budget_real_case(self):
-        # «Сайт под ключ»: 16.5 ч × 1000 × 1.3 = 21 450, бюджет 80 000
+        # «Сайт под ключ»: 16.5 ч × 1000 × 1.3 = 21 450 при любом бюджете (раньше поднималось к 80 000)
         r = pricing.calc_price(ai(16.5, "other", clarity="размыто"), budget=80000, rate=1000)
-        self.assertEqual(r["price_own"], 21500)
-        self.assertEqual(r["price_mid"], 50500)  # 21450 + 58550 / 2 = 50725 -> шаг 500
-        self.assertLessEqual(r["price_high"], 80000)
+        self.assertEqual(r["price_mid"], 21500)
+        self.assertTrue(r["price_vague"])
+        self.assertEqual(r["price_mid"], pricing.calc_price(ai(16.5, "other", clarity="размыто"), rate=1000)["price_mid"])
 
-    def test_high_not_above_budget_cap(self):
-        # расчёт чуть ниже бюджета: верх вилки не выходит за бюджет × 1.1
-        r = pricing.calc_price(ai(6.5, "integration", clarity="частично", unknowns=["a", "b", "c"]),
-                               budget=10000, rate=1000)
-        self.assertTrue(r["budget_raised"])
-        self.assertLessEqual(r["price_mid"], 10000)
-        self.assertLessEqual(r["price_high"], 11000)
-        self.assertGreaterEqual(r["price_high"], r["price_mid"])
-
-    def test_capped_keeps_own_for_display(self):
-        # «Создать сайт под ключ»: 5 ч × 1000 × 1.45 = 7250, бюджет 5000
-        r = pricing.calc_price(ai(5, "landing", clarity="частично", unknowns=["a", "b", "c"]),
-                               budget=5000, rate=1000)
-        self.assertTrue(r["budget_capped"])
-        self.assertEqual((r["price_mid"], r["price_own"]), (5500, 7300))
-        self.assertLessEqual(r["price_high"], 5500)
-
-    def test_no_budget_no_own(self):
+    def test_no_budget_keys_without_budget_compare(self):
         r = pricing.calc_price(ai(4), rate=1000)
         self.assertNotIn("price_own", r)
-        self.assertFalse(r["budget_raised"])
+        self.assertNotIn("budget_raised", r)
 
     def test_market_ignored_below_5_points(self):
         market = {"median": 10000, "p25": 8000, "p75": 12000, "n": 4}
@@ -104,17 +91,12 @@ class CalcPriceTest(unittest.TestCase):
         self.assertEqual(r["price_mid"], 4000)
         self.assertNotIn("market_low", r)
 
-    def test_market_shift_with_5_points(self):
+    def test_market_is_reference_with_5_points(self):
         market = {"median": 10000, "p25": 8000, "p75": 12000, "n": 5}
         r = pricing.calc_price(ai(4), market=market, rate=1000)
-        # 4000 × 0.7 + 10000 × 0.3 = 5800
-        self.assertEqual(r["price_mid"], 5800)
+        self.assertEqual(r["price_mid"], 4000)          # цену рынок бюджетов больше не двигает
         self.assertEqual((r["market_low"], r["market_high"]), (8000, 12000))
-
-    def test_market_not_used_when_budget(self):
-        market = {"median": 10000, "p25": 8000, "p75": 12000, "n": 9}
-        r = pricing.calc_price(ai(4), budget=20000, market=market, rate=1000)
-        self.assertEqual(r["price_own"], 4000)   # рыночный сдвиг к медиане не применён
+        self.assertEqual(r["market_verdict"], "ниже рынка на 50%")
         self.assertNotIn("price_market_applied", r)
 
     def test_rounding_steps(self):
@@ -174,25 +156,14 @@ class MinRateTest(unittest.TestCase):
         self.assertGreaterEqual(r["price_mid"], 7750)
         self.assertGreaterEqual(r["price_low"], 7750)
 
-    def test_budget_cap_not_below_min(self):
-        # бюджет 8000 ≥ минимума 7750: режем до потолка 8800, вилка не ниже минимума
-        r = pricing.calc_price(ai(10, "other"), budget=8000, rate=1000)
-        self.assertTrue(r["budget_capped"])
-        self.assertEqual(r["price_mid"], 8800)
-        self.assertGreaterEqual(r["price_low"], 7750)
-
-    def test_budget_below_min_not_capped(self):
-        # бюджет 7500 < 10 ч × 775: под него не опускаемся, предлагаем минимум
-        r = pricing.calc_price(ai(10, "other"), budget=7500, rate=1000)
-        self.assertFalse(r["budget_capped"])
-        self.assertTrue(r["budget_low"])
-        self.assertEqual(r["price_mid"], 7800)
-        self.assertEqual(r["price_low"], 7800)
-
-    def test_no_jump_at_budget_edge(self):
-        below = pricing.calc_price(ai(10, "other"), budget=7749, rate=1000)
-        above = pricing.calc_price(ai(10, "other"), budget=7750, rate=1000)
-        self.assertLessEqual(below["price_mid"], above["price_mid"])
+    def test_budget_below_or_near_min_never_changes_price(self):
+        # 10 ч: расчёт 10 000, минимум 7 750. Любой бюджет цену не меняет, меняется лишь сравнение
+        base = pricing.calc_price(ai(10, "other"), rate=1000)
+        for budget in (500, 7500, 7749, 7750, 8000, 9000, 50000):
+            r = pricing.calc_price(ai(10, "other"), budget=budget, rate=1000)
+            self.assertEqual((r["price_low"], r["price_mid"], r["price_high"]),
+                             (base["price_low"], base["price_mid"], base["price_high"]), budget)
+        self.assertGreaterEqual(base["price_low"], 7750)
 
     def test_low_edge_of_range_not_below_min(self):
         r = pricing.calc_price(ai(4, "other"), rate=800)   # 3200, вилка -15% = 2700
@@ -207,12 +178,12 @@ class MarketVerdictTest(unittest.TestCase):
 
     def test_verdict_and_budget_rate_in_result(self):
         market = {"median": 3000, "p25": 2000, "p75": 4000, "n": 8}
-        r = pricing.calc_price(ai(10, "other"), budget=3000, market=market, rate=1000)
-        self.assertEqual(r["budget_rate"], 300)
+        r = pricing.calc_price(ai(10, "other"), market=market, rate=1000)
+        r.update(pricing.compare_budget(r, parse_budget("3000 ₽")))
         self.assertTrue(r["market_verdict"].startswith("выше рынка"))
         line = _price_basis_line_for(r)
         self.assertIn("цена выше рынка", line)
-        self.assertIn("≈ 300 ₽/ч, занижен", line)
+        self.assertIn("бюджет клиента: ниже минимума", line)
 
     def test_few_market_points_shown(self):
         r = pricing.calc_price(ai(4), market={"median": 5000, "p25": 4000, "p75": 6000, "n": 2}, rate=1000)
@@ -286,14 +257,16 @@ class FormatOrderTest(unittest.TestCase):
         a = {"fit": 8, "difficulty": "средне", "hours": 4.5, "category": "tg_bot",
              "components": [{"name": "меню <b>", "hours": 2}], "questions": ["есть таблица?"],
              "summary": "s", "risks": "r"}
-        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=6000,
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]),
                                     market={"median": 5500, "p25": 4000, "p75": 7000, "n": 6},
                                     rate=1000))
+        a.update(pricing.compare_budget(a, parse_budget("6 000 ₽")))
         text = format_order(ScoredOrder(make_order(6000), a), detailed=True)
         self.assertIn("💵 Предложить:", text)
         self.assertIn("рынок ботов: 4–7 тыс.", text)
         self.assertIn("рынок ботов: 4–7 тыс. — цена в рынке", text)
-        self.assertIn("бюджет 6 000 ₽ ≈ 1 333 ₽/ч, ок · поднято к бюджету (по расчёту 5 200 ₽)", text)
+        self.assertIn("бюджет клиента: покрывает полный объём", text)
+        self.assertIn("Предложить: 5 200 ₽", text)          # цена прежняя, бюджет её не поднял
         self.assertIn("🧩 меню &lt;b&gt; 2 ч", text)
         self.assertIn("❓ Уточнить: есть таблица?", text)
         self.assertIn("Бот &lt;для&gt;", text)
@@ -302,21 +275,20 @@ class FormatOrderTest(unittest.TestCase):
         self.assertNotIn("🧩", compact)
         self.assertLessEqual(len(text), 4000)
 
-    def test_capped_shown(self):
+    def test_low_budget_shown_as_mismatch(self):
         a = {"fit": 8, "difficulty": "легко", "hours": 5, "category": "landing",
              "summary": "s", "risks": "r"}
-        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=["a", "b", "c"]),
-                                    budget=5000, rate=1000))
-        text = format_order(ScoredOrder(make_order(5000), a), detailed=True)
-        self.assertIn("бюджет 5 000 ₽ ≈ 1 000 ₽/ч · упёрлось в бюджет +10% (по расчёту 7 300 ₽)", text)
-
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=["a", "b", "c"]), rate=1000))
+        a.update(pricing.compare_budget(a, parse_budget("до 3 000 ₽")))
+        text = format_order(ScoredOrder(make_order(3000), a), detailed=True)
+        self.assertIn("бюджет клиента: ниже минимума", text)
+        self.assertIn("цену не снижать", text)
 
     def card(self, **extra):
         a = {"fit": 9, "difficulty": "средне", "hours": 9, "category": "landing",
              "components": [{"name": "блок", "hours": 2}], "questions": ["есть макет?"],
              "summary": "суть", "risks": "риск"}
-        budget = extra.pop("budget", 6000)
-        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]), budget=budget,
+        a.update(pricing.calc_price(dict(a, clarity="частично", unknowns=[]),
                                     market={"median": 5500, "p25": 4000, "p75": 7000, "n": 6},
                                     rate=1000))
         a.update(extra)
@@ -352,7 +324,7 @@ class FormatOrderTest(unittest.TestCase):
 
     def test_detailed_card(self):
         text = format_order(self.card(), detailed=True)
-        for good in ("🧩", "⚠️ Риск: риск", "Сложность: средне", "×", "₽/ч", "вилка:"):
+        for good in ("🧩", "⚠️ Риск: риск", "Сложность: средне", "×", "минимально приемлемая", "вилка:"):
             self.assertIn(good, text)
 
     def test_escape_and_length(self):
@@ -444,11 +416,10 @@ class DatabaseTest(unittest.TestCase):
 
 class SmallBudgetTest(unittest.TestCase):
     def test_budget_below_floor_not_capping(self):
-        # минимум tg_bot 3000, бюджет 500: цену бюджетом не ограничиваем
+        # минимум tg_bot 3000, бюджет 500: цену бюджетом не ограничиваем, несоответствие видно в сравнении
         r = pricing.calc_price(ai(1), budget=500)
         self.assertGreaterEqual(r["price_mid"], config.FREELANCE_MIN_PRICE["tg_bot"])
-        self.assertTrue(r["budget_low"])
-        self.assertFalse(r["budget_capped"])
+        self.assertEqual(pricing.compare_budget(r, parse_budget("500 ₽"))["budget_status"], "below_min")
 
     def test_tiny_budget_invariants(self):
         for budget in (1, 50, 100, 900, 2999):

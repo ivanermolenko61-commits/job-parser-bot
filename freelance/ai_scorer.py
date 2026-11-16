@@ -24,7 +24,7 @@ from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
-from freelance import yandex_budget
+from freelance import profile, yandex_budget
 
 load_dotenv()
 
@@ -99,17 +99,18 @@ SYSTEM_PROMPT = (
     "Не подходят: сайты, лендинги, интернет-магазины, WordPress/Tilda, вёрстка и "
     "правки сайтов; дизайн и графика, тексты, SMM, физические и офлайн-услуги, 1С, "
     "Битрикс, мобильные приложения, игры, установка ПО, обучение, ручное заполнение "
-    "карточек и таблиц, вакансии «в штат», размытые или подозрительные заказы. "
+    "карточек и таблиц, вакансии «в штат», подозрительные заказы. Размытость текста "
+    "сама по себе не причина низкого fit: она отражается в clarity и unknowns. "
     "Если сайт - только источник данных (парсер сайта) или форма сайта лишь "
     "отправляет заявки в таблицу, бот или CRM, это наш профиль.\n"
-    "Шкала fit (используй ВСЕ значения, не только 0 и 10):\n"
+    "Шкала fit отвечает только на вопрос «наш ли это профиль и можно ли это "
+    "выполнить»; ясность текста и бюджет оцениваются отдельно и на fit не влияют "
+    "(используй ВСЕ значения, не только 0 и 10):\n"
     "9-10: таблица, формулы, Apps Script, бот, парсер в таблицу, выгрузка или "
-    "интеграция по API, ТЗ ясное, бюджет адекватен объёму;\n"
-    "7-8: подходит, но ТЗ частично размыто, нужна интеграция или бюджет "
-    "скромный для такого объёма. Сюда же: доработка чужой таблицы или "
-    "скрипта, бот с оплатой или админкой;\n"
-    "5-6: подходит с оговорками: большой объём, много неизвестных, "
-    "бюджет явно мал или не указан, а задача неясна;\n"
+    "интеграция по API - ядро профиля;\n"
+    "7-8: подходит, но нужна интеграция или есть оговорки. Сюда же: доработка "
+    "чужой таблицы или скрипта, бот с оплатой или админкой;\n"
+    "5-6: подходит с оговорками: большой объём, пограничная тема;\n"
     "3-4: сложно или рискованно: высоконагруженная система, работа на чужом "
     "сервере без доступов, чужая система без открытого API. "
     "Работа на чужом сервере: fit не выше 5, не меньше 3 ч "
@@ -118,11 +119,9 @@ SYSTEM_PROMPT = (
     "офлайн, 1С, мобильные приложения, обучение, ручной труд), "
     "а также объявление исполнителя о своих услугах (от первого лица: «создам», "
     "«сделаю для вас»), а не заказ клиента - fit 0.\n"
-    "Бюджет: небольшой, но реальный (1-5 тыс. за формулы или доработку таблицы, "
-    "3-15 тыс. за бота, парсер, скрипт) нормален, не снижай за него оценку. Снижай "
-    "fit до 4 и ниже только если бюджет абсурдно мал (меньше 500 ₽ за правку "
-    "таблицы, меньше 1000 ₽ за бота, парсер или скрипт). Цена «по договорённости» "
-    "не повод снижать оценку.\n"
+    "Бюджет заказчика в fit НЕ учитывай совсем: ни маленький, ни большой, ни "
+    "«по договорённости», ни в другой валюте. Его сравнивает с ценой программа. "
+    "Нет бюджета - это не плохой профиль.\n"
     "Оценивай саму задачу: нужно ли тут писать код или настраивать сайт. "
     "Ручная работа за компьютером (покупать, скачивать, регистрировать, "
     "кликать, заполнять) кодом не решается: fit 0-2.\n"
@@ -140,14 +139,25 @@ SYSTEM_PROMPT = (
     "Сайт с каталогом, калькулятором, CMS или блогом - это не визитка: считай "
     "каждый раздел отдельным компонентом. Компонент - отдельный кусок работы (например "
     "«меню и запись», «выгрузка в Google Sheets», «деплой»), у каждого часы "
-    "от 0.25 до 40; компонентов не больше 8.\n"
+    "от 0.25 до 40; компонентов не больше 8. Если нужны уточнение задачи и доступы, "
+    "проверка на данных клиента, согласованные правки, запуск и передача "
+    "результата, выдели их отдельными компонентами с часами.\n"
     "category - одно из: tg_bot, parser, landing, site_fix, wp, script, "
     "integration, sheets, other.\n"
     "clarity: «ясно» (ТЗ понятно), «частично» (есть пробелы), «размыто» (непонятно, что делать).\n"
     "unknowns - неизвестные, которые могут увеличить объём (нет доступа к API, "
     "нет макетов, чужой сервер); если их нет - пустой список.\n"
-    "client_budget_ok: true, если указанный бюджет адекватен объёму, false если "
-    "мал; null, если бюджет не указан.\n"
+    "feasibility - можно ли выполнить при известных данных: «высокая» (всё "
+    "понятно и доступно), «средняя» (нужны доступы или уточнения), «низкая» "
+    "(нет доступа, чужая закрытая система, оборудование).\n"
+    "urgency: «срочно», если в тексте названы сжатые сроки, иначе «обычно»; "
+    "«не указана», если срок не упомянут.\n"
+    "profile_reason - одна строка, почему заказ подходит или нет. Ссылайся на "
+    "опыт исполнителя только из блока «Подтверждённый опыт» в запросе; если "
+    "такого блока нет или опыт не подходит, не придумывай клиентов, цифры и "
+    "результаты, напиши «подтверждённого опыта по теме нет».\n"
+    "Если данных не хватает, не угадывай: впиши неизвестное в unknowns и задай "
+    "вопросы заказчику в questions.\n"
     "Ответь СТРОГО одним JSON-объектом без пояснений и без markdown:\n"
     '{"fit": целое число 0-10 по шкале выше, '
     '"difficulty": "легко" | "средне" | "сложно", '
@@ -156,7 +166,9 @@ SYSTEM_PROMPT = (
     '"components": [{"name": "короткое название", "hours": число}], '
     '"unknowns": ["неизвестное"], '
     '"clarity": "ясно" | "частично" | "размыто", '
-    '"client_budget_ok": true | false | null, '
+    '"feasibility": "высокая" | "средняя" | "низкая", '
+    '"urgency": "срочно" | "обычно" | "не указана", '
+    '"profile_reason": "почему подходит или нет, одна строка", '
     '"summary": "суть заказа в одну короткую строку", '
     '"risks": "главный риск в одну короткую строку", '
     '"questions": ["вопрос заказчику"]}'
@@ -628,6 +640,9 @@ def _clean_float(value) -> float:
 CATEGORIES = ("tg_bot", "parser", "landing", "site_fix", "wp", "script",
               "integration", "sheets", "other")
 CLARITY_VALUES = ("ясно", "частично", "размыто")
+FEASIBILITY_VALUES = ("высокая", "средняя", "низкая")
+URGENCY_VALUES = ("срочно", "обычно", "не указана")
+SHORT_TEXT = 200      # короче этого текста заказа (знаков) данных для уверенной оценки недостаточно
 MIN_COMPONENT_HOURS = 0.25
 MAX_COMPONENT_HOURS = 40.0
 MAX_COMPONENTS = 8
@@ -679,8 +694,29 @@ def _clean_str_list(raw, limit: int, max_len: int) -> list[str]:
     return result
 
 
-def parse_ai_json(text: str) -> dict | None:
-    """Достаёт JSON из ответа модели (с ```json-обёрткой, рассуждениями или лишним текстом)."""
+def assess_sufficiency(clarity: str, unknowns: list, text_len: int | None) -> tuple[str, str]:
+    """(достаточность исходного текста, уверенность оценки) - считает код, не модель.
+    Короткий текст, размытое ТЗ или много неизвестных не дают «достаточно» и «высокая»."""
+    many = len(unknowns) >= 3
+    short = text_len is not None and text_len < SHORT_TEXT
+    if clarity == "размыто" or short and clarity != "ясно" or text_len == 0:
+        sufficiency = "недостаточно"
+    elif clarity == "ясно" and not short and not unknowns:
+        sufficiency = "достаточно"
+    else:
+        sufficiency = "частично"
+    if sufficiency == "недостаточно" or many or not clarity:
+        confidence = "низкая"
+    elif sufficiency == "достаточно":
+        confidence = "высокая"
+    else:
+        confidence = "средняя"
+    return sufficiency, confidence
+
+
+def parse_ai_json(text: str, text_len: int | None = None) -> dict | None:
+    """Достаёт JSON из ответа модели (с ```json-обёрткой, рассуждениями или лишним текстом).
+    text_len - длина текста заказа (знаков): по ней код оценивает достаточность данных и уверенность."""
     if not text:
         return None
     cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
@@ -729,17 +765,30 @@ def parse_ai_json(text: str) -> dict | None:
     clarity = str(data.get("clarity") or "").strip().lower()
     if clarity not in CLARITY_VALUES:
         clarity = ""
-    budget_ok = data.get("client_budget_ok")
+    budget_ok = data.get("client_budget_ok")      # старые записи; в новом формате модель его не возвращает
     if not isinstance(budget_ok, bool):
         budget_ok = None
+    feasibility = str(data.get("feasibility") or "").strip().lower()
+    if feasibility not in FEASIBILITY_VALUES:
+        feasibility = ""
+    urgency = str(data.get("urgency") or "").strip().lower()
+    if urgency not in URGENCY_VALUES:
+        urgency = ""
+    unknowns = _clean_str_list(data.get("unknowns"), MAX_UNKNOWNS, 120)
+    sufficiency, confidence = assess_sufficiency(clarity, unknowns, text_len)
     return {
         "fit": max(0, min(10, fit)),
         "difficulty": difficulty,
         "hours": round(hours, 1),
         "category": category,
         "components": components,
-        "unknowns": _clean_str_list(data.get("unknowns"), MAX_UNKNOWNS, 120),
+        "unknowns": unknowns,
         "clarity": clarity,
+        "feasibility": feasibility,
+        "urgency": urgency,
+        "profile_reason": str(data.get("profile_reason") or "").strip()[:200],
+        "sufficiency": sufficiency,
+        "confidence": confidence,
         "client_budget_ok": budget_ok,
         "price_rub": str(data.get("price_rub") or "").strip()[:100],  # только старые записи
         "summary": str(data.get("summary") or "").strip()[:300],
@@ -766,6 +815,9 @@ def score_order(order) -> dict | None:
             logging.exception(f"[AI] {name}: неожиданный сбой, берём следующего")
             continue
         if result is not None:
+            # достаточность данных считает код по реальной длине текста заказа (оценка модели её не знает)
+            result["sufficiency"], result["confidence"] = assess_sufficiency(
+                result.get("clarity") or "", result.get("unknowns") or [], len(order.body or ""))
             return result
     return None
 
@@ -790,12 +842,25 @@ def mask_contacts(text: str) -> str:
     return _PHONE_RE.sub("[телефон]", text)
 
 
+def experience_block(text: str) -> str:
+    """Блок «Подтверждённый опыт» для запроса: только названия подходящих записей каталога profile.EXPERIENCE
+    (по словам заказа), без ссылок на файлы и без остальной базы знаний. Нет подходящих - явная пометка."""
+    found = profile.relevant_experience(None, text, limit=3, min_score=1)
+    if not found:
+        return "Подтверждённый опыт исполнителя: по теме заказа нет, не придумывай опыт."
+    items = "\n".join(f"- {item['title']} [{item['id']}]" for item in found)
+    return f"Подтверждённый опыт исполнителя (только это можно называть опытом):\n{items}"
+
+
 def _user_prompt(order) -> str:
+    # сначала маскируем весь текст, потом режем: контакт на границе обрезки не просочится
+    body = mask_contacts(order.body or "")[:BODY_LIMIT]
+    topic = (order.title or "") + " " + body
     return (
         f"Название: {mask_contacts(order.title)}\n"
-        f"Цена: {mask_contacts(order.price_text) or 'не указана'}\n"
-        # сначала маскируем весь текст, потом режем: контакт на границе обрезки не просочится
-        f"Описание:\n{mask_contacts(order.body or '')[:BODY_LIMIT]}"
+        # бюджет модели не передаётся: fit и часы не должны зависеть от него (экономику считает код)
+        f"{experience_block(topic)}\n"
+        f"Описание:\n{body}"
     )
 
 

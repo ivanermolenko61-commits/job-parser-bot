@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,14 +43,24 @@ from database import (
     freelance_mark_desc_changed,
     freelance_mark_filtered,
     freelance_mark_stale,
+    freelance_assessment_get,
+    freelance_claim_assessment_notice,
     freelance_pending,
+    freelance_reassess_attempt,
+    freelance_reassess_finish,
+    freelance_reassess_pending,
+    freelance_reassess_queue,
+    freelance_reassess_state,
+    freelance_record_assessment,
+    freelance_replace_assessment,
     freelance_requeue,
     freelance_save,
     freelance_set_queue_reason,
     kv_get,
     kv_set,
 )
-from freelance import ai_scorer, pricing, sources, yandex_budget
+from freelance import ai_scorer, pricing, profile, sources, yandex_budget
+from freelance.budget import parse_budget, rub_amount
 from freelance import journal as jr
 from freelance.alot_client import (
     FreelanceOrder,
@@ -141,6 +152,19 @@ TRIAGE_CONTROL_EVERY = 10
 _EVIDENCE_FIELDS = ("n", "good", "miss", "lab_good", "lab_bad", "lab_miss", "cut", "extra", "ctl_cut", "ctl_miss")
 _triage_evidence_lock = threading.Lock()
 _triage_warned = {"on": False}
+# Повторная оценка оценённого заказа после существенной правки описания (Ф06)
+REASSESS_PER_CYCLE = 2          # не больше стольких повторных оценок за цикл: основной поток заказов важнее
+REASSESS_MAX_ATTEMPTS = 3
+REASSESS_SIMILARITY = 0.8       # схожесть слов старого и нового текста ниже - правка существенная
+REASSESS_LENGTH_CHANGE = 0.25   # длина текста изменилась на столько и более - правка существенная
+NOTICE_FIT_DELTA = 2            # повторное уведомление: оценка изменилась на столько и более
+NOTICE_PRICE_CHANGE = 0.3       # или цена полного объёма изменилась на столько и более
+
+# Давность наблюдений триажа: набор статистики и подтверждение владельца недействительны после паузы
+# в записях и по достижении предельного возраста (совпадение отпечатка настроек этого не отменяет)
+TRIAGE_EVIDENCE_MAX_IDLE_DAYS = 14
+TRIAGE_EVIDENCE_MAX_AGE_DAYS = 60
+
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
 QUOTA_OUT_DAY_KEY = "ai_quota_out_day"   # день МСК, за который уже сообщили «квота кончилась»
@@ -202,6 +226,7 @@ class ScoredOrder:
     attempts: int = 0        # неудачных AI-оценок (и сбоев отправки) подряд
     queue_reason: str | None = None   # почему не оценён (journal.Q_*)
     first_seen: datetime | None = None   # когда бот впервые увидел заказ (очередь и старение)
+    stale_note: str = ""     # пометка карточки: оценка относится к прежнему тексту / обновлена после правки
 
     @property
     def fit(self) -> int | None:
@@ -233,6 +258,8 @@ class CycleResult:
     reserved: int = 0        # отложено ради резерва квоты
     triaged: int = 0         # отсеяно быстрым фильтром без полной оценки
     quota_out: datetime | None = None   # квоты нет ни у кого: когда вернётся первый провайдер
+    reassessed: int = 0      # повторных оценок после правки описания за цикл
+    reassess_notes: list[str] = field(default_factory=list)   # повторные уведомления об обновлённой оценке
 
 
 def prepare_cycle() -> CycleResult:
@@ -274,7 +301,25 @@ def scored_from_row(row: dict) -> ScoredOrder:
         published_at=_parse_dt(row.get("published_at")) or datetime.now(timezone.utc),
         url=row.get("url") or "",
     )
-    return ScoredOrder(order, ai, row.get("dedup_key") or "")
+    return ScoredOrder(order, ai, row.get("dedup_key") or "", stale_note=_stale_note(row, ai))
+
+
+STALE_PENDING = "описание изменено, оценка относится к прежнему тексту (ждёт повторной оценки)"
+STALE_MINOR = "описание немного изменено, оценка прежняя"
+STALE_DONE = "оценка обновлена после правки описания"
+
+
+def _stale_note(row: dict, ai: dict | None) -> str:
+    """Пометка карточки о версии оценки: до повторной оценки явно говорит, что оценка устарела."""
+    if row.get("desc_changed"):
+        try:
+            state = freelance_reassess_state(int(row["order_id"]))
+        except Exception:
+            state = None
+        if state and state.get("significant") and state.get("status") == "pending":
+            return STALE_PENDING
+        return STALE_MINOR
+    return STALE_DONE if ai and ai.get("reassessed") else ""
 
 
 # Полные заказы FL.ru/Kwork со статусом pending. В таблице заказов описания нет, а заказ, ждущий
@@ -461,6 +506,13 @@ def _full_snippet(o: FreelanceOrder) -> str:
     return ai_scorer.mask_contacts(o.body or "")[:ai_scorer.BODY_LIMIT]
 
 
+def _db_budget(o: FreelanceOrder) -> float | None:
+    """Бюджет для колонки budget (и статистики рынка): только рублёвая сопоставимая сумма. Иностранная и неизвестная
+    валюта, ставка в час, отсутствие суммы и испорченные значения дают None, а не число «как есть»."""
+    amount = rub_amount(parse_budget(o.price_text))
+    return amount if amount > 0 else None
+
+
 def _journal_new(o: FreelanceOrder, tech: str, *, full: bool, **states) -> None:
     """Первая запись об увиденном заказе. Название маскируется всегда (телефон, почта, токен -> метка):
     карточка из БД показывает обезличенное название, контакты заказчика в журнал не попадают."""
@@ -472,7 +524,7 @@ def _journal_new(o: FreelanceOrder, tech: str, *, full: bool, **states) -> None:
     freelance_save(
         o.order_id, o.site, title, o.url, ai_scorer.mask_contacts(o.price_text or ""),
         o.published_at.isoformat(), norm_dedup_key(o), None, "", "pending", 0, None,
-        budget=o.price_value if o.price_value and o.price_value > 0 else None,
+        budget=_db_budget(o),
         origin=origin, title_key=jr.title_key(o.site, o.title),
         content_hash=jr.content_hash(o.title, o.body), snippet=snippet,
         pub_unreliable=jr.pub_unreliable(o.site, origin), tech=tech, **states,
@@ -514,6 +566,37 @@ def _handle_updated(o: FreelanceOrder, known: dict, stats: dict) -> None:
         freelance_requeue(o.order_id, new_hash, snippet)
     else:
         freelance_mark_desc_changed(o.order_id, new_hash, snippet)
+        if known.get("tech") == jr.ASSESSED:
+            _queue_reassess(o.order_id, new_hash, known.get("snippet") or "", snippet)
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"\w+", (text or "").lower().replace("ё", "е")))
+
+
+def _text_change(old: str, new: str) -> tuple[float, bool]:
+    """(схожесть слов 0..1, правка существенна). Существенна, если слов общих меньше REASSESS_SIMILARITY
+    или длина текста изменилась на REASSESS_LENGTH_CHANGE и более; пустой прежний текст - всегда существенна."""
+    a, b = _words(old), _words(new)
+    similarity = len(a & b) / len(a | b) if (a or b) else 1.0
+    la, lb = len(old or ""), len(new or "")
+    length_change = abs(lb - la) / max(la, lb, 1)
+    return similarity, (not a) or similarity < REASSESS_SIMILARITY or length_change >= REASSESS_LENGTH_CHANGE
+
+
+def _queue_reassess(order_id: int, new_hash: str, old_snippet: str, new_snippet: str) -> None:
+    """Оценённый заказ получил новое описание: запись о повторной оценке (оценка прежняя до её выполнения)."""
+    try:
+        similarity, significant = _text_change(old_snippet, new_snippet)
+        row = freelance_get(order_id) or {}
+        try:
+            ai = json.loads(row.get("ai_json") or "{}")
+        except ValueError:
+            ai = {}
+        old_price = _num(ai.get("price_mid")) if isinstance(ai, dict) else 0.0
+        freelance_reassess_queue(order_id, new_hash, similarity, significant, row.get("fit"), old_price or None)
+    except Exception:
+        logging.exception(f"[FREELANCE] не удалось поставить повторную оценку заказа {order_id}")
 
 
 def _intake(orders, last_id: int,
@@ -900,6 +983,7 @@ def _prepare_cycle() -> CycleResult:
         else:
             res.to_send.append(sc)
 
+    _reassess_changed(res)
     _report_ai_health(res)
 
     quota_note = f", квота пуста до {res.quota_out.astimezone(MSK):%H:%M}" if res.quota_out else ""
@@ -919,6 +1003,100 @@ def _prepare_cycle() -> CycleResult:
     return res
 
 
+def _reassess_changed(res: CycleResult) -> None:
+    """Повторная оценка заказов с существенно изменённым описанием. Идёт после основной очереди и только когда
+    квоты хватает: не больше REASSESS_PER_CYCLE за цикл, не больше REASSESS_MAX_ATTEMPTS попыток на версию текста.
+    Любой сбой не должен ломать цикл."""
+    try:
+        if not ai_scorer.is_enabled() or ai_scorer.quota_exhausted() or _quota_reserved(3):
+            return
+        for row in freelance_reassess_pending(REASSESS_PER_CYCLE, REASSESS_MAX_ATTEMPTS):
+            try:
+                _reassess_one(res, row)
+            except Exception:
+                logging.exception(f"[FREELANCE] повторная оценка заказа {row.get('order_id')} не удалась")
+    except Exception:
+        logging.exception("[FREELANCE] повторная оценка: сбой")
+
+
+def _reassess_one(res: CycleResult, row: dict) -> None:
+    oid, version = int(row["order_id"]), row["content_hash"]
+    cur = freelance_get(oid)
+    if cur is None or cur.get("tech") != jr.ASSESSED or cur.get("content_hash") != version:
+        freelance_reassess_finish(oid, version, "skipped")   # заказ ушёл или текст изменился ещё раз (там своя запись)
+        return
+    stored = freelance_assessment_get(oid, version)
+    if stored is not None:
+        # такая версия текста уже оценена (например, правка вернулась к прежнему тексту): квота не тратится
+        try:
+            new_ai = json.loads(stored["ai_json"])
+        except ValueError:
+            new_ai = None
+    else:
+        new_ai = None
+    reused = isinstance(new_ai, dict) and "fit" in new_ai
+    if not reused:
+        order = FreelanceOrder(
+            order_id=oid, site=cur.get("site") or "", title=cur.get("title") or "", body=cur.get("snippet") or "",
+            price_text=cur.get("price_text") or "", price_value=0.0, categories=[],
+            published_at=_parse_dt(cur.get("published_at")) or datetime.now(timezone.utc), url=cur.get("url") or "")
+        result = ai_scorer.score_order(order)
+        if result is None:
+            freelance_reassess_attempt(oid, version)
+            return
+        sc = ScoredOrder(order, dict(result), cur.get("dedup_key") or "")
+        _ensure_price(sc)
+        sc.ai["reassessed"] = True
+        new_ai = sc.ai
+        freelance_record_assessment(oid, version, sc.fit, str(result.get("model") or ""),
+                                    json.dumps(new_ai, ensure_ascii=False))
+    new_ai["reassessed"] = True
+    new_fit = int(new_ai["fit"])
+    delivered = cur.get("delivery") == jr.D_CARD
+    delivery = verdict = None
+    if cur.get("delivery") in (None, jr.D_NONE, jr.D_PENDING, jr.D_UNKNOWN):
+        # ещё не доставлен: решение о доставке принимается по новой оценке (это первое уведомление, не повторное)
+        low = new_fit < FREELANCE_MIN_FIT
+        delivery, verdict = (jr.D_NONE, jr.V_LOW) if low else (jr.D_PENDING, jr.V_OK)
+    if not freelance_replace_assessment(oid, version, new_fit, json.dumps(new_ai, ensure_ascii=False),
+                                        new_ai.get("category"), new_ai.get("hours") or None, delivery, verdict):
+        return      # за время оценки текст изменился: запись о новой версии поставлена отдельно
+    freelance_reassess_finish(oid, version, "done")
+    res.reassessed += 1
+    if delivered and _notice_needed(row.get("old_fit"), row.get("old_price"), new_fit, _num(new_ai.get("price_mid"))):
+        if freelance_claim_assessment_notice(oid, version):
+            res.reassess_notes.append(format_reassess_note(cur, row.get("old_fit"), row.get("old_price"), new_ai))
+
+
+def _notice_needed(old_fit, old_price, new_fit: int, new_price: float) -> bool:
+    """Повторное уведомление о доставленном заказе: оценка пересекла порог вверх, изменилась на NOTICE_FIT_DELTA и более
+    либо цена полного объёма изменилась на NOTICE_PRICE_CHANGE и более. Иначе оценка обновляется молча."""
+    if old_fit is None:
+        return False
+    old_fit = int(old_fit)
+    if old_fit < FREELANCE_MIN_FIT <= new_fit or abs(new_fit - old_fit) >= NOTICE_FIT_DELTA:
+        return True
+    old_price = _num(old_price)
+    return old_price > 0 and new_price > 0 and abs(new_price - old_price) / old_price >= NOTICE_PRICE_CHANGE
+
+
+def format_reassess_note(row: dict, old_fit, old_price, ai: dict) -> str:
+    """Короткое HTML-сообщение: описание заказа изменилось, оценка обновлена (было -> стало)."""
+    e = html.escape
+    lines = [f"🔄 Описание заказа изменилось, оценка обновлена: <b>{e((row.get('title') or '')[:200])}</b>"]
+    lines.append(f"🤖 было {old_fit}/10 → стало {ai.get('fit')}/10")
+    price = _num(ai.get("price_mid"))
+    if price > 0:
+        was = f"{_money(old_price)} → " if _num(old_price) > 0 else ""
+        lines.append(f"💵 Цена полного объёма: {was}{_money(price)} ₽")
+    summary = str(ai.get("summary") or "")
+    if summary:
+        lines.append(f"📝 {e(summary[:300])}")
+    if row.get("url"):
+        lines.append(e(str(row["url"])))
+    return "\n".join(lines)
+
+
 def _save_scored_now(sc: ScoredOrder, result: dict) -> None:
     """Оценка уже получена и стоила квоты: сразу в БД как pending, не дожидаясь конца пачки.
     Рестарт посреди цикла иначе заставил бы оценивать те же заказы заново. Работаем с копией:
@@ -927,6 +1105,10 @@ def _save_scored_now(sc: ScoredOrder, result: dict) -> None:
         tmp = ScoredOrder(sc.order, dict(result), sc.dedup, sc.attempts)
         _ensure_price(tmp)
         _save_retry(tmp, "pending")
+        if not result.get("triage") and sc.order.body:
+            freelance_record_assessment(sc.order.order_id, jr.content_hash(sc.order.title, sc.order.body),
+                                        tmp.fit, str(result.get("model") or ""),
+                                        json.dumps(tmp.ai, ensure_ascii=False))
     except Exception:
         logging.exception(f"[FREELANCE] не удалось сразу сохранить оценку {sc.order.url}")
 
@@ -959,14 +1141,31 @@ def _evidence_signature() -> str:
     return f"{ai_scorer.triage_signature()}|rej{TRIAGE_REJECT_MAX}|fit{FREELANCE_MIN_FIT}"
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _evidence_aged(started, updated, now: datetime | None = None) -> bool:
+    """Набор наблюдений недействителен: пауза с последней записи больше TRIAGE_EVIDENCE_MAX_IDLE_DAYS, возраст набора
+    больше TRIAGE_EVIDENCE_MAX_AGE_DAYS либо меток времени нет (старый формат), либо метка из будущего."""
+    first, last = _parse_dt(str(started or "")), _parse_dt(str(updated or ""))
+    if first is None or last is None:
+        return True
+    now = now or _now()
+    return (now - last > timedelta(days=TRIAGE_EVIDENCE_MAX_IDLE_DAYS)
+            or now - first > timedelta(days=TRIAGE_EVIDENCE_MAX_AGE_DAYS)
+            or last > now + timedelta(days=1) or last < first)
+
+
 def _load_evidence() -> dict:
     try:
         data = json.loads(kv_get(TRIAGE_EVIDENCE_KEY, "") or "{}")
         ev = {k: int(data.get(k) or 0) for k in _EVIDENCE_FIELDS}
         ev["sig"] = str(data.get("sig") or "")
+        ev["started"], ev["updated"] = str(data.get("started") or ""), str(data.get("updated") or "")
         return ev
     except (ValueError, TypeError, AttributeError):
-        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": ""}
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": "", "started": "", "updated": ""}
 
 
 def triage_evidence() -> dict:
@@ -977,12 +1176,18 @@ def triage_evidence() -> dict:
     current = _evidence_signature()
     if ev["sig"] != current:
         return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": current, "stale": bool(ev["sig"] or any(
-            ev[k] for k in _EVIDENCE_FIELDS))}
-    return {**ev, "stale": False}
+            ev[k] for k in _EVIDENCE_FIELDS)), "expired": False}
+    if any(ev[k] for k in _EVIDENCE_FIELDS) and _evidence_aged(ev["started"], ev["updated"]):
+        # тот же отпечаток, но наблюдения старые или с паузой: возврат настроек их не оживляет
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": current, "stale": True, "expired": True}
+    return {**ev, "stale": False, "expired": False}
 
 
 def _save_evidence(ev: dict) -> None:
-    kv_set(TRIAGE_EVIDENCE_KEY, json.dumps({**{k: ev[k] for k in _EVIDENCE_FIELDS}, "sig": ev["sig"]}))
+    now = _now().isoformat()
+    started = ev.get("started") or now
+    kv_set(TRIAGE_EVIDENCE_KEY, json.dumps({**{k: ev[k] for k in _EVIDENCE_FIELDS}, "sig": ev["sig"],
+                                            "started": started, "updated": now}))
 
 
 def _is_control(order_id: int) -> bool:
@@ -1061,6 +1266,9 @@ def record_triage_label(order_id: int, suitable: bool) -> str | None:
 def triage_allowed() -> tuple[bool, str]:
     """Можно ли включать отсекающий триаж: (да/нет, пояснение)."""
     ev = triage_evidence()
+    if ev.get("expired"):
+        return False, (f"наблюдения устарели (пауза больше {TRIAGE_EVIDENCE_MAX_IDLE_DAYS} дн. или набору больше "
+                       f"{TRIAGE_EVIDENCE_MAX_AGE_DAYS} дн.): набор начат заново")
     if ev["stale"]:
         return False, "статистика набрана при другой модели, промпте или порогах: набор начат заново"
     if ev["n"] < TRIAGE_MIN_SAMPLE or ev["good"] < TRIAGE_MIN_GOOD:
@@ -1089,14 +1297,21 @@ def _audit_state() -> dict:
         data = json.loads(kv_get(TRIAGE_AUDIT_KEY, "") or "{}")
     except (ValueError, TypeError):
         data = {}
-    if not isinstance(data, dict) or data.get("sig") != sig:
+    if not isinstance(data, dict) or data.get("sig") != sig or _evidence_aged(data.get("started"), data.get("updated")):
         return {"sig": sig, "issued": [], "pending": [], "code": "", "reviewed": [], "suitable": []}
-    out = {"sig": sig}
+    out = {"sig": sig, "started": str(data.get("started") or ""), "updated": str(data.get("updated") or "")}
     for k in ("issued", "pending", "reviewed", "suitable"):
         v = data.get(k)
         out[k] = [int(x) for x in v] if isinstance(v, list) else []
     out["code"] = str(data.get("code") or "")
     return out
+
+
+def _stamp(state: dict) -> None:
+    """Метки давности набора подтверждений владельца (started - начало набора, updated - последняя запись)."""
+    now = _now().isoformat()
+    state["started"] = state.get("started") or now
+    state["updated"] = now
 
 
 def _batch_code(sig: str, ids: list[int]) -> str:
@@ -1138,6 +1353,7 @@ def approve_triage(code: str, suitable_ids: list[int] | None = None) -> str:
         st["suitable"] = sorted(set(st["suitable"]) | set(suitable_ids))
         n = len(st["pending"])
         st["pending"], st["code"] = [], ""
+        _stamp(st)
         kv_set(TRIAGE_AUDIT_KEY, json.dumps(st))
     ok, why = triage_allowed()
     ap = triage_approval()
@@ -1168,6 +1384,7 @@ def triage_audit_sample(k: int = 20) -> dict:
                 st["pending"] = ids
                 st["issued"] = sorted(seen | set(ids))
                 st["code"] = _batch_code(st["sig"], ids)
+                _stamp(st)
                 kv_set(TRIAGE_AUDIT_KEY, json.dumps(st))
         code = st["code"] if st["pending"] else ""
     rows = []
@@ -1252,11 +1469,14 @@ def _ensure_price(sc: ScoredOrder) -> None:
     if not ai or "category" not in ai or ai.get("price_v") == pricing.PRICE_VERSION:
         return
     try:
-        price = pricing.price_order(ai, sc.order.price_value)
+        price = pricing.price_order(ai, parse_budget(sc.order.price_text))
         # старые price_*/market_*/budget_* не должны пережить пересчёт (например, устаревший рынок)
-        for key in [k for k in ai if k.startswith(("price_", "market_", "budget"))]:
+        for key in [k for k in ai if k.startswith(("price_", "market_", "budget", "hours_", "hourly_"))]:
             del ai[key]
         ai.update(price)
+        topic = f"{sc.order.title or ''} {sc.order.body or ''}"
+        ai["experience"] = [{"id": e["id"], "title": e["title"], "client_ok": e["client_ok"]}
+                            for e in profile.relevant_experience(ai.get("category"), topic)]
     except Exception:
         logging.exception(f"[FREELANCE] не удалось посчитать цену {sc.order.url}")
 
@@ -1385,7 +1605,7 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
         json.dumps(sc.ai, ensure_ascii=False) if sc.ai else "",
         status, sc.attempts, message_id,
         category=ai.get("category"),
-        budget=o.price_value if o.price_value and o.price_value > 0 else None,
+        budget=_db_budget(o),
         hours=ai.get("hours") or None,
         origin=origin, title_key=jr.title_key(o.site, o.title),
         content_hash=jr.content_hash(o.title, o.body) if o.body else None,
@@ -1535,7 +1755,12 @@ def _price_basis_line(ai: dict) -> str:
         parts.append(f"{market} — цена {verdict[:40]}" if verdict else market)
     elif ai.get("market_n") is not None:
         parts.append(f"рынок {name}: мало данных ({int(_num(ai.get('market_n')))} из {pricing.MIN_POINTS})")
-    budget = _num(ai.get("budget"))
+    if ai.get("budget_status"):
+        line = _budget_line(ai)
+        if line:
+            parts.append(line)
+        return " · ".join(parts)
+    budget = _num(ai.get("budget"))     # записи прежней формулы (до версии цены 4): бюджет подгонял цену
     if budget > 0:
         b_rate = _num(ai.get("budget_rate"))
         b_text = f"бюджет {_money(budget)} ₽" + (f" ≈ {_money(b_rate)} ₽/ч" if b_rate > 0 else "")
@@ -1550,6 +1775,66 @@ def _price_basis_line(ai: dict) -> str:
             b_text += f" · поднято к бюджету (по расчёту {_money(own)} ₽)"
         parts.append(b_text)
     return " · ".join(parts)
+
+
+BUDGET_SHORT = {
+    "ok": "покрывает полный объём",
+    "below_full": "ниже расчёта: предложить меньший объём или этапы",
+    "below_min": "ниже минимума: предложить диагностику или меньший объём, цену не снижать",
+    "open_low": "«от N» ниже расчёта: уточнить верхнюю границу",
+    "none": "не указан (это не плохой профиль)",
+    "uncertain_currency": "валюта неизвестна, сравнить нельзя",
+    "uncertain_fx": "нет надёжного курса, сравнение не сделано",
+    "suspicious": "значение испорчено, не учтено",
+}
+
+
+def _budget_line(ai: dict) -> str:
+    """Бюджет клиента отдельно от цены: статус сравнения, валюта, курс (источник и дата) для иностранной валюты."""
+    status = str(ai.get("budget_status") or "")
+    if status == "hourly":
+        text = str(ai.get("budget_note") or "почасовая ставка")
+    else:
+        text = BUDGET_SHORT.get(status, "")
+    if not text:
+        return ""
+    line = f"бюджет клиента: {text}"
+    fx_info = ai.get("budget_fx")
+    if isinstance(fx_info, dict) and _num(ai.get("budget_rub")) > 0:
+        line += (f" ({ai.get('budget_currency') or ''} ≈ {_money(ai.get('budget_rub'))} ₽ по курсу "
+                 f"{_num(fx_info.get('rate')):g}, {str(fx_info.get('source') or '')[:30]}, "
+                 f"{str(fx_info.get('date') or '')[:10]})")
+    return line
+
+
+def _dimensions_lines(ai: dict) -> list[str]:
+    """Раздельные оценки подробной карточки: профиль, выполнимость, ясность и достаточность данных, срочность, часы."""
+    lines = []
+    reason = str(ai.get("profile_reason") or "").strip()
+    if reason:
+        lines.append(f"🎯 Профиль: {html.escape(reason[:200])}")
+    parts = []
+    for label, key in (("выполнимость", "feasibility"), ("ясность ТЗ", "clarity"), ("данных", "sufficiency")):
+        value = str(ai.get(key) or "")
+        if value:
+            parts.append(f"{label}: {html.escape(value[:20])}")
+    confidence = str(ai.get("confidence") or "")
+    if confidence:
+        parts.append(f"уверенность: {html.escape(confidence[:20])}")
+    urgency = str(ai.get("urgency") or "")
+    if urgency and urgency != "не указана":
+        parts.append(f"срок: {html.escape(urgency[:20])}")
+    if parts:
+        lines.append("🧭 " + " · ".join(parts))
+    low, high = _fmt_hours(ai.get("hours_low")), _fmt_hours(ai.get("hours_high"))
+    if low and high:
+        lines.append(f"⏱ Работа: {low}" + (f"–{high}" if high != low else "") + " ч (часы работы, не календарный срок)")
+    experience = ai.get("experience")
+    if isinstance(experience, list):
+        titles = [str(x.get("title") or "")[:90] for x in experience if isinstance(x, dict) and x.get("title")]
+        lines.append("📚 Подтверждённый опыт: " + html.escape("; ".join(titles))
+                     if titles else "📚 Подтверждённого опыта по теме нет")
+    return lines
 
 
 def _components_line(ai: dict) -> str:
@@ -1570,6 +1855,11 @@ def _components_line(ai: dict) -> str:
 def _price_note(ai: dict) -> str:
     """Одна пометка после цены; приоритет: бюджет занижен -> упёрлось в бюджет ->
     поднято к бюджету -> вердикт рынка (если не «в рынке»)."""
+    status = ai.get("budget_status")
+    if status in ("below_min", "below_full"):
+        return "бюджет ниже минимума" if status == "below_min" else "бюджет ниже расчёта"
+    if status in ("uncertain_currency", "uncertain_fx", "suspicious"):
+        return "бюджет не сопоставлен"
     if ai.get("budget_low"):
         return "бюджет занижен"
     if ai.get("budget_capped"):
@@ -1623,6 +1913,8 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
     age = _age_line(sc)
     if age:
         lines.append(age)
+    if sc.stale_note:
+        lines.append(f"⚠️ {e(sc.stale_note)}")
     if detailed:
         lag = _lag_line(sc)
         if lag:
@@ -1640,7 +1932,12 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
                 parts.append(f"предложить {e(price_rub[:100])}")
         lines.append(" · ".join([money] + parts))
         if price_mid > 0:
-            line = f"💵 Предложить: {_money(price_mid)} ₽"
+            if ai.get("price_vague") and _num(ai.get("price_low")) > 0 and _num(ai.get("price_high")) > 0:
+                # размытое ТЗ: ориентир с вилкой и условиями, а не точная цена
+                line = (f"💵 Ориентир: {_money(ai.get('price_low'))}–{_money(ai.get('price_high'))} ₽ "
+                        f"(зависит от уточнений)")
+            else:
+                line = f"💵 Предложить: {_money(price_mid)} ₽"
             note = _price_note(ai)
             if note:
                 line += f" · {e(note)}"
@@ -1654,6 +1951,13 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
                 basis = _price_basis_line(ai)
                 if basis:
                     lines.append(f"   {e(basis)}")
+            minimum = _num(ai.get("price_min"))
+            if minimum > 0 and ai.get("price_v") == pricing.PRICE_VERSION:
+                lines.append(f"   минимально приемлемая цена: {_money(minimum)} ₽")
+            conditions = ai.get("price_conditions")
+            if ai.get("price_vague") and isinstance(conditions, list) and conditions:
+                lines.append("   условия оценки: " + e("; ".join(str(c)[:80] for c in conditions[:5])))
+            lines.extend(_dimensions_lines(ai))
             difficulty = str(ai.get("difficulty") or "")
             if difficulty:
                 lines.append(f"⚙️ Сложность: {e(difficulty[:20])}")
@@ -1668,8 +1972,11 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
                 if comps:
                     lines.append(f"🧩 {e(comps)}")
             questions = ai.get("questions")
-            if isinstance(questions, list) and questions and str(questions[0]).strip():
-                lines.append(f"❓ Уточнить: {e(str(questions[0]).strip()[:200])}")
+            if isinstance(questions, list):
+                asked = [str(q).strip()[:200] for q in questions if str(q).strip()]
+                if asked:
+                    shown = asked[:3] if detailed else asked[:1]
+                    lines.append("❓ Уточнить: " + e(" · ".join(shown)))
     else:
         lines.append(money)
         lines.append("🤖 без AI")

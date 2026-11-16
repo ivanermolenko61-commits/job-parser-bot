@@ -1,0 +1,119 @@
+Дословные выдержки (без изменений) из freelance/pipeline.py для проверки tests/test_triage_capacity.py (давность наблюдений триажа).
+Путь: freelance/pipeline.py; blob файла: 74b473a7e533bb3442c7a62fbfb04e8a4c9aac4f (в момент подготовки; точный коммит - коммит единицы).
+Константы: TRIAGE_EVIDENCE_MAX_IDLE_DAYS=14, TRIAGE_EVIDENCE_MAX_AGE_DAYS=60; _parse_dt - разбор ISO-времени (None при ошибке).
+
+--- строки 1144-1147, sha256 fb76a36a24bb
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+--- строки 1148-1159, sha256 56832c3b806e
+def _evidence_aged(started, updated, now: datetime | None = None) -> bool:
+    """Набор наблюдений недействителен: пауза с последней записи больше TRIAGE_EVIDENCE_MAX_IDLE_DAYS, возраст набора
+    больше TRIAGE_EVIDENCE_MAX_AGE_DAYS либо меток времени нет (старый формат), либо метка из будущего."""
+    first, last = _parse_dt(str(started or "")), _parse_dt(str(updated or ""))
+    if first is None or last is None:
+        return True
+    now = now or _now()
+    return (now - last > timedelta(days=TRIAGE_EVIDENCE_MAX_IDLE_DAYS)
+            or now - first > timedelta(days=TRIAGE_EVIDENCE_MAX_AGE_DAYS)
+            or last > now + timedelta(days=1) or last < first)
+
+--- строки 1160-1170, sha256 80e3c3672a2e
+def _load_evidence() -> dict:
+    try:
+        data = json.loads(kv_get(TRIAGE_EVIDENCE_KEY, "") or "{}")
+        ev = {k: int(data.get(k) or 0) for k in _EVIDENCE_FIELDS}
+        ev["sig"] = str(data.get("sig") or "")
+        ev["started"], ev["updated"] = str(data.get("started") or ""), str(data.get("updated") or "")
+        return ev
+    except (ValueError, TypeError, AttributeError):
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": "", "started": "", "updated": ""}
+
+--- строки 1171-1185, sha256 0b83e9cc1f1d
+def triage_evidence() -> dict:
+    """Накопленная статистика триажа: n/good/miss - сравнение с полной AI-оценкой; lab_good/lab_bad/lab_miss -
+    независимая разметка владельца. Хранится в kv (переживает рестарт). Статистика, набранная при другой модели,
+    промпте или порогах (отпечаток не совпал), не используется: возвращаются нули и stale=True."""
+    ev = _load_evidence()
+    current = _evidence_signature()
+    if ev["sig"] != current:
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": current, "stale": bool(ev["sig"] or any(
+            ev[k] for k in _EVIDENCE_FIELDS)), "expired": False}
+    if any(ev[k] for k in _EVIDENCE_FIELDS) and _evidence_aged(ev["started"], ev["updated"]):
+        # тот же отпечаток, но наблюдения старые или с паузой: возврат настроек их не оживляет
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": current, "stale": True, "expired": True}
+    return {**ev, "stale": False, "expired": False}
+
+--- строки 1186-1192, sha256 c56b63066b20
+def _save_evidence(ev: dict) -> None:
+    now = _now().isoformat()
+    started = ev.get("started") or now
+    kv_set(TRIAGE_EVIDENCE_KEY, json.dumps({**{k: ev[k] for k in _EVIDENCE_FIELDS}, "sig": ev["sig"],
+                                            "started": started, "updated": now}))
+
+--- строки 1291-1309, sha256 b18102d0266b
+def _audit_state() -> dict:
+    """Состояние выборки владельца для ТЕКУЩИХ настроек: issued - все выданные заказы (уникальные), pending - выданная
+    и ещё не подтверждённая партия, reviewed - подтверждённые, suitable - из них отмеченные подходящими.
+    При смене настроек (отпечаток) состояние начинается с нуля."""
+    sig = _evidence_signature()
+    try:
+        data = json.loads(kv_get(TRIAGE_AUDIT_KEY, "") or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict) or data.get("sig") != sig or _evidence_aged(data.get("started"), data.get("updated")):
+        return {"sig": sig, "issued": [], "pending": [], "code": "", "reviewed": [], "suitable": []}
+    out = {"sig": sig, "started": str(data.get("started") or ""), "updated": str(data.get("updated") or "")}
+    for k in ("issued", "pending", "reviewed", "suitable"):
+        v = data.get(k)
+        out[k] = [int(x) for x in v] if isinstance(v, list) else []
+    out["code"] = str(data.get("code") or "")
+    return out
+
+--- строки 1310-1316, sha256 36e32f4c46bc
+def _stamp(state: dict) -> None:
+    """Метки давности набора подтверждений владельца (started - начало набора, updated - последняя запись)."""
+    now = _now().isoformat()
+    state["started"] = state.get("started") or now
+    state["updated"] = now
+
+--- строки 1266-1290, sha256 2656851f0ca5
+def triage_allowed() -> tuple[bool, str]:
+    """Можно ли включать отсекающий триаж: (да/нет, пояснение)."""
+    ev = triage_evidence()
+    if ev.get("expired"):
+        return False, (f"наблюдения устарели (пауза больше {TRIAGE_EVIDENCE_MAX_IDLE_DAYS} дн. или набору больше "
+                       f"{TRIAGE_EVIDENCE_MAX_AGE_DAYS} дн.): набор начат заново")
+    if ev["stale"]:
+        return False, "статистика набрана при другой модели, промпте или порогах: набор начат заново"
+    if ev["n"] < TRIAGE_MIN_SAMPLE or ev["good"] < TRIAGE_MIN_GOOD:
+        return False, (f"мало данных shadow: оценок {ev['n']} из {TRIAGE_MIN_SAMPLE}, "
+                       f"подходящих {ev['good']} из {TRIAGE_MIN_GOOD}")
+    if ev["miss"]:
+        return False, f"shadow показал пропуски подходящих: {ev['miss']} из {ev['good']}"
+    if ev["lab_miss"]:
+        return False, f"разметка владельца показала пропуски: {ev['lab_miss']} из {ev['lab_good']} подходящих"
+    if ev["lab_good"] < TRIAGE_MIN_LABELED:
+        return False, (f"нет независимой разметки: подходящих по решению владельца {ev['lab_good']} "
+                       f"из {TRIAGE_MIN_LABELED} (совпадение с полной оценкой полноту не доказывает)")
+    appr = triage_approval()
+    if not appr["valid"]:
+        return False, appr["why"]
+    return True, (f"пропусков нет: {ev['n']} сравнений с полной оценкой, по разметке владельца "
+                  f"{ev['lab_good']} подходящих и {ev['lab_bad']} отклонённых")
+
+--- строки 1321-1336, sha256 81bf9da093b7
+def triage_approval() -> dict:
+    """Подтверждение владельца для ТЕКУЩИХ настроек триажа (отпечаток): valid - можно, why - почему нет.
+    Считаются только уникальные заказы, выданные ботом и подтверждённые по коду партии."""
+    st = _audit_state()
+    checked, suitable = len(set(st["reviewed"])), len(set(st["suitable"]))
+    base = {"checked": checked, "suitable": suitable, "issued": len(set(st["issued"])), "pending": len(st["pending"])}
+    if suitable:
+        return {**base, "valid": False,
+                "why": f"выборка владельца нашла подходящих среди отсекаемых: {suitable} из {checked}"}
+    if checked < TRIAGE_AUDIT_MIN:
+        return {**base, "valid": False,
+                "why": f"нет подтверждения владельца для этих настроек: просмотрено {checked} из {TRIAGE_AUDIT_MIN} "
+                       f"уникальных заказов выборки (/triage_audit, затем /triage_approve)"}
+    return {**base, "valid": True, "why": ""}

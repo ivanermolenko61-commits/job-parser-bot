@@ -9,6 +9,7 @@
                     как её удалили из vacancies, а на сайте она всё ещё висит.
 """
 import json
+import math
 import os
 import re
 import sqlite3
@@ -430,6 +431,25 @@ def _init_freelance(conn) -> None:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_assessments (
+            order_id INTEGER NOT NULL, content_hash TEXT NOT NULL, assessed_at TEXT, fit INTEGER,
+            model TEXT, ai_json TEXT, notified INTEGER DEFAULT 0,
+            PRIMARY KEY (order_id, content_hash)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_reassess (
+            order_id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL, similarity REAL, significant INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0, old_fit INTEGER, old_price REAL,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_actuals (
+            order_id INTEGER PRIMARY KEY, hours REAL, expenses REAL, updated_at TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -563,7 +583,7 @@ def freelance_dup_candidates(title_key: str, days: int, exclude_id: int | None =
 
 
 def freelance_known(order_ids: list[int]) -> dict[int, dict]:
-    """Уже виденные заказы: {order_id: {content_hash, tech, desc_changed}} (для обнаружения правки описания)."""
+    """Уже виденные заказы: {order_id: {content_hash, tech, snippet, desc_changed}} (для обнаружения правки описания)."""
     found: dict[int, dict] = {}
     if not order_ids:
         return found
@@ -572,7 +592,7 @@ def freelance_known(order_ids: list[int]) -> dict[int, dict]:
             chunk = order_ids[i:i + 500]
             marks = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT order_id, content_hash, tech, COALESCE(desc_changed, 0) AS desc_changed "
+                f"SELECT order_id, content_hash, tech, snippet, COALESCE(desc_changed, 0) AS desc_changed "
                 f"FROM freelance_orders WHERE order_id IN ({marks})", chunk).fetchall()
             found.update((r["order_id"], dict(r)) for r in rows)
     return found
@@ -880,6 +900,171 @@ def freelance_deal_rows() -> list[dict]:
         rows = conn.execute(
             "SELECT category, deal_price, ai_json FROM freelance_orders WHERE deal_price > 0"
         ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Версии оценки, повторная оценка и фактические результаты (этап 2). Таблицы новые: freelance_orders не меняется ---
+
+def freelance_record_assessment(order_id: int, content_hash: str, fit: int | None, model: str,
+                                ai_json: str) -> bool:
+    """Запоминает оценку версии текста. False - такая версия (заказ + отпечаток текста) уже оценена: повторно не пишется."""
+    if not content_hash:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO freelance_assessments (order_id, content_hash, assessed_at, fit, model, ai_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (order_id, content_hash, _now_sql(), fit, model or "", ai_json or ""))
+        return cur.rowcount > 0
+
+
+def freelance_assessment_get(order_id: int, content_hash: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM freelance_assessments WHERE order_id = ? AND content_hash = ?",
+                           (order_id, content_hash)).fetchone()
+        return dict(row) if row else None
+
+
+def freelance_assessment_history(order_id: int) -> list[dict]:
+    """История оценок заказа, новые первыми."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM freelance_assessments WHERE order_id = ? "
+                            "ORDER BY assessed_at DESC, rowid DESC", (order_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_claim_assessment_notice(order_id: int, content_hash: str) -> bool:
+    """Занимает право на повторное уведомление по версии текста: True получает только первый вызов
+    (одно уведомление на версию), дальше False."""
+    with _connect() as conn:
+        cur = conn.execute("UPDATE freelance_assessments SET notified = 1 "
+                           "WHERE order_id = ? AND content_hash = ? AND COALESCE(notified, 0) = 0",
+                           (order_id, content_hash))
+        return cur.rowcount > 0
+
+
+def freelance_reassess_queue(order_id: int, content_hash: str, similarity: float, significant: bool,
+                             old_fit: int | None, old_price: float | None) -> bool:
+    """Правка описания оценённого заказа: запись о повторной оценке. Тот же отпечаток повторно не ставится (False).
+    Если прежняя запись ещё не отработана, прежняя оценка (old_fit/old_price) сохраняется: она та, что видел владелец."""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute("SELECT * FROM freelance_reassess WHERE order_id = ?", (order_id,)).fetchone()
+        if old is not None and old["content_hash"] == content_hash:
+            return False
+        if old is not None and old["status"] == "pending":
+            old_fit, old_price = old["old_fit"], old["old_price"]
+        conn.execute(
+            "INSERT OR REPLACE INTO freelance_reassess (order_id, content_hash, similarity, significant, status, "
+            "attempts, old_fit, old_price, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (order_id, content_hash, float(similarity), 1 if significant else 0,
+             "pending" if significant else "skipped", old_fit, old_price, _now_sql()))
+        return True
+
+
+def freelance_reassess_state(order_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM freelance_reassess WHERE order_id = ?", (order_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def freelance_reassess_pending(limit: int = 2, max_attempts: int = 3) -> list[dict]:
+    """Существенные правки, ждущие повторной оценки (старые первыми, попыток меньше max_attempts)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM freelance_reassess WHERE status = 'pending' AND significant = 1 AND attempts < ? "
+            "ORDER BY created_at, order_id LIMIT ?", (max_attempts, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_reassess_attempt(order_id: int, content_hash: str) -> bool:
+    """Ещё одна неудачная попытка повторной оценки этой версии текста."""
+    with _connect() as conn:
+        cur = conn.execute("UPDATE freelance_reassess SET attempts = attempts + 1 "
+                           "WHERE order_id = ? AND content_hash = ?", (order_id, content_hash))
+        return cur.rowcount > 0
+
+
+def freelance_reassess_finish(order_id: int, content_hash: str, status: str) -> bool:
+    """Закрывает запись версии: done (оценка обновлена) или skipped (заказ изменился или не подходит)."""
+    with _connect() as conn:
+        cur = conn.execute("UPDATE freelance_reassess SET status = ? WHERE order_id = ? AND content_hash = ?",
+                           (status, order_id, content_hash))
+        return cur.rowcount > 0
+
+
+def freelance_replace_assessment(order_id: int, content_hash: str, fit: int | None, ai_json: str,
+                                 category: str | None, hours: float | None,
+                                 delivery: str | None = None, verdict: str | None = None) -> bool:
+    """Заменяет текущую оценку оценкой новой версии текста (одна запись) и снимает пометку «описание изменено».
+    Только для оценённого заказа и только если текст с тех пор не менялся (отпечаток совпадает). delivery и
+    verdict меняются лишь у не доставленных карточкой заказов. False - запись не изменена."""
+    fields: dict = {"fit": fit, "ai_json": ai_json, "category": category, "hours": hours, "desc_changed": 0}
+
+    def guard(row: dict) -> bool:
+        if row.get("tech") != jr.ASSESSED or row.get("content_hash") != content_hash:
+            return False
+        if row.get("delivery") in (jr.D_CARD, jr.D_DIGEST):
+            fields.pop("delivery", None)
+            fields.pop("verdict", None)
+        elif delivery is not None:
+            fields["delivery"] = delivery
+            if verdict is not None:
+                fields["verdict"] = verdict
+        return True
+
+    return _replace_guarded(order_id, guard, fields)
+
+
+def _replace_guarded(order_id: int, guard, fields: dict) -> bool:
+    """Запись полей заказа под проверкой guard(row) в той же транзакции; guard может дополнить fields."""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
+        if row is None or not guard(dict(row)):
+            return False
+        merged = {**dict(row), **fields}
+        merged["status"] = jr.legacy_status(
+            merged.get("tech"), merged.get("delivery"), merged.get("lead"), bool(merged.get("card_deleted_at")))
+        names = [*fields, "status"]
+        conn.execute(
+            f"UPDATE freelance_orders SET {','.join(f'{n} = ?' for n in names)} WHERE order_id = ?",
+            (*(merged[n] for n in names), order_id))
+        return True
+
+
+def freelance_set_actuals(order_id: int, hours: float | None = None, expenses: float | None = None) -> bool:
+    """Фактические часы и расходы по заказу (None - значение не менять). False - заказа нет, значения
+    отрицательные/нечисловые или не передано ничего."""
+    values = {}
+    for name, value in (("hours", hours), ("expenses", expenses)):
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(number) or number < 0:
+            return False
+        values[name] = number
+    if not values or freelance_get(order_id) is None:
+        return False
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO freelance_actuals (order_id, hours, expenses, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(order_id) DO UPDATE SET hours = COALESCE(?, hours), expenses = COALESCE(?, expenses), "
+            "updated_at = ?",
+            (order_id, values.get("hours"), values.get("expenses"), _now_sql(),
+             values.get("hours"), values.get("expenses"), _now_sql()))
+    return True
+
+
+def freelance_actuals_rows() -> list[dict]:
+    """Заказы с фактическими часами: category, hours_est (оценка часов), hours_actual, expenses - для калибровки."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT o.order_id, o.category, o.hours AS hours_est, a.hours AS hours_actual, a.expenses "
+            "FROM freelance_actuals a JOIN freelance_orders o ON o.order_id = a.order_id "
+            "WHERE a.hours IS NOT NULL").fetchall()
         return [dict(r) for r in rows]
 
 

@@ -15,6 +15,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from config import ALOT_SEED_ID
+from freelance.budget import detect_currency
 
 API_URL = "https://alot.pro/api/v2/"
 BATCH_SIZE = 100
@@ -113,6 +114,23 @@ def _clean_body(html_text: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
+_NOT_AMOUNT_RE = re.compile(r"[\d\s.,\-–—]|\b(?:от|до|тыс|млн|к|k|from|up to)\b\.?", re.IGNORECASE)
+_CURRENCY_SIGNS = {"RUB": "₽", "UAH": "₴", "USD": "$", "EUR": "€", "KZT": "₸"}
+
+
+def _with_currency(price_text: str, currency) -> str:
+    """alot.pro отдаёт сумму без знака валюты, а валюту - отдельным полем currency. Если в тексте знака нет, а поле
+    известно, дописываем знак: дальше бюджет разбирается как «сумма + валюта», а не как рубли по умолчанию.
+    Неизвестный код валюты или пустая цена текст не меняют (валюта остаётся неизвестной)."""
+    sign = _CURRENCY_SIGNS.get(str(currency or "").strip().upper())
+    if not price_text or not sign or detect_currency(price_text):
+        return price_text
+    # в тексте есть что-то кроме суммы («100 £», «5000 zł»): неизвестный знак валюты поле не перекрывает
+    if _NOT_AMOUNT_RE.sub("", price_text).strip():
+        return price_text
+    return f"{price_text} {sign}"
+
+
 def _parse_item(item: dict) -> FreelanceOrder | None:
     try:
         order_id = int(item["internalId"])
@@ -127,7 +145,7 @@ def _parse_item(item: dict) -> FreelanceOrder | None:
             site=str(item.get("site") or ""),
             title=str(item.get("title") or "").strip(),
             body=_clean_body(item.get("body") or ""),
-            price_text=str(item.get("price") or "").strip(),
+            price_text=_with_currency(str(item.get("price") or "").strip(), item.get("currency")),
             price_value=price_value,
             categories=list(item.get("alotCategories") or []),
             published_at=published,
