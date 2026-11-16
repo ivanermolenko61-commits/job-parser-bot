@@ -114,6 +114,13 @@ except ValueError:
 TRIAGE_MIN_SAMPLE = 150
 TRIAGE_MIN_GOOD = 15
 TRIAGE_EVIDENCE_KEY = "triage_shadow_stats"
+# Совпадение с полной AI-оценкой НЕ доказывает полноту: полная оценка сама может ошибаться. Поэтому отсечение
+# требует ещё независимой разметки - решений владельца по кнопкам («Взял» = подходит, «Не подходит» = отказ)
+# для заказов, которые прошли shadow-триаж: не меньше TRIAGE_MIN_LABELED подходящих и ни одного пропуска
+TRIAGE_MIN_LABELED = 8
+TRIAGE_SCORES_KEY = "triage_shadow_scores"   # order_id -> быстрая оценка, последние TRIAGE_SCORES_MAX заказов
+TRIAGE_SCORES_MAX = 400
+_EVIDENCE_FIELDS = ("n", "good", "miss", "lab_good", "lab_bad", "lab_miss")
 _triage_evidence_lock = threading.Lock()
 _triage_warned = {"on": False}
 LAST_ID_KEY = "alot_last_id"
@@ -927,36 +934,111 @@ def _triage(sc: ScoredOrder) -> int | None:
     return value
 
 
-def triage_evidence() -> dict:
-    """Накопленное сравнение быстрой и полной оценки: {n, good, miss}. Хранится в kv (переживает рестарт)."""
+def _evidence_signature() -> str:
+    """Отпечаток условий, при которых набрана статистика: модель, промпты, цепочка полной оценки (ai_scorer)
+    и пороги (TRIAGE_REJECT_MAX, FREELANCE_MIN_FIT)."""
+    return f"{ai_scorer.triage_signature()}|rej{TRIAGE_REJECT_MAX}|fit{FREELANCE_MIN_FIT}"
+
+
+def _load_evidence() -> dict:
     try:
         data = json.loads(kv_get(TRIAGE_EVIDENCE_KEY, "") or "{}")
-        return {k: int(data.get(k) or 0) for k in ("n", "good", "miss")}
+        ev = {k: int(data.get(k) or 0) for k in _EVIDENCE_FIELDS}
+        ev["sig"] = str(data.get("sig") or "")
+        return ev
     except (ValueError, TypeError, AttributeError):
-        return {"n": 0, "good": 0, "miss": 0}
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": ""}
 
 
-def _record_triage_evidence(miss: bool, good: bool) -> None:
+def triage_evidence() -> dict:
+    """Накопленная статистика триажа: n/good/miss - сравнение с полной AI-оценкой; lab_good/lab_bad/lab_miss -
+    независимая разметка владельца. Хранится в kv (переживает рестарт). Статистика, набранная при другой модели,
+    промпте или порогах (отпечаток не совпал), не используется: возвращаются нули и stale=True."""
+    ev = _load_evidence()
+    current = _evidence_signature()
+    if ev["sig"] != current:
+        return {**{k: 0 for k in _EVIDENCE_FIELDS}, "sig": current, "stale": bool(ev["sig"] or any(
+            ev[k] for k in _EVIDENCE_FIELDS))}
+    return {**ev, "stale": False}
+
+
+def _save_evidence(ev: dict) -> None:
+    kv_set(TRIAGE_EVIDENCE_KEY, json.dumps({**{k: ev[k] for k in _EVIDENCE_FIELDS}, "sig": ev["sig"]}))
+
+
+def _record_triage_evidence(miss: bool, good: bool, order_id: int | None = None, triage: int | None = None) -> None:
     try:
         with _triage_evidence_lock:
-            ev = triage_evidence()
+            ev = triage_evidence()   # при смене настроек начинается с нуля
             ev["n"] += 1
             ev["good"] += 1 if good else 0
             ev["miss"] += 1 if miss else 0
-            kv_set(TRIAGE_EVIDENCE_KEY, json.dumps(ev))
+            _save_evidence(ev)
+            if order_id is not None and triage is not None:
+                scores = _load_scores()
+                scores[str(order_id)] = [int(triage), ev["sig"]]
+                while len(scores) > TRIAGE_SCORES_MAX:
+                    scores.pop(next(iter(scores)))
+                kv_set(TRIAGE_SCORES_KEY, json.dumps(scores))
     except Exception:
         logging.exception("[TRIAGE] не удалось записать выборку сравнения")
+
+
+def _load_scores() -> dict:
+    try:
+        data = json.loads(kv_get(TRIAGE_SCORES_KEY, "") or "{}")
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def record_triage_label(order_id: int, suitable: bool) -> str | None:
+    """Решение владельца по заказу (suitable: «Взял» - True, «Не подходит» - False) как независимая разметка.
+    Учитывается только если у заказа есть быстрая оценка, набранная при текущих настройках. Пропуск - подходящий
+    заказ с быстрой оценкой <= TRIAGE_REJECT_MAX. Повторная отметка того же заказа не удваивает счётчики.
+    Возвращает: 'good' / 'bad' / 'miss' либо None (оценки нет, устарела или уже учтён)."""
+    try:
+        with _triage_evidence_lock:
+            scores = _load_scores()
+            rec = scores.get(str(order_id))
+            if not rec or rec[1] != _evidence_signature() or (len(rec) > 2 and rec[2]):
+                return None
+            ev = triage_evidence()
+            if suitable:
+                ev["lab_good"] += 1
+                kind = "good"
+                if int(rec[0]) <= TRIAGE_REJECT_MAX:
+                    ev["lab_miss"] += 1
+                    kind = "miss"
+            else:
+                ev["lab_bad"] += 1
+                kind = "bad"
+            _save_evidence(ev)
+            scores[str(order_id)] = [rec[0], rec[1], 1]   # заказ размечен
+            kv_set(TRIAGE_SCORES_KEY, json.dumps(scores))
+            return kind
+    except Exception:
+        logging.exception("[TRIAGE] не удалось записать разметку")
+        return None
 
 
 def triage_allowed() -> tuple[bool, str]:
     """Можно ли включать отсекающий триаж: (да/нет, пояснение)."""
     ev = triage_evidence()
+    if ev["stale"]:
+        return False, "статистика набрана при другой модели, промпте или порогах: набор начат заново"
     if ev["n"] < TRIAGE_MIN_SAMPLE or ev["good"] < TRIAGE_MIN_GOOD:
         return False, (f"мало данных shadow: оценок {ev['n']} из {TRIAGE_MIN_SAMPLE}, "
                        f"подходящих {ev['good']} из {TRIAGE_MIN_GOOD}")
     if ev["miss"]:
         return False, f"shadow показал пропуски подходящих: {ev['miss']} из {ev['good']}"
-    return True, f"пропусков нет на {ev['n']} оценках ({ev['good']} подходящих)"
+    if ev["lab_miss"]:
+        return False, f"разметка владельца показала пропуски: {ev['lab_miss']} из {ev['lab_good']} подходящих"
+    if ev["lab_good"] < TRIAGE_MIN_LABELED:
+        return False, (f"нет независимой разметки: подходящих по решению владельца {ev['lab_good']} "
+                       f"из {TRIAGE_MIN_LABELED} (совпадение с полной оценкой полноту не доказывает)")
+    return True, (f"пропусков нет: {ev['n']} сравнений с полной оценкой, по разметке владельца "
+                  f"{ev['lab_good']} подходящих и {ev['lab_bad']} отклонённых")
 
 
 def effective_triage_mode() -> str:
@@ -979,7 +1061,7 @@ def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict) -> None:
     except (KeyError, TypeError, ValueError):
         return
     miss = triage <= TRIAGE_REJECT_MAX and full >= FREELANCE_MIN_FIT
-    _record_triage_evidence(miss, full >= FREELANCE_MIN_FIT)
+    _record_triage_evidence(miss, full >= FREELANCE_MIN_FIT, sc.order.order_id, triage)
     title = ai_scorer.mask_contacts(sc.order.title or "")[:60]
     logging.info(f"[TRIAGE] заказ {sc.order.order_id}: быстрая {triage}, полная {full}"
                  f"{' - ПРОПУСТИЛ БЫ ХОРОШИЙ' if miss else ''} {title!r}")

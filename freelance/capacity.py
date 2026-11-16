@@ -4,6 +4,7 @@
 провайдеров цепочки и хватает ли их на спрос. Чистая функция forecast() (без БД и сети) плюс чтение спроса
 из журнала. Допущения названы в результате: это оценка, а не измерение.
 """
+import math
 from datetime import date, datetime, timezone
 
 # Cloudflare Workers AI: нейроны общие на аккаунт, поэтому быстрый триаж (маленькая модель) и полная оценка
@@ -19,7 +20,13 @@ SHARED_PROVIDER = "cloudflare"
 CONFIRMED_FROM_BOTHOST = ("cloudflare", "openrouter")
 
 
-def forecast(status: dict, demand_per_day: float, shadow_per_day: int, today: date, yandex_until: date) -> dict:
+# Допущение, пока нет замера: доля вызовов, потраченных зря (ошибка провайдера, повтор неудачной оценки).
+# Замер - measure_overhead() по журналу (сумма неудачных попыток на один заказ); он подставляется вместо допущения.
+DEFAULT_OVERHEAD = 0.10
+
+
+def forecast(status: dict, demand_per_day: float, shadow_per_day: int, today: date, yandex_until: date,
+             overhead: float | None = None) -> dict:
     """Прогноз ёмкости. status - ai_scorer.status() (провайдеры, ключи, лимиты); demand_per_day - сколько
     заказов в сутки доходит до оценки; shadow_per_day - сколько быстрых оценок в сутки тратит shadow-триаж.
     Возвращает словарь с разбивкой по провайдерам и итогом без Yandex."""
@@ -37,7 +44,9 @@ def forecast(status: dict, demand_per_day: float, shadow_per_day: int, today: da
     if SHARED_PROVIDER in live and shadow_per_day > 0:
         triage_cost = shadow_per_day * TRIAGE_CALL_NEURONS / FULL_ORDER_NEURONS
     total = float(sum(live.values()))
-    net = max(0.0, total - triage_cost)
+    # чистая ёмкость: настройки провайдеров минус триаж и минус вызовы, потраченные на ошибки и повторы
+    overhead_value = DEFAULT_OVERHEAD if overhead is None else max(0.0, float(overhead))
+    net = max(0.0, (total - triage_cost) / (1.0 + overhead_value))
     yandex = providers.get("yandex") or {}
     yandex_on = bool(yandex.get("has_key") and yandex.get("enabled")) and today < yandex_until
     coverage = (net / demand_per_day) if demand_per_day > 0 else None
@@ -46,6 +55,8 @@ def forecast(status: dict, demand_per_day: float, shadow_per_day: int, today: da
         "unconfirmed": unconfirmed,
         "total_without_yandex": total,
         "triage_cost_orders": round(triage_cost, 1),
+        "overhead": round(overhead_value, 3),
+        "overhead_measured": overhead is not None,
         "net_without_yandex": round(net, 1),
         "demand_per_day": demand_per_day,
         "coverage": coverage,                       # доля спроса, которую можно оценить; >= 1 - хватает
@@ -54,8 +65,10 @@ def forecast(status: dict, demand_per_day: float, shadow_per_day: int, today: da
         "yandex_until": yandex_until.isoformat(),
         "days_to_yandex_off": (yandex_until - today).days,
         "assumptions": [
-            f"полная оценка ~{FULL_ORDER_NEURONS:.0f} нейронов (замер 11.10), быстрый триаж ~{TRIAGE_CALL_NEURONS:.0f} "
-            f"нейрона (оценка по тарифу, не замер)",
+            f"полная оценка ~{FULL_ORDER_NEURONS:.0f} нейронов (исторический замер 11.10), быстрый триаж "
+            f"~{TRIAGE_CALL_NEURONS:.0f} нейрона (оценка по тарифу, не замер)",
+            "доля вызовов на ошибки и повторы: " + (f"{overhead_value:.0%} (замер по журналу)" if overhead is not None
+                                                    else f"{overhead_value:.0%} (допущение, замера нет)"),
             "лимиты провайдеров - из настроек бота (per_day), фактическая бесплатная квота может быть ниже; "
             "в ёмкость входят только провайдеры, подтверждённые с IP BotHost",
             "Gemini недоступен из региона BotHost и в сумму не входит",
@@ -80,6 +93,105 @@ def demand_per_day(days: int = 7) -> float | None:
             (f"-{int(days)} days", f"-{int(days)} days")).fetchone()[0]
     span_days = max(1.0, (datetime.now(timezone.utc).replace(tzinfo=None) - datetime.strptime(first, "%Y-%m-%d %H:%M:%S")).total_seconds() / 86400)
     return n / min(span_days, float(days))
+
+
+def measure_overhead(days: int = 7) -> float | None:
+    """Замер по журналу: неудачных попыток оценки на один заказ, дошедший до оценки (attempts пишется при
+    ошибке провайдера). None - журнал пуст, остаётся допущение DEFAULT_OVERHEAD."""
+    import database
+    with database._connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(attempts), 0) FROM freelance_orders "
+            "WHERE seen_at >= datetime('now', ?) AND tech IN ('queued', 'assessed', 'stale')",
+            (f"-{int(days)} days",)).fetchone()
+    if not row or not row[0]:
+        return None
+    return row[1] / row[0]
+
+
+def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_share: dict,
+                   *, days: int = 14, warmup_days: int = 3, reserve: dict | None = None,
+                   aging_hours: float = 12.0, aging_boost: float = 1.0, queue_max_hours: float = 48.0,
+                   quota_reset_hour: int = 3, skip_share: dict | None = None) -> dict:
+    """Устойчивый спрос выше ёмкости: что успевает оцениваться, сколько ждёт и сколько истекает.
+
+    Почасовая модель правил очереди бота: группы приоритета 1-3 (mix - доли спроса), ранг = группа минус
+    бонус старения, внутри ранга новые первыми, резерв квоты (reserve: группа -> доля, ниже которой она не
+    оценивается), суточный сброс квоты в quota_reset_hour (МСК), истечение через queue_max_hours.
+    good_share - доля подходящих среди заказов группы (допущение или замер): по ней считаются потерянные
+    подходящие. skip_share - доля группы, снимаемая до полной оценки (например отсекающим триажем).
+    Первые warmup_days в итог не входят. Детерминированная, без случайных чисел."""
+    reserve = reserve if reserve is not None else {2: 0.2, 3: 0.5}
+    skip_share = skip_share or {}
+    groups = (1, 2, 3)
+    total_mix = sum(mix.get(g, 0.0) for g in groups) or 1.0
+    hours = days * 24
+    warm = warmup_days * 24
+    carry = {g: 0.0 for g in groups}
+    pending: list = []   # (час поступления, группа)
+    stat = {g: {"arrived": 0, "scored": 0, "expired": 0, "waits": []} for g in groups}
+    quota = net_per_day
+    for h in range(hours):
+        if h % 24 == quota_reset_hour:
+            quota = net_per_day
+        for g in groups:
+            carry[g] += demand_per_day * mix.get(g, 0.0) / total_mix / 24.0 * (1.0 - skip_share.get(g, 0.0))
+            n = int(carry[g])
+            carry[g] -= n
+            pending.extend((h, g) for _ in range(n))
+            if h >= warm:
+                stat[g]["arrived"] += n
+        keep = []
+        for item in pending:
+            if h - item[0] > queue_max_hours:
+                if item[0] >= warm:
+                    stat[item[1]]["expired"] += 1
+            else:
+                keep.append(item)
+
+        def rank(item, now=h):
+            return item[1] - min(aging_boost, (now - item[0]) / aging_hours)
+
+        keep.sort(key=lambda it: (rank(it), -it[0]))
+        rest = []
+        for item in keep:
+            eff = max(1, math.ceil(rank(item) - 1e-9))
+            share = reserve.get(eff)
+            blocked = share is not None and quota <= net_per_day * share
+            if quota >= 1.0 and not blocked:
+                quota -= 1.0
+                if item[0] >= warm:
+                    stat[item[1]]["scored"] += 1
+                    stat[item[1]]["waits"].append(h - item[0])
+            else:
+                rest.append(item)
+        pending = rest
+    out: dict = {"groups": {}, "days": days - warmup_days}
+    lost_good = arrived_good = 0.0
+    for g in groups:
+        st = stat[g]
+        waits = sorted(st["waits"])
+        left = sum(1 for it in pending if it[1] == g and it[0] >= warm)
+        gs = good_share.get(g, 0.0)
+        # потеря - только истёкшие без оценки; ещё ждущие (хвост на конец прогона) показаны отдельно
+        unscored = st["expired"]
+        lost_good += unscored * gs
+        arrived_good += st["arrived"] * gs
+        out["groups"][g] = {
+            "arrived": st["arrived"], "scored": st["scored"], "expired": st["expired"], "waiting": left,
+            "wait_median_h": waits[len(waits) // 2] if waits else None,
+            "wait_p90_h": waits[int(len(waits) * 0.9)] if waits else None,
+            "lost_good": round(unscored * gs, 1),
+        }
+    arrived = sum(v["arrived"] for v in out["groups"].values())
+    out["arrived"] = arrived
+    out["scored"] = sum(v["scored"] for v in out["groups"].values())
+    out["expired"] = sum(v["expired"] for v in out["groups"].values())
+    out["waiting_at_end"] = sum(v["waiting"] for v in out["groups"].values())
+    out["good_arrived"] = round(arrived_good, 1)
+    out["good_lost"] = round(lost_good, 1)
+    out["good_lost_share"] = round(lost_good / arrived_good, 3) if arrived_good else None
+    return out
 
 
 def format_forecast(f: dict) -> str:

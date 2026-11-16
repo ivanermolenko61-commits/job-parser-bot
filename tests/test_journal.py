@@ -300,9 +300,19 @@ class TriageGuardTest(CycleTestBase):
             self.assertEqual(pipeline.effective_triage_mode(), "shadow")
             self.assertIn("пропуски", pipeline.triage_allowed()[1])
 
-    def test_enough_clean_evidence_allows_on(self):
+    def test_agreement_with_full_ai_alone_does_not_allow_on(self):
+        # совпадение с полной AI-оценкой не доказывает полноту: нужна ещё разметка владельца
         for i in range(pipeline.TRIAGE_MIN_SAMPLE):
             pipeline._record_triage_evidence(miss=False, good=(i < 30))
+        with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+            self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+            self.assertIn("разметки", pipeline.triage_allowed()[1])
+
+    def test_enough_clean_evidence_with_owner_labels_allows_on(self):
+        for i in range(pipeline.TRIAGE_MIN_SAMPLE):
+            pipeline._record_triage_evidence(miss=False, good=(i < 30), order_id=9000 + i, triage=7)
+        for i in range(pipeline.TRIAGE_MIN_LABELED):
+            self.assertEqual(pipeline.record_triage_label(9000 + i, True), "good")
         with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
             self.assertEqual(pipeline.effective_triage_mode(), "on")
 
@@ -441,7 +451,7 @@ class CapacityTest(unittest.TestCase):
     def test_yandex_dead_and_unkeyed_providers_not_counted(self):
         from datetime import date
         from freelance import capacity
-        f = capacity.forecast(self.STATUS, 127, 0, date(2026, 11, 13), date(2026, 11, 20))
+        f = capacity.forecast(self.STATUS, 127, 0, date(2026, 11, 13), date(2026, 11, 20), overhead=0.0)
         self.assertEqual(f["providers"], {"cloudflare": 50, "openrouter": 45})
         self.assertEqual(f["total_without_yandex"], 95)
         self.assertEqual(f["unconfirmed"], {"github": 290})     # настроен, но с IP BotHost не отвечает

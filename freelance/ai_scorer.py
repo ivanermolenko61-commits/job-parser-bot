@@ -1750,6 +1750,15 @@ def _triage_prompt(order) -> str:
     )
 
 
+def triage_signature() -> str:
+    """Отпечаток всего, от чего зависит смысл накопленной статистики триажа: модель и промпт триажа, обрезка
+    текста, промпт и цепочка полной оценки (она служит эталоном при сравнении). Любое изменение -> новый
+    отпечаток -> прежняя статистика не может включить отсечение."""
+    import hashlib
+    raw = "\x1f".join((TRIAGE_MODEL, TRIAGE_PROMPT, str(TRIAGE_BODY_LIMIT), SYSTEM_PROMPT, ",".join(CHAIN)))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
 def triage_today() -> int:
     with _triage_lock:
         return _triage_count if _triage_day == _today() else 0

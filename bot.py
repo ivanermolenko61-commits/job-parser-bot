@@ -66,6 +66,7 @@ from freelance.pipeline import (
     format_order_plain,
     mark_sent_status,
     prepare_cycle,
+    record_triage_label,
     save_sent,
     scored_from_row,
 )
@@ -414,7 +415,10 @@ async def _send_order(sc):
 
 async def _set_order_status(order_id: int, status: str) -> None:
     """Статус заказа в БД; если записи ещё нет (сбой записи после отправки), статус
-    запоминается в памяти, и finish_cycle запишет его вместо «sent»."""
+    запоминается в памяти, и finish_cycle запишет его вместо «sent».
+    Решение владельца («Взял» / «Не подходит») заодно служит независимой разметкой для проверки триажа."""
+    if status in ("taken", "dismissed"):
+        await asyncio.to_thread(record_triage_label, order_id, status == "taken")
     if await asyncio.to_thread(freelance_set_status, order_id, status):
         return
     if await asyncio.to_thread(mark_sent_status, order_id, status):
@@ -682,7 +686,8 @@ def _freelance_status_text() -> str:
     ]
     try:   # ёмкость AI после отключения Yandex и состояние отсекающего триажа
         fc = capacity.forecast(ai_scorer.status(), capacity.demand_per_day(7) or 0.0,
-                               TRIAGE_SHADOW_MAX_PER_DAY, datetime.now(MSK).date(), yandex_budget.until())
+                               TRIAGE_SHADOW_MAX_PER_DAY, datetime.now(MSK).date(), yandex_budget.until(),
+                               overhead=capacity.measure_overhead(7))
         cover = f", покрытие {fc['coverage'] * 100:.0f}%" if fc["coverage"] is not None else ""
         lines.append(f"📉 Без Yandex ({fc['yandex_until']}): ≈{fc['net_without_yandex']:.0f} оценок/сутки "
                      f"при спросе ≈{fc['demand_per_day']:.0f}{cover}")
