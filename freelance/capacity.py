@@ -179,8 +179,11 @@ def simulate_queue(demand_per_day: float, net_per_day: float, mix: dict, good_sh
         # ВСЕХ подходящих заказов группы, потерянных триажем; замера нет). Остальные подходящие идут в очередь
         group_good = demand_per_day * mix.get(g, 0.0) / total_mix * window * gs
         lost_by_triage = group_good * triage_miss if skip_share.get(g, 0.0) > 0 else 0.0
-        q_share = gs if not lost_by_triage else ((group_good - lost_by_triage) / st["arrived"]
-                                                 if st["arrived"] else 0.0)
+        # при снятии части потока триажем (даже без ошибок) подходящие концентрируются в оставшейся очереди
+        if skip_share.get(g, 0.0) > 0:
+            q_share = (group_good - lost_by_triage) / st["arrived"] if st["arrived"] else 0.0
+        else:
+            q_share = gs
         triage_lost += lost_by_triage
         total_good += group_good
         # потеря - только истёкшие без оценки; ещё ждущие (хвост на конец прогона) показаны отдельно

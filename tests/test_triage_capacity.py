@@ -48,6 +48,14 @@ class SimulateQueueTest(unittest.TestCase):
         self.assertAlmostEqual(r["loss_total_share"], 0.05, delta=0.002)
         self.assertEqual(r["good_lost"], 0)
 
+    def test_perfect_triage_keeps_all_good_orders_in_queue(self):
+        # триаж без ошибок снимает только неподходящие: все подходящие остаются в очереди (доля выше исходной)
+        r = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4, 2: 0.25}, triage_miss=0.0)
+        self.assertEqual(r["triage_good_lost"], 0.0)
+        self.assertAlmostEqual(r["good_arrived"], r["good_total"], delta=3)
+        plain = capacity.simulate_queue(127, 86, MIX, GOOD, skip_share={3: 0.4, 2: 0.25}, triage_miss=0.05)
+        self.assertLess(plain["good_arrived"], r["good_arrived"])
+
     def test_no_triage_means_no_triage_losses(self):
         none = capacity.simulate_queue(127, 86, MIX, GOOD, triage_miss=0.5)
         self.assertEqual(none["triage_good_lost"], 0.0)
