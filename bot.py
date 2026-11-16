@@ -11,6 +11,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ForceReply,
     InlineKeyboardButton,
@@ -26,7 +27,7 @@ from dotenv import load_dotenv
 from config import (
     CHECK_INTERVAL_MINUTES,
     FREELANCE_INTERVAL_MINUTES,
-    FREELANCE_MAX_AGE_HOURS,
+    FREELANCE_QUEUE_MAX_HOURS,
     FREELANCE_MAX_PER_CYCLE,
     FREELANCE_MESSAGE_TTL_HOURS,
     FREELANCE_MIN_FIT,
@@ -39,6 +40,7 @@ from database import (
     freelance_get,
     freelance_recent,
     freelance_set_deal_price,
+    freelance_mark_card_deleted,
     freelance_set_status,
     freelance_day_summary,
     freelance_stats,
@@ -49,12 +51,16 @@ from database import (
     reset_db,
     stats,
 )
-from freelance import ai_scorer, deal_wait, pricing, sources
+from freelance import ai_scorer, capacity, deal_wait, pricing, report, sources, yandex_budget
 from freelance.alot_client import site_name
 from freelance.pipeline import (
     LAST_ID_KEY,
     MSK,
     PREPARE_TIMEOUT_SEC,
+    TRIAGE_MODE,
+    TRIAGE_SHADOW_MAX_PER_DAY,
+    effective_triage_mode,
+    triage_allowed,
     finish_cycle,
     format_order,
     format_order_plain,
@@ -371,8 +377,9 @@ def _order_kb(order_id: int, url: str | None, taken: bool = False,
 
 
 def _sort_key_for_cap(sc) -> tuple:
-    # Без AI считаем «средним» (5), чтобы не вытеснять оценённые
-    return (sc.fit if sc.fit is not None else 5, sc.order.order_id)
+    # Без AI считаем «средним» (5), чтобы не вытеснять оценённые. При равной оценке - свежее первым
+    # по времени публикации: order_id разных источников (alot.pro, FL.ru, Kwork) несравнимы
+    return (sc.fit if sc.fit is not None else 5, sc.order.published_at.timestamp())
 
 
 async def _send_order(sc):
@@ -417,9 +424,10 @@ async def _set_order_status(order_id: int, status: str) -> None:
 
 
 def _order_is_stale(sc) -> bool:
-    """Заказ старше FREELANCE_MAX_AGE_HOURS: пока его оценивали и ждали отправки,
-    он мог состариться. Такой в чат не уходит."""
-    limit = timedelta(hours=FREELANCE_MAX_AGE_HOURS)
+    """Заказ старше предела очереди (FREELANCE_QUEUE_MAX_HOURS): пока его оценивали и ждали
+    отправки, он мог состариться. Такой в чат не уходит, а получает состояние «устарел» с причиной.
+    Заказ старше FREELANCE_FRESH_HOURS уходит с пометкой возраста в карточке."""
+    limit = timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
     return datetime.now(timezone.utc) - sc.order.published_at > limit
 
 
@@ -442,7 +450,7 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     stale_ids = {sc.order.order_id for sc in stale}
     ranked = sorted((sc for sc in res.to_send if sc.order.order_id not in stale_ids),
                     key=_sort_key_for_cap, reverse=True)
-    chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=lambda sc: sc.order.order_id)
+    chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=lambda sc: sc.order.published_at)
     extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
     sent_ok = progress.setdefault("sent", [])
@@ -672,6 +680,17 @@ def _freelance_status_text() -> str:
         f"🤖 AI: {ai_state}",
         f"Порог fit: {FREELANCE_MIN_FIT}, интервал: {FREELANCE_INTERVAL_MINUTES} мин",
     ]
+    try:   # ёмкость AI после отключения Yandex и состояние отсекающего триажа
+        fc = capacity.forecast(ai_scorer.status(), capacity.demand_per_day(7) or 0.0,
+                               TRIAGE_SHADOW_MAX_PER_DAY, datetime.now(MSK).date(), yandex_budget.until())
+        cover = f", покрытие {fc['coverage'] * 100:.0f}%" if fc["coverage"] is not None else ""
+        lines.append(f"📉 Без Yandex ({fc['yandex_until']}): ≈{fc['net_without_yandex']:.0f} оценок/сутки "
+                     f"при спросе ≈{fc['demand_per_day']:.0f}{cover}")
+        ok, why = triage_allowed()
+        lines.append(f"Триаж: запрошен {TRIAGE_MODE}, применяется {effective_triage_mode()}"
+                     f"{'' if ok else ' (' + html.escape(why) + ')'}")
+    except Exception:
+        logging.exception("[FREELANCE] не удалось посчитать ёмкость для статуса")
     for name, title, on, forced in sources.states():
         if not on:
             lines.append(f"⚪ {title}: выключен" + (" (в настройках сервера)" if forced else ""))
@@ -684,6 +703,7 @@ def _freelance_status_text() -> str:
             lines.append(f"🟢 {title}: работает")
     if sources.is_enabled(sources.ALOT) and monitor.streak.get("alot_feed", 0) >= monitor.threshold:
         lines.append(f"🔴 Выдача alot.pro отстаёт: {html.escape(monitor.last_reason.get('alot_feed', ''))}")
+    lines.append("\n" + report.format_funnel(report.load_rows(1), report.load_excluded(1), 1))
     return "\n".join(lines)
 
 
@@ -947,7 +967,8 @@ async def cleanup_freelance_messages():
             except Exception:
                 logging.exception(f"[FREELANCE] не удалось удалить сообщение {row['message_id']}")
                 continue  # статус не меняем: повторим в следующий час
-            await asyncio.to_thread(freelance_set_status, row["order_id"], "expired")
+            # карточка удалена по сроку: лид и техническая обработка заказа не меняются
+            await asyncio.to_thread(freelance_mark_card_deleted, row["order_id"])
             await asyncio.sleep(0.1)
         if rows:
             logging.info(f"[FREELANCE] очистка: найдено {len(rows)}, удалено {deleted}")
@@ -995,12 +1016,16 @@ async def _send_freelance_daily_summary_locked():
         if await asyncio.to_thread(kv_get, SUMMARY_DAY_KEY) == today:
             return  # за сегодня уже отправляли
         d = await asyncio.to_thread(freelance_day_summary)
+        passed = d["total"] - d["filtered"]
         text = (
             "📋 <b>Фриланс за сутки</b>\n"
-            f"Прошло префильтр: {d['total']}\n"
-            f"Отправлено вам: {d['sent']}\n"
-            f"Отсеяно AI: {d['rejected_ai']}, дубли и прочее: {d['rejected_other']}\n"
-            f"Ждут оценки: {d['pending']}"
+            f"Увидено заказов: {d['total'] + d['excluded']} (вакансионные доски: {d['excluded']}, "
+            f"отсеяно правилами: {d['filtered']}, дубли: {d['duplicate']})\n"
+            f"Прошли фильтр и дедуп: {passed - d['duplicate']}\n"
+            f"Оценено: {d['assessed']} (подходят {d['good']}, отклонены AI {d['low_fit']})\n"
+            f"Показано вам: карточек {d['card']}, в сводке «ещё N» {d['digest']}, "
+            f"ждут доставки {d['delivery_pending']}\n"
+            f"Ждут оценки AI: {d['queued']}, устарели: {d['stale']}"
         )
         usage = _ai_usage_line(await asyncio.to_thread(ai_scorer.status))
         if usage:
@@ -1166,6 +1191,40 @@ async def cmd_start(message: Message):
     )
 
     asyncio.create_task(check_vacancies())
+
+
+@dp.message(Command("funnel"))
+async def cmd_funnel(message: Message):
+    """Воронка и задержки по источникам за N дней (по умолчанию 1): /funnel 7."""
+    parts = (message.text or "").split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    days = max(1, min(days, 30))
+    try:
+        rows = await asyncio.to_thread(report.load_rows, days)
+        excluded = await asyncio.to_thread(report.load_excluded, days)
+        for chunk in _split_messages(report.format_funnel(rows, excluded, days)):
+            await message.answer(chunk, parse_mode="HTML")
+    except Exception:
+        logging.exception("[FREELANCE] funnel")
+        await message.answer("⚠️ Не удалось собрать воронку, подробности в логе.")
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    """CSV журнала увиденных заказов за N дней (по умолчанию 7): /export 14. Названия обезличены,
+    описаний нет. Нужен, чтобы по каждому заказу проверить, куда он делся."""
+    parts = (message.text or "").split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+    days = max(1, min(days, 30))
+    try:
+        rows = await asyncio.to_thread(report.load_rows, days)
+        data = report.export_csv(rows).encode("utf-8-sig")   # BOM: Excel открывает кириллицу без танцев
+        name = f"freelance_journal_{datetime.now(MSK):%Y%m%d}_{days}d.csv"
+        await message.answer_document(BufferedInputFile(data, filename=name),
+                                      caption=f"Журнал за {days} дн.: {len(rows)} заказов")
+    except Exception:
+        logging.exception("[FREELANCE] export")
+        await message.answer("⚠️ Не удалось выгрузить журнал, подробности в логе.")
 
 
 @dp.message(Command("stop"))
