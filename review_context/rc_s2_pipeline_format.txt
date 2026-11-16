@@ -1,0 +1,314 @@
+Дословные выдержки (без изменений) для проверки: карточка заказа (ScoredOrder, format_order и помощники) для tests/test_pricing.py
+Файл: freelance/pipeline.py; коммит: e83d659; blob: 74b473a7e533bb3442c7a62fbfb04e8a4c9aac4f
+--- freelance/pipeline.py, строки 222-241, sha256 38ad3b877763
+class ScoredOrder:
+    order: FreelanceOrder
+    ai: dict | None          # None = «без AI»
+    dedup: str = ""
+    attempts: int = 0        # неудачных AI-оценок (и сбоев отправки) подряд
+    queue_reason: str | None = None   # почему не оценён (journal.Q_*)
+    first_seen: datetime | None = None   # когда бот впервые увидел заказ (очередь и старение)
+    stale_note: str = ""     # пометка карточки: оценка относится к прежнему тексту / обновлена после правки
+
+    @property
+    def fit(self) -> int | None:
+        if not self.ai:
+            return None
+        try:
+            return int(self.ai["fit"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+@dataclass
+
+--- freelance/pipeline.py, строки 1720-2008, sha256 ef28b32fc594
+def _num(value) -> float:
+    try:
+        f = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def _fmt_hours(value) -> str:
+    h = round(_num(value), 1)
+    if h <= 0 or h > 9999:
+        return ""
+    return f"{h:.1f}".rstrip("0").rstrip(".")
+
+
+def _money(value) -> str:
+    return f"{int(_num(value)):,}".replace(",", " ")
+
+
+def _thousands(value: float) -> str:
+    k = value / 1000
+    return f"{k:.1f}".rstrip("0").rstrip(".")
+
+
+def _price_basis_line(ai: dict) -> str:
+    """Откуда цена: формула · рынок категории · бюджет."""
+    parts = []
+    basis = str(ai.get("price_basis") or "").strip()
+    if basis:
+        parts.append(basis[:100])
+    m_low, m_high = _num(ai.get("market_low")), _num(ai.get("market_high"))
+    name = pricing.CATEGORY_NAMES.get(str(ai.get("category") or ""), "заказов")
+    if m_low > 0 and m_high > 0:
+        market = f"рынок {name}: {_thousands(m_low)}–{_thousands(m_high)} тыс."
+        verdict = str(ai.get("market_verdict") or "").strip()
+        parts.append(f"{market} — цена {verdict[:40]}" if verdict else market)
+    elif ai.get("market_n") is not None:
+        parts.append(f"рынок {name}: мало данных ({int(_num(ai.get('market_n')))} из {pricing.MIN_POINTS})")
+    if ai.get("budget_status"):
+        line = _budget_line(ai)
+        if line:
+            parts.append(line)
+        return " · ".join(parts)
+    budget = _num(ai.get("budget"))     # записи прежней формулы (до версии цены 4): бюджет подгонял цену
+    if budget > 0:
+        b_rate = _num(ai.get("budget_rate"))
+        b_text = f"бюджет {_money(budget)} ₽" + (f" ≈ {_money(b_rate)} ₽/ч" if b_rate > 0 else "")
+        own = _num(ai.get("price_own"))
+        if ai.get("budget_low"):
+            b_text += ", занижен"
+        elif not ai.get("budget_capped"):
+            b_text += ", ок"
+        if ai.get("budget_capped") and own > 0:
+            b_text += f" · упёрлось в бюджет +10% (по расчёту {_money(own)} ₽)"
+        elif ai.get("budget_raised") and own > 0:
+            b_text += f" · поднято к бюджету (по расчёту {_money(own)} ₽)"
+        parts.append(b_text)
+    return " · ".join(parts)
+
+
+BUDGET_SHORT = {
+    "ok": "покрывает полный объём",
+    "below_full": "ниже расчёта: предложить меньший объём или этапы",
+    "below_min": "ниже минимума: предложить диагностику или меньший объём, цену не снижать",
+    "open_low": "«от N» ниже расчёта: уточнить верхнюю границу",
+    "none": "не указан (это не плохой профиль)",
+    "uncertain_currency": "валюта неизвестна, сравнить нельзя",
+    "uncertain_fx": "нет надёжного курса, сравнение не сделано",
+    "suspicious": "значение испорчено, не учтено",
+}
+
+
+def _budget_line(ai: dict) -> str:
+    """Бюджет клиента отдельно от цены: статус сравнения, валюта, курс (источник и дата) для иностранной валюты."""
+    status = str(ai.get("budget_status") or "")
+    if status == "hourly":
+        text = str(ai.get("budget_note") or "почасовая ставка")
+    else:
+        text = BUDGET_SHORT.get(status, "")
+    if not text:
+        return ""
+    line = f"бюджет клиента: {text}"
+    fx_info = ai.get("budget_fx")
+    if isinstance(fx_info, dict) and _num(ai.get("budget_rub")) > 0:
+        line += (f" ({ai.get('budget_currency') or ''} ≈ {_money(ai.get('budget_rub'))} ₽ по курсу "
+                 f"{_num(fx_info.get('rate')):g}, {str(fx_info.get('source') or '')[:30]}, "
+                 f"{str(fx_info.get('date') or '')[:10]})")
+    return line
+
+
+def _dimensions_lines(ai: dict) -> list[str]:
+    """Раздельные оценки подробной карточки: профиль, выполнимость, ясность и достаточность данных, срочность, часы."""
+    lines = []
+    reason = str(ai.get("profile_reason") or "").strip()
+    if reason:
+        lines.append(f"🎯 Профиль: {html.escape(reason[:200])}")
+    parts = []
+    for label, key in (("выполнимость", "feasibility"), ("ясность ТЗ", "clarity"), ("данных", "sufficiency")):
+        value = str(ai.get(key) or "")
+        if value:
+            parts.append(f"{label}: {html.escape(value[:20])}")
+    confidence = str(ai.get("confidence") or "")
+    if confidence:
+        parts.append(f"уверенность: {html.escape(confidence[:20])}")
+    urgency = str(ai.get("urgency") or "")
+    if urgency and urgency != "не указана":
+        parts.append(f"срок: {html.escape(urgency[:20])}")
+    if parts:
+        lines.append("🧭 " + " · ".join(parts))
+    low, high = _fmt_hours(ai.get("hours_low")), _fmt_hours(ai.get("hours_high"))
+    if low and high:
+        lines.append(f"⏱ Работа: {low}" + (f"–{high}" if high != low else "") + " ч (часы работы, не календарный срок)")
+    experience = ai.get("experience")
+    if isinstance(experience, list):
+        titles = [str(x.get("title") or "")[:90] for x in experience if isinstance(x, dict) and x.get("title")]
+        lines.append("📚 Подтверждённый опыт: " + html.escape("; ".join(titles))
+                     if titles else "📚 Подтверждённого опыта по теме нет")
+    return lines
+
+
+def _components_line(ai: dict) -> str:
+    comps = ai.get("components")
+    if not isinstance(comps, list):
+        return ""
+    items = []
+    for c in comps[:8]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()[:50]
+        hours = _fmt_hours(c.get("hours"))
+        if name and hours:
+            items.append(f"{name} {hours} ч")
+    return " · ".join(items)
+
+
+def _price_note(ai: dict) -> str:
+    """Одна пометка после цены; приоритет: бюджет занижен -> упёрлось в бюджет ->
+    поднято к бюджету -> вердикт рынка (если не «в рынке»)."""
+    status = ai.get("budget_status")
+    if status in ("below_min", "below_full"):
+        return "бюджет ниже минимума" if status == "below_min" else "бюджет ниже расчёта"
+    if status in ("uncertain_currency", "uncertain_fx", "suspicious"):
+        return "бюджет не сопоставлен"
+    if ai.get("budget_low"):
+        return "бюджет занижен"
+    if ai.get("budget_capped"):
+        return "упёрлось в бюджет"
+    if ai.get("budget_raised"):
+        return "бюджет выше расчёта"
+    verdict = str(ai.get("market_verdict") or "").strip()
+    if verdict and verdict != "в рынке":
+        return verdict[:40]
+    return ""
+
+
+def _hours_text(hours: float) -> str:
+    if hours < 1:
+        return f"{max(1, round(hours * 60))} мин"
+    if hours < 48:
+        return f"{hours:.0f} ч" if hours >= 10 else f"{hours:.1f}".rstrip("0").rstrip(".") + " ч"
+    return f"{hours / 24:.0f} дн"
+
+
+def _age_line(sc: ScoredOrder, now: datetime | None = None) -> str:
+    """Предупреждение о возрасте: устаревший заказ не выдаём за свежий, актуальность проверяют перед откликом."""
+    o = sc.order
+    if jr.pub_unreliable(o.site, sources.source_of(o.order_id)):
+        return "🕰 дата публикации неизвестна - проверьте, что заказ ещё открыт"
+    age = ((now or datetime.now(timezone.utc)) - o.published_at).total_seconds() / 3600
+    if age > FREELANCE_FRESH_HOURS:
+        return f"🕰 опубликован {_hours_text(age)} назад - не свежий, проверьте, что заказ ещё открыт"
+    return ""
+
+
+def _lag_line(sc: ScoredOrder) -> str:
+    """Через сколько после публикации бот впервые увидел заказ (задержка источника, не очередь AI)."""
+    if sc.first_seen is None or jr.pub_unreliable(sc.order.site, sources.source_of(sc.order.order_id)):
+        return ""
+    lag = (sc.first_seen - sc.order.published_at).total_seconds() / 3600
+    return f"⏱ обнаружен через {_hours_text(max(0.0, lag))} после публикации" if lag * 60 >= 10 else ""
+
+
+def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False) -> str:
+    """HTML-сообщение о заказе. По умолчанию короткая карточка; detailed=True добавляет
+    вилку цены, расчёт, риск, компоненты и сложность (кнопка «Подробнее»).
+    Итог не длиннее MAX_MESSAGE_LEN: подробный упрощается до короткого, короткий - до plain."""
+    o, ai = sc.order, sc.ai
+    e = html.escape
+    fit = sc.fit
+    fire = "🔥 " if fit is not None and fit >= 9 else ""
+    t = o.published_at.astimezone(MSK).strftime("%H:%M")
+    money = f"💰 {e((o.price_text or 'не указана')[:100])} · 🕒 {t}"
+    lines = [f"{fire}💼 <b>{e((o.title or '')[:200])}</b>   [{e(site_name(o.site))}]"]
+    age = _age_line(sc)
+    if age:
+        lines.append(age)
+    if sc.stale_note:
+        lines.append(f"⚠️ {e(sc.stale_note)}")
+    if detailed:
+        lag = _lag_line(sc)
+        if lag:
+            lines.append(lag)
+    if ai and fit is not None:
+        parts = [f"🤖 {fit}/10"]
+        hours = _fmt_hours(ai.get("hours"))
+        if hours:
+            parts.append(f"~{hours} ч")
+        price_mid = _num(ai.get("price_mid"))
+        if price_mid <= 0:
+            # старая запись без расчёта цены: прежний вывод
+            price_rub = str(ai.get("price_rub") or "").strip()
+            if price_rub:
+                parts.append(f"предложить {e(price_rub[:100])}")
+        lines.append(" · ".join([money] + parts))
+        if price_mid > 0:
+            if ai.get("price_vague") and _num(ai.get("price_low")) > 0 and _num(ai.get("price_high")) > 0:
+                # размытое ТЗ: ориентир с вилкой и условиями, а не точная цена
+                line = (f"💵 Ориентир: {_money(ai.get('price_low'))}–{_money(ai.get('price_high'))} ₽ "
+                        f"(зависит от уточнений)")
+            else:
+                line = f"💵 Предложить: {_money(price_mid)} ₽"
+            note = _price_note(ai)
+            if note:
+                line += f" · {e(note)}"
+            lines.append(line)
+        summary = str(ai.get("summary") or "")
+        if detailed:
+            if price_mid > 0:
+                low, high = _num(ai.get("price_low")), _num(ai.get("price_high"))
+                if low > 0 and high > 0 and (low != price_mid or high != price_mid):
+                    lines.append(f"   вилка: {_money(low)}–{_money(high)} ₽")
+                basis = _price_basis_line(ai)
+                if basis:
+                    lines.append(f"   {e(basis)}")
+            minimum = _num(ai.get("price_min"))
+            if minimum > 0 and ai.get("price_v") == pricing.PRICE_VERSION:
+                lines.append(f"   минимально приемлемая цена: {_money(minimum)} ₽")
+            conditions = ai.get("price_conditions")
+            if ai.get("price_vague") and isinstance(conditions, list) and conditions:
+                lines.append("   условия оценки: " + e("; ".join(str(c)[:80] for c in conditions[:5])))
+            lines.extend(_dimensions_lines(ai))
+            difficulty = str(ai.get("difficulty") or "")
+            if difficulty:
+                lines.append(f"⚙️ Сложность: {e(difficulty[:20])}")
+        if not compact:
+            if summary:
+                lines.append(f"📝 {e(summary[:300])}")
+            if detailed:
+                risks = str(ai.get("risks") or "")
+                if risks:
+                    lines.append(f"⚠️ Риск: {e(risks[:300])}")
+                comps = _components_line(ai)
+                if comps:
+                    lines.append(f"🧩 {e(comps)}")
+            questions = ai.get("questions")
+            if isinstance(questions, list):
+                asked = [str(q).strip()[:200] for q in questions if str(q).strip()]
+                if asked:
+                    shown = asked[:3] if detailed else asked[:1]
+                    lines.append("❓ Уточнить: " + e(" · ".join(shown)))
+    else:
+        lines.append(money)
+        lines.append("🤖 без AI")
+        if not compact:
+            body = " ".join((o.body or "").split())
+            if body:
+                lines.append(f"📝 {e(body[:300])}{'…' if len(body) > 300 else ''}")
+    text = "\n".join(lines)
+    if len(text) > MAX_MESSAGE_LEN:
+        if detailed:
+            return format_order(sc, compact=compact)
+        if not compact:
+            return format_order(sc, compact=True)
+        return format_order_plain(sc)  # HTML резать нельзя: сломаются теги
+    return text
+
+
+def format_order_plain(sc: ScoredOrder) -> str:
+    """Запасной формат без HTML: название, цена, ссылка (и оценка, если есть)."""
+    o = sc.order
+    t = o.published_at.astimezone(MSK).strftime("%H:%M")
+    lines = [
+        f"💼 {(o.title or '')[:200]}   [{site_name(o.site)}]",
+        f"💰 {(o.price_text or 'не указана')[:100]} · 🕒 {t}",
+    ]
+    fit = sc.fit
+    lines.append(f"🤖 {fit}/10" if fit is not None else "🤖 без AI")
+    lines.append(f"🔗 {o.url}")
+    return "\n".join(lines)[:MAX_MESSAGE_LEN]

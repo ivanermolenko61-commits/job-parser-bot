@@ -1,0 +1,50 @@
+Дословные выдержки (без изменений) для проверки: помощники тестов (CycleTestBase, ai_result, LONG_BODY) для tests/test_dbx.py и tests/test_reassess.py
+Файл: tests/test_pipeline_cycle.py; коммит: e83d659; blob: aba470408273f8d5ffa3f21c3dd71fb0e5ab2e1c
+--- tests/test_pipeline_cycle.py, строки 18-51, sha256 c22738dbfe24
+def make_order(oid, title="Создать телеграм бота"):
+    return alot_client.FreelanceOrder(oid, "youdoru", title, "нужен бот", "5000 ₽", 5000.0, [],
+                                      datetime.now(timezone.utc), f"https://x/{oid}")
+
+
+def ai_result(fit):
+    return {"fit": fit, "difficulty": "легко", "hours": 4.0, "category": "tg_bot",
+            "components": [{"name": "бот", "hours": 4}], "unknowns": [], "clarity": "ясно",
+            "client_budget_ok": True, "summary": "s", "risks": "", "questions": [],
+            "model": "test:m"}
+
+
+class CycleTestBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_path = database.DB_PATH
+        database.DB_PATH = os.path.join(self.tmp.name, "t.db")
+        database.init_db()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, database, "DB_PATH", self.old_path)
+        for p in (mock.patch.object(pipeline.monitor, "record"),
+                  mock.patch.object(pipeline, "_report_ai_health"),
+                  mock.patch.object(pipeline, "_fetch_feed_orders", return_value=[]),  # FL.ru и Kwork без сети
+                  mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True),
+                  mock.patch.object(pipeline.ai_scorer, "daily_capacity", return_value=None),
+                  mock.patch.object(pipeline.ai_scorer, "quota_exhausted", return_value=None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def scan(self, orders):
+        return alot_client.ScanResult(orders=orders, max_id=max([o.order_id for o in orders] or [0]),
+                                      raw_count=len(orders))
+
+
+
+Файл: tests/test_journal.py; коммит: e83d659; blob: 578cff311c861e75aeba8b2446495bdff94012ab
+--- tests/test_journal.py, строки 17-26, sha256 644bb20863f4
+LONG_BODY = ("Нужно настроить выгрузку заказов из Wildberries в Google Таблицу каждый час, "
+             "с расчётом остатков и отчётом по продажам для менеджера. Доступ к кабинету дам.")
+
+
+def order(oid, title="Выгрузка заказов из Wildberries в Google Таблицу", body=LONG_BODY, site="flru",
+          age_h=0.2, price=3000.0, cats=()):
+    return FreelanceOrder(oid, site, title, body, f"{int(price)} ₽" if price else "по договорённости", price,
+                          list(cats), datetime.now(timezone.utc) - timedelta(hours=age_h), f"https://x/{oid}")
+
+
