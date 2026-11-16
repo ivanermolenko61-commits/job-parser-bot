@@ -9,6 +9,7 @@
 import csv
 import html
 import io
+import sqlite3
 import statistics
 from datetime import datetime, timezone
 
@@ -26,7 +27,7 @@ _COLUMNS = (
 
 def use_copy_of(path: str) -> str:
     """Инструменты отчётов НЕ меняют боевую БД: работают с копией во временной папке (рядом лежащие
-    -wal/-shm копируются тоже), на копии идемпотентно мигрирует схема. Возвращает путь копии и ставит
+    снимок через backup API SQLite), на копии идемпотентно мигрирует схема. Возвращает путь копии и ставит
     её как database.DB_PATH. Временная папка удаляется при выходе из процесса."""
     import atexit
     import os
@@ -35,10 +36,14 @@ def use_copy_of(path: str) -> str:
     tmp = tempfile.mkdtemp(prefix="freelance_report_")
     atexit.register(shutil.rmtree, tmp, True)
     dst = os.path.join(tmp, "copy.db")
-    shutil.copy2(path, dst)
-    for suffix in ("-wal", "-shm"):
-        if os.path.exists(path + suffix):
-            shutil.copy2(path + suffix, dst + suffix)
+    # согласованный снимок средствами SQLite (backup API учитывает WAL, пока бот пишет), а не копирование файлов
+    src_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    dst_conn = sqlite3.connect(dst)
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
     database.DB_PATH = dst
     database.init_db()
     return dst
