@@ -46,7 +46,7 @@ database.init_db()
 rows = [
     (1, "flru", "Выгрузка из WB в таблицу", "pending", 7), (2, "flru", "Бот для заявок", "sent", 8),
     (3, "kwork", "Парсер цен", "taken", 9), (4, "alot", "Скрипт отчёта", "dismissed", 6),
-    (5, "flru", "Автоматизация отчётов", "expired", 7), (6, "kwork", "Сайт-визитка", "rejected", 2),
+    (8, "flru", "Отказ без оценки", "rejected", None), (5, "flru", "Автоматизация отчётов", "expired", 7), (6, "kwork", "Сайт-визитка", "rejected", 2),
     (7, "alot", "Интеграция API с таблицей", "sent", 8),
 ]
 for oid, site, title, status, fit in rows:
@@ -93,11 +93,13 @@ import database
 database.init_db()
 database.freelance_stats(); database.freelance_recent(5); database.freelance_pending(10)
 database.freelance_day_summary(24); database.freelance_deals("PROG_OTHER"); database.freelance_deal_rows()
-database.freelance_save(901, "flru", "Запись прежнего кода после отката", "https://x/901", "1000 ₽",
+pid = int(os.environ["PROBE_BASE"]) + 9
+database.freelance_save(pid, "flru", "Запись прежнего кода после отката", f"https://x/{pid}", "1000 ₽",
                         "2026-11-02T10:00:00", "flru|rollback", 7, "{}", "pending", 0, None)
-database.freelance_set_status(901, "taken")
-database.freelance_set_status(1, "sent")
-print(json.dumps(database.freelance_get(901)["status"]))
+database.freelance_set_status(pid, "taken")
+if os.environ.get("PROBE_OLD_ID"):
+    database.freelance_set_status(int(os.environ["PROBE_OLD_ID"]), "sent")
+print(json.dumps(database.freelance_get(pid)["status"]))
 '''
 
 NEW_ROWS = r'''
@@ -105,15 +107,16 @@ import os, sys
 sys.path.insert(0, os.getcwd())
 import database
 database.init_db()
+base = int(os.environ["PROBE_BASE"])   # свободные order_id: не пересекаются с прежними заказами копии
 def save(oid, status, **kw):
     database.freelance_save(oid, "flru", f"Новый заказ {oid}", f"https://x/{oid}", "3000 ₽", "2026-11-10T10:00:00",
                             f"flru|n{oid}", None, "", status, 0, None, **kw)
-save(701, "rejected", tech="filtered", reject_reason="no_profile_signal")
-save(702, "rejected", tech="duplicate", dup_of=1)
-save(703, "pending", tech="queued", queue_reason="no_quota")
-save(704, "expired", tech="stale", stale_reason="queue_expired")
-save(705, "sent", tech="assessed", verdict="ok", delivery="card")
-database.freelance_set_lead(705, "applied")
+save(base + 1, "rejected", tech="filtered", reject_reason="no_profile_signal")
+save(base + 2, "rejected", tech="duplicate", dup_of=base + 1)
+save(base + 3, "pending", tech="queued", queue_reason="no_quota")
+save(base + 4, "expired", tech="stale", stale_reason="queue_expired")
+save(base + 5, "sent", tech="assessed", verdict="ok", delivery="card")
+database.freelance_set_lead(base + 5, "applied")
 print("ok")
 '''
 
@@ -269,23 +272,26 @@ def main(argv=None) -> int:
         try:
             empty = conn.execute("SELECT COUNT(*) FROM freelance_orders WHERE tech IS NULL OR tech = ''").fetchone()[0]
             invented = conn.execute("SELECT COUNT(*) FROM freelance_orders WHERE tech = 'legacy' "
-                                    "AND COALESCE(reject_reason, '') != ''").fetchone()[0]
+                                    "AND COALESCE(reject_reason, '') NOT IN ('', 'legacy_unknown')").fetchone()[0]
         finally:
             conn.close()
         check(empty == 0, "у каждого заказа есть состояние журнала tech")
-        check(invented == 0, "у старых записей причины отсева не выдуманы")
+        check(invented == 0, "у старых записей причины отсева не выдуманы (допустим только маркер legacy_unknown)")
 
         print("4. Откат: прежний код на мигрированной БД:")
         rolled = os.path.join(tmp, "rolled.db")
         shutil.copy2(migrated, rolled)
-        run_code(ROOT, NEW_ROWS, rolled)   # в БД есть и записи, созданные только новым кодом (отсев, дубль, лид...)
+        legacy_ids = sorted(int(k) for k in legacy_rows)
+        probe = {"PROBE_BASE": str(max(legacy_ids + [0]) + 1000),   # проверочные order_id вне прежних
+                 "PROBE_OLD_ID": str(legacy_ids[0]) if legacy_ids else ""}
+        run_code(ROOT, NEW_ROWS, rolled, probe)   # в БД есть и записи, созданные только новым кодом (отсев, дубль, лид...)
         try:
-            extra = {"ORDER_COLS": json.dumps(list(OLD_ORDER_COLS)), "ORDER_IDS": json.dumps([int(k) for k in legacy_rows])}
+            extra = {"ORDER_COLS": json.dumps(list(OLD_ORDER_COLS)), "ORDER_IDS": json.dumps(legacy_ids), **probe}
             read_back = json.loads(run_code(old_tree, OLD_READ, rolled, extra) or "{}")
             bad = diff_rows(legacy_rows, read_back)
             check(not bad, "прежний код читает прежние строки мигрированной БД без искажений (все старые поля, "
                            "включая seen_at и sent_at)" + (": " + "; ".join(bad[:3]) if bad else ""))
-            out = run_code(old_tree, OLD_PROBE, rolled)
+            out = run_code(old_tree, OLD_PROBE, rolled, probe)
             check(out == '"taken"', "прежний код открыл мигрированную БД, прочитал, записал и закрыл заказ")
         except (RuntimeError, ValueError) as e:
             check(False, f"прежний код не работает на мигрированной БД: {e}")
@@ -294,7 +300,8 @@ def main(argv=None) -> int:
                 run_code(ROOT, NEW_INIT, rolled)
                 conn = sqlite3.connect(rolled)
                 try:
-                    row = conn.execute("SELECT tech FROM freelance_orders WHERE order_id = 901").fetchone()
+                    row = conn.execute("SELECT tech FROM freelance_orders WHERE order_id = ?",
+                                       (int(probe["PROBE_BASE"]) + 9,)).fetchone()
                 finally:
                     conn.close()
                 check(row is not None and row[0], "после отката и нового запуска запись прежнего кода получила состояние журнала")
@@ -323,7 +330,7 @@ def main(argv=None) -> int:
         shutil.copy2(backup, restored)
         try:
             run_code(ROOT, NEW_INIT, restored)
-            run_code(old_tree, OLD_PROBE, restored)
+            run_code(old_tree, OLD_PROBE, restored, probe)
             check(True, "восстановленная копия открывается новым и прежним кодом")
         except RuntimeError as e:
             check(False, f"восстановленная копия не открылась: {e}")

@@ -1,48 +1,10 @@
-##### ВЫДЕРЖКА (дословно, без правок) | файл: freelance/pipeline.py | коммит: 2c19296 | blob: 6857e422df1c26d3f2b16adfb9d7216e8c6478cb | строки 459-572 | sha256 фрагмента: 12df704438d78cfb075de919147ea132379266612a28a3bb6762d3faab3219ca
+##### ВЫДЕРЖКА (дословно, без правок) | файл: freelance/pipeline.py | коммит: 2c19296 | blob: 6857e422df1c26d3f2b16adfb9d7216e8c6478cb | строки 459-461 | sha256 фрагмента: 4d495e51a8516cd81f8012bd6e31641be347195219cce520592091fd77cb0921
 def _full_snippet(o: FreelanceOrder) -> str:
     """Обезличенный текст заказа для повторной оценки: ровно то, что видит AI."""
     return ai_scorer.mask_contacts(o.body or "")[:ai_scorer.BODY_LIMIT]
+##### КОНЕЦ ВЫДЕРЖКИ freelance/pipeline.py:459-461
 
-
-def _journal_new(o: FreelanceOrder, tech: str, *, full: bool, **states) -> None:
-    """Первая запись об увиденном заказе. Название маскируется всегда (телефон, почта, токен -> метка):
-    карточка из БД показывает обезличенное название, контакты заказчика в журнал не попадают."""
-    origin = sources.source_of(o.order_id)
-    snippet = _full_snippet(o)
-    if not full:
-        snippet = snippet[:jr.SNIPPET_FILTERED]
-    title = ai_scorer.mask_contacts(o.title or "")   # контакты заказчика в БД не попадают ни в каком виде
-    freelance_save(
-        o.order_id, o.site, title, o.url, ai_scorer.mask_contacts(o.price_text or ""),
-        o.published_at.isoformat(), norm_dedup_key(o), None, "", "pending", 0, None,
-        budget=o.price_value if o.price_value and o.price_value > 0 else None,
-        origin=origin, title_key=jr.title_key(o.site, o.title),
-        content_hash=jr.content_hash(o.title, o.body), snippet=snippet,
-        pub_unreliable=jr.pub_unreliable(o.site, origin), tech=tech, **states,
-    )
-
-
-def _find_duplicate(o: FreelanceOrder) -> int | None:
-    """Оригинал, из-за которого заказ не надо оценивать заново. У alot.pro нет ни ссылки, ни id исходной
-    биржи, поэтому «биржа + id» работает только внутри одного источника (order_id уже в БД). Между
-    источниками (alot и прямой FL.ru/Kwork) совпадают биржа и название, а текст сравнивается как
-    вспомогательный признак (journal.same_listing); по одному названию заказы не склеиваются."""
-    origin = sources.source_of(o.order_id)
-    cands = freelance_dup_candidates(jr.title_key(o.site, o.title), DEDUP_DAYS, o.order_id)
-    if not cands:
-        return None
-    new = {"body": jr.norm_text(_full_snippet(o)), "origin": origin, "price": o.price_value or 0,
-           "published_ts": o.published_at.timestamp(), "reliable": not jr.pub_unreliable(o.site, origin)}
-    for c in cands:
-        published = _parse_dt(c.get("published_at"))
-        other = {"body": jr.norm_text(c.get("snippet") or ""), "origin": c.get("origin"),
-                 "price": c.get("price") or 0, "published_ts": published.timestamp() if published else 0,
-                 "reliable": not c.get("unreliable") and published is not None}
-        if jr.same_listing(new, other):
-            return int(c["order_id"])
-    return None
-
-
+##### ВЫДЕРЖКА (дословно, без правок) | файл: freelance/pipeline.py | коммит: 2c19296 | blob: 6857e422df1c26d3f2b16adfb9d7216e8c6478cb | строки 503-517 | sha256 фрагмента: 171070d6bdf8198ce9692fb195550152599a8efafc1e94f2d83841230623fece
 def _handle_updated(o: FreelanceOrder, known: dict, stats: dict) -> None:
     """Заказ уже в журнале, но заказчик мог поправить описание (отпечаток содержимого изменился).
     Ожидающий оценки возьмёт новый текст сам; отсеянный правилом получает шанс пройти заново; уже
@@ -58,59 +20,4 @@ def _handle_updated(o: FreelanceOrder, known: dict, stats: dict) -> None:
     else:
         freelance_mark_desc_changed(o.order_id, new_hash, snippet)
 
-
-def _intake(orders, last_id: int,
-            sent_now: set[int]) -> tuple[dict[int, FreelanceOrder], dict, list[FreelanceOrder]]:
-    """Приём всех увиденных заказов: каждый получает объяснимое состояние в журнале. Порядок - от старых
-    к новым, чтобы оригиналом считался первый опубликованный. Возвращает ({order_id: заказ} для
-    дальнейшей работы в памяти, счётчики, новые заказы к оценке). Вакансионные доски строк не получают (их тысячи в сутки),
-    только счётчик; считаются лишь новые за курсором alot (хвост окна скан перечитывает)."""
-    uniq: dict[int, FreelanceOrder] = {}
-    for o in orders:
-        uniq.setdefault(o.order_id, o)
-    known = freelance_known(list(uniq))
-    stats: dict = {"new": 0, "filtered": 0, "duplicate": 0, "stale": 0, "updated": 0, "excluded": {}}
-    new_orders: list[FreelanceOrder] = []
-    reasons: dict[str, int] = {}
-    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
-    for o in sorted(uniq.values(), key=lambda x: (x.published_at, x.order_id)):
-        if o.order_id in sent_now:
-            continue
-        if o.site in EXCLUDED_SITES:
-            if sources.source_of(o.order_id) == sources.ALOT and o.order_id > last_id:
-                stats["excluded"][o.site] = stats["excluded"].get(o.site, 0) + 1
-            continue
-        if o.order_id in known:
-            _handle_updated(o, known[o.order_id], stats)
-            continue
-        origin = sources.source_of(o.order_id)
-        why = reject_reason(o)
-        if why is not None:
-            key = why.split(":", 1)[0]
-            reasons[key] = reasons.get(key, 0) + 1
-            if (o.site == "youdoru" or key == "stop_word") and o.order_id not in _prefilter_logged:
-                if len(_prefilter_logged) >= _PREFILTER_LOG_MAX:
-                    _prefilter_logged.clear()
-                _prefilter_logged.add(o.order_id)
-                title = ai_scorer.mask_contacts(o.title or "")[:80]
-                logging.info(f"[FREELANCE] префильтр: {why}, {o.site} {o.order_id}, {title!r}")
-            _journal_new(o, jr.FILTERED, full=False, reject_reason=why)
-            stats["filtered"] += 1
-            continue
-        if not jr.pub_unreliable(o.site, origin) and o.published_at < threshold:
-            _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
-            stats["stale"] += 1
-            continue
-        dup_of = _find_duplicate(o)
-        if dup_of is not None:
-            _log_dropped(o, f"дубль заказа {dup_of}")
-            _journal_new(o, jr.DUPLICATE, full=False, dup_of=dup_of)
-            stats["duplicate"] += 1
-            continue
-        _journal_new(o, jr.QUEUED, full=True, queue_reason=jr.Q_WAIT)
-        stats["new"] += 1
-        new_orders.append(o)
-    if reasons:
-        logging.info(f"[FREELANCE] префильтр отсеял: {reasons}")
-    return uniq, stats, new_orders
-##### КОНЕЦ ВЫДЕРЖКИ freelance/pipeline.py:459-572
+##### КОНЕЦ ВЫДЕРЖКИ freelance/pipeline.py:503-517

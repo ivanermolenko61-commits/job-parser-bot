@@ -8,6 +8,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import migration_check
 
@@ -96,6 +97,20 @@ class MigrationCheckTest(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 migration_check.main(["--db", src])
             self.assertIn("исходный файл БД не изменился за время проверки", buf.getvalue())
+
+    def test_occupied_probe_ids_and_rejected_without_fit_do_not_fail_correct_migration(self):
+        """Реальная копия может содержать order_id 701-705, 901 и прежнюю rejected-запись без оценки (legacy_unknown)."""
+        seed = migration_check.SEED.replace(
+            '(8, "flru", "Отказ без оценки"',
+            '(701, "flru", "Занятый 701", "pending", 7), (702, "flru", "Занятый 702", "sent", 8), '
+            '(705, "flru", "Занятый 705", "taken", 9), (901, "flru", "Занятый 901", "pending", 6), '
+            '(8, "flru", "Отказ без оценки"', 1)
+        self.assertIn("Занятый 901", seed)
+        buf = io.StringIO()
+        with mock.patch.object(migration_check, "SEED", seed), contextlib.redirect_stdout(buf):
+            code = migration_check.main([])
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertNotIn("ПРОВАЛ", buf.getvalue())
 
     def test_unknown_ref_reports_error(self):
         with contextlib.redirect_stdout(io.StringIO()):

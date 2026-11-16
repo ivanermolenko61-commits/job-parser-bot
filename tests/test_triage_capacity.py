@@ -157,6 +157,18 @@ class TriageEvidenceStaleTest(CycleTestBase):
     def test_full_scoring_prompt_change_discards_statistics(self):
         self._assert_change_resets(mock.patch.object(ai_scorer, "SYSTEM_PROMPT", ai_scorer.SYSTEM_PROMPT + " ещё"))
 
+    def test_reverting_to_same_settings_reactivates_same_fingerprint_evidence(self):
+        """Контракт: статистика и подтверждение привязаны к ОТПЕЧАТКУ настроек. Пока он другой - не действуют; при возврате
+        к тем же настройкам (тот же отпечаток) набранное для них снова действует, если за это время новые сравнения его
+        не перезаписали (тогда прежний набор не воскресает - тест ниже)."""
+        self.fill()
+        approve_audit()
+        with mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"):
+            self.assertFalse(pipeline.triage_allowed()[0])
+        ok, why = pipeline.triage_allowed()
+        self.assertTrue(ok, why)
+        self.assertGreaterEqual(pipeline.triage_evidence()["n"], pipeline.TRIAGE_MIN_SAMPLE)
+
     def test_new_records_after_change_start_from_zero_and_restore_after_return(self):
         self.fill()
         with mock.patch.object(ai_scorer, "TRIAGE_MODEL", "другая-модель"):

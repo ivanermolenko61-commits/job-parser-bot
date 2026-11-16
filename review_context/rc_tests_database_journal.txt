@@ -1,79 +1,4 @@
-##### ВЫДЕРЖКА (дословно, без правок) | файл: database.py | коммит: 2c19296 | blob: cd3803f0b7c136348d69d637720d44a6a3773112 | строки 565-589 | sha256 фрагмента: 2eb110f343e7e916b2aa8416296be80ad79201b8969c98c4cb65b1b71fda14c3
-def freelance_known(order_ids: list[int]) -> dict[int, dict]:
-    """Уже виденные заказы: {order_id: {content_hash, tech, desc_changed}} (для обнаружения правки описания)."""
-    found: dict[int, dict] = {}
-    if not order_ids:
-        return found
-    with _connect() as conn:
-        for i in range(0, len(order_ids), 500):
-            chunk = order_ids[i:i + 500]
-            marks = ",".join("?" * len(chunk))
-            rows = conn.execute(
-                f"SELECT order_id, content_hash, tech, COALESCE(desc_changed, 0) AS desc_changed "
-                f"FROM freelance_orders WHERE order_id IN ({marks})", chunk).fetchall()
-            found.update((r["order_id"], dict(r)) for r in rows)
-    return found
-
-
-_SAVE_COLUMNS = (
-    "site", "title", "url", "price_text", "fit", "ai_json", "published_at", "dedup_key", "attempts",
-    "message_id", "category", "budget", "hours", "sent_at", "status", "origin", "title_key",
-    "content_hash", "snippet", "pub_unreliable", "tech", "queue_reason", "reject_reason", "verdict",
-    "dup_of", "delivery", "assessed_at", "delivered_at", "card_deleted_at", "stale_at", "stale_reason",
-    "desc_changed", "lead", "lead_reason", "lead_at",
-)
-
-
-##### КОНЕЦ ВЫДЕРЖКИ database.py:565-589
-
-##### ВЫДЕРЖКА (дословно, без правок) | файл: database.py | коммит: 2c19296 | blob: cd3803f0b7c136348d69d637720d44a6a3773112 | строки 696-758 | sha256 фрагмента: d73c30066a77f954c2128d0cd689ad74f051d5591739357ecd3c3a263584b168
-def _update_states(order_id: int, _guard=None, **fields) -> bool:
-    """Точечная правка состояний заказа с пересчётом зеркала status. True - заказ найден.
-    _guard(row) -> bool проверяется в той же транзакции, что и запись: False - строка не меняется
-    (конкурентная доставка или устаревание не затираются); заказ при этом считается найденным."""
-    with _connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
-        if row is None:
-            return False
-        if _guard is not None and not _guard(dict(row)):
-            return True
-        merged = {**dict(row), **fields}
-        merged["status"] = jr.legacy_status(
-            merged.get("tech"), merged.get("delivery"), merged.get("lead"), bool(merged.get("card_deleted_at")))
-        names = [*fields, "status"]
-        conn.execute(
-            f"UPDATE freelance_orders SET {','.join(f'{n} = ?' for n in names)} WHERE order_id = ?",
-            (*(merged[n] for n in names), order_id),
-        )
-        return True
-
-
-def freelance_mark_stale(order_id: int, reason: str) -> bool:
-    """Заказ устарел (не оценён/не доставлен до предела очереди): состояние с причиной, без удаления.
-    Уже доставленный, дубль и отсеянный остаются как есть."""
-    # оценка (fit, assessed_at) остаётся: в отчёте видно, что заказ оценили, но не доставили;
-    # проверка и запись - одна транзакция: доставка, состоявшаяся между ними, не затирается
-    return _update_states(
-        order_id,
-        lambda r: r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST)
-        and r.get("tech") not in (jr.STALE, jr.DUPLICATE, jr.FILTERED),
-        tech=jr.STALE, delivery=jr.D_NONE, stale_reason=reason, stale_at=_now_sql(), queue_reason=None)
-
-
-def freelance_mark_filtered(order_id: int, reason: str) -> bool:
-    """Отсеян правилом (например, после смены фильтра ожидающий заказ больше не проходит)."""
-    return _update_states(
-        order_id, lambda r: r.get("tech") in (jr.QUEUED, jr.ASSESSED)
-        and r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST),
-        tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
-
-
-def freelance_mark_card_deleted(order_id: int) -> bool:
-    """Карточка удалена из чата по сроку. Ни технический статус, ни этап сделки не меняются."""
-    return _update_states(order_id, card_deleted_at=_now_sql())
-
-
+##### ВЫДЕРЖКА (дословно, без правок) | файл: database.py | коммит: 2c19296 | blob: cd3803f0b7c136348d69d637720d44a6a3773112 | строки 743-757 | sha256 фрагмента: 176d75bf948bfdc8a1146dc9468435067fc5cec6687b34e86dbb1b587830b6b0
 def freelance_mark_desc_changed(order_id: int, content_hash: str, snippet: str | None = None) -> bool:
     """Заказчик поправил описание уже оценённого заказа: оценка не повторяется, пометка остаётся
     (в карточке и отчёте); отпечаток обновлён, чтобы не срабатывать каждый цикл."""
@@ -89,5 +14,4 @@ def freelance_requeue(order_id: int, content_hash: str, snippet: str, queue_reas
                           tech=jr.QUEUED, queue_reason=queue_reason, reject_reason=None,
                           content_hash=content_hash, snippet=snippet, desc_changed=1)
 
-
-##### КОНЕЦ ВЫДЕРЖКИ database.py:696-758
+##### КОНЕЦ ВЫДЕРЖКИ database.py:743-757
