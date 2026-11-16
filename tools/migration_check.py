@@ -11,7 +11,11 @@
   4. ОТКАТ: прежний код (старая ревизия) открывает уже мигрированную БД, читает, пишет и закрывает заказ;
      затем новый код снова открывает её, а строка, записанная прежним кодом, получает состояние журнала;
   5. резервная копия (sqlite3.backup): PRAGMA integrity_check, те же данные, восстановленная копия открывается
-     новым и прежним кодом.
+     новым и прежним кодом;
+  6. источник: SHA-256 файла (--db) до и после проверки совпадает, снимок до миграции восстанавливается побайтно;
+     прежний код читает ПРЕЖНИЕ строки мигрированной БД (все старые поля, включая seen_at/sent_at) без искажений;
+     новый код читает мигрированную БД теми же функциями, что /export и отчёты (report.load_rows, export_csv,
+     format_funnel, format_losses).
 
   python -m tools.migration_check [--db path/to/vacancies.db] [--old-ref 110afe6]
 Код возврата 0 - все проверки прошли, 1 - есть расхождения.
@@ -32,7 +36,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Столбцы freelance_orders, существовавшие до этапа 1: по ним сравниваем «до» и «после»
 OLD_ORDER_COLS = ("order_id", "site", "title", "url", "price_text", "published_at", "dedup_key", "fit", "ai_json",
-                  "status", "attempts", "message_id", "category", "budget", "hours", "deal_price")
+                  "status", "attempts", "message_id", "category", "budget", "hours", "deal_price", "seen_at", "sent_at")
 
 SEED = r'''
 import json, os, sys
@@ -52,6 +56,34 @@ for oid, site, title, status, fit in rows:
 database.freelance_set_deal_price(3, 12000.0)
 database.kv_set("alot_last_id", 12345)
 print("seeded")
+'''
+
+# Чтение ПРЕЖНИХ строк прежним кодом (до любых его записей): функция freelance_get старой ревизии
+OLD_READ = r'''
+import json, os, sys
+sys.path.insert(0, os.getcwd())
+import database
+database.init_db()
+cols = json.loads(os.environ["ORDER_COLS"])
+out = {}
+for oid in json.loads(os.environ["ORDER_IDS"]):
+    row = database.freelance_get(oid) or {}
+    out[str(oid)] = {c: row.get(c) for c in cols}
+print(json.dumps(out, default=str, ensure_ascii=False))
+'''
+
+# Чтение мигрированной БД новым кодом теми же функциями, что /export и /funnel, /losses
+NEW_READ = r'''
+import json, os, sys
+sys.path.insert(0, os.getcwd())
+import database
+database.init_db()
+from freelance import report
+rows = report.load_rows(36500)
+csv = report.export_csv(rows)
+funnel = report.format_funnel(rows, report.load_excluded(36500), 1)
+losses = report.format_losses(report.losses(rows))
+print(json.dumps({"rows": len(rows), "csv_lines": csv.count(chr(10)), "funnel": bool(funnel), "losses": bool(losses)}))
 '''
 
 OLD_PROBE = r'''
@@ -94,8 +126,8 @@ print("ok")
 '''
 
 
-def run_code(tree: str, code: str, db: str) -> str:
-    env = dict(os.environ, DB_PATH=db, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+def run_code(tree: str, code: str, db: str, extra_env: dict | None = None) -> str:
+    env = dict(os.environ, DB_PATH=db, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", **(extra_env or {}))
     r = subprocess.run([sys.executable, "-c", code], cwd=tree, env=env, capture_output=True, text=True, timeout=300)
     if r.returncode:
         raise RuntimeError((r.stderr or r.stdout).strip()[-600:])
@@ -119,6 +151,47 @@ def snapshot(db: str) -> dict:
         return out
     finally:
         conn.close()
+
+
+def file_sha(path: str) -> str:
+    """SHA-256 байтов файла (не SQL-дампа): так видно любое изменение файла, в том числе служебное."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def old_rows(db: str) -> dict:
+    """Прежние строки freelance_orders по order_id: только столбцы OLD_ORDER_COLS (включая seen_at и sent_at)."""
+    conn = sqlite3.connect(db)
+    try:
+        cols = [c for c in OLD_ORDER_COLS if c in {r[1] for r in conn.execute("PRAGMA table_info(freelance_orders)")}]
+        if not cols:
+            return {}
+        return {str(r[0]): dict(zip(cols, r)) for r in conn.execute(
+            f"SELECT {', '.join(cols)} FROM freelance_orders ORDER BY order_id")}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
+def diff_rows(expected: dict, actual: dict, skip: dict | None = None) -> list[str]:
+    """Расхождения прежних строк: пропавшие заказы и изменившиеся поля. skip - {order_id: {поля}}, которые
+    проверка сама меняла (например, статус, который пишет проверочный прежний код)."""
+    out = []
+    for oid, row in expected.items():
+        got = actual.get(oid)
+        if got is None:
+            out.append(f"заказ {oid} пропал")
+            continue
+        for col, val in row.items():
+            if col in (skip or {}).get(oid, ()):
+                continue
+            if str(got.get(col)) != str(val):
+                out.append(f"заказ {oid}: {col} {val!r} -> {got.get(col)!r}")
+    return out
 
 
 def full_hash(db: str) -> str:
@@ -163,16 +236,20 @@ def main(argv=None) -> int:
             tf.extractall(old_tree, filter="data")
 
         legacy = os.path.join(tmp, "legacy.db")
+        source_sha = None
         if args.db:
             if not os.path.exists(args.db):
                 print(f"БД не найдена: {args.db}")
                 return 2
+            source_sha = file_sha(args.db)
             backup_copy(args.db, legacy)
             print(f"Источник: снимок {args.db} (боевая БД не менялась)")
         else:
             run_code(old_tree, SEED, legacy)
             print(f"Источник: синтетическая БД, созданная кодом {args.old_ref}")
         before = snapshot(legacy)
+        legacy_sha = file_sha(legacy)
+        legacy_rows = old_rows(legacy)
         print(f"Строк freelance_orders до: {before.get('freelance_orders', 0)}")
 
         print("1-3. Миграция и повторный запуск (новый код):")
@@ -203,9 +280,14 @@ def main(argv=None) -> int:
         shutil.copy2(migrated, rolled)
         run_code(ROOT, NEW_ROWS, rolled)   # в БД есть и записи, созданные только новым кодом (отсев, дубль, лид...)
         try:
+            extra = {"ORDER_COLS": json.dumps(list(OLD_ORDER_COLS)), "ORDER_IDS": json.dumps([int(k) for k in legacy_rows])}
+            read_back = json.loads(run_code(old_tree, OLD_READ, rolled, extra) or "{}")
+            bad = diff_rows(legacy_rows, read_back)
+            check(not bad, "прежний код читает прежние строки мигрированной БД без искажений (все старые поля, "
+                           "включая seen_at и sent_at)" + (": " + "; ".join(bad[:3]) if bad else ""))
             out = run_code(old_tree, OLD_PROBE, rolled)
             check(out == '"taken"', "прежний код открыл мигрированную БД, прочитал, записал и закрыл заказ")
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             check(False, f"прежний код не работает на мигрированной БД: {e}")
         else:
             try:
@@ -218,6 +300,14 @@ def main(argv=None) -> int:
                 check(row is not None and row[0], "после отката и нового запуска запись прежнего кода получила состояние журнала")
             except RuntimeError as e:
                 check(False, f"новый код не открыл БД после отката: {e}")
+
+        print("4б. Чтение мигрированной БД новым кодом (пути /export, /funnel, /losses):")
+        try:
+            info = json.loads(run_code(ROOT, NEW_READ, migrated) or "{}")
+            check(info.get("funnel") and info.get("losses") and info.get("csv_lines", 0) >= 1,
+                  f"экспорт и отчёты читают мигрированную БД (строк журнала {info.get('rows')})")
+        except (RuntimeError, ValueError) as e:
+            check(False, f"экспорт или отчёты не работают на мигрированной БД: {e}")
 
         print("5. Резервная копия и восстановление:")
         backup = os.path.join(tmp, "backup.db")
@@ -237,6 +327,16 @@ def main(argv=None) -> int:
             check(True, "восстановленная копия открывается новым и прежним кодом")
         except RuntimeError as e:
             check(False, f"восстановленная копия не открылась: {e}")
+        print("6. Источник и восстановление исходного снимка:")
+        check(file_sha(legacy) == legacy_sha, "снимок источника не изменился за время проверки (SHA-256 файла)")
+        if source_sha is not None:
+            check(file_sha(args.db) == source_sha,
+                  "исходный файл БД не изменился за время проверки (SHA-256 до и после; у живой БД с WAL файл "
+                  "меняется сам - проверяйте остановленную копию)")
+        restore_src = os.path.join(tmp, "restored_original.db")
+        shutil.copy2(legacy, restore_src)
+        check(file_sha(restore_src) == legacy_sha and snapshot(restore_src) == before,
+              "восстановление исходного снимка (до миграции) возвращает те же байты и данные")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

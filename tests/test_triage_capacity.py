@@ -130,22 +130,32 @@ class TriageEvidenceStaleTest(CycleTestBase):
             self.assertIn("другой модели", why)
             self.assertEqual(pipeline.triage_evidence()["n"], 0)
 
-    def test_prompt_change_discards_statistics(self):
+    def _assert_change_resets(self, patcher):
+        """Исходно отсечение разрешено (статистика, разметка и подтверждение владельца); после смены настройки -
+        запрещено ИМЕННО из-за устаревшей статистики (счётчики и подтверждение обнулены), возврат настройки её не воскрешает."""
         self.fill()
-        with mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"):
-            self.assertFalse(pipeline.triage_allowed()[0])
+        approve_audit()
+        self.assertTrue(pipeline.triage_allowed()[0])
+        with patcher:
+            ok, why = pipeline.triage_allowed()
+            self.assertFalse(ok)
+            self.assertIn("другой модели, промпте или порогах", why)
+            self.assertEqual(pipeline.triage_evidence()["n"], 0)
+            self.assertFalse(pipeline.triage_approval()["valid"])
+            with mock.patch.object(pipeline, "TRIAGE_MODE", "on"):
+                self.assertEqual(pipeline.effective_triage_mode(), "shadow")
+
+    def test_prompt_change_discards_statistics(self):
+        self._assert_change_resets(mock.patch.object(ai_scorer, "TRIAGE_PROMPT", ai_scorer.TRIAGE_PROMPT + " ещё"))
 
     def test_threshold_change_discards_statistics(self):
-        self.fill()
-        with mock.patch.object(pipeline, "TRIAGE_REJECT_MAX", pipeline.TRIAGE_REJECT_MAX + 1):
-            self.assertFalse(pipeline.triage_allowed()[0])
-        with mock.patch.object(pipeline, "FREELANCE_MIN_FIT", pipeline.FREELANCE_MIN_FIT + 1):
-            self.assertFalse(pipeline.triage_allowed()[0])
+        self._assert_change_resets(mock.patch.object(pipeline, "TRIAGE_REJECT_MAX", pipeline.TRIAGE_REJECT_MAX + 1))
+
+    def test_min_fit_change_discards_statistics(self):
+        self._assert_change_resets(mock.patch.object(pipeline, "FREELANCE_MIN_FIT", pipeline.FREELANCE_MIN_FIT + 1))
 
     def test_full_scoring_prompt_change_discards_statistics(self):
-        self.fill()
-        with mock.patch.object(ai_scorer, "SYSTEM_PROMPT", ai_scorer.SYSTEM_PROMPT + " ещё"):
-            self.assertFalse(pipeline.triage_allowed()[0])
+        self._assert_change_resets(mock.patch.object(ai_scorer, "SYSTEM_PROMPT", ai_scorer.SYSTEM_PROMPT + " ещё"))
 
     def test_new_records_after_change_start_from_zero_and_restore_after_return(self):
         self.fill()
