@@ -18,6 +18,11 @@ _CURRENCY_PATTERNS = (
     ("KZT", re.compile(r"₸|\bkzt\b|тенге", re.IGNORECASE)),
 )
 _KNOWN = {name for name, _ in _CURRENCY_PATTERNS}
+# знаки и коды валют, которых нет в списке выше: бюджет в них не рубли и не распознан («100 £», «5000 zł»)
+_OTHER_CURRENCY = re.compile(
+    r"[£¥₹₺₩₪฿₦₫₭₮₼₾]|\b(?:gbp|cny|jpy|try|pln|byn|uzs|gel|azn|amd|czk|chf|kgs|rmb)\b|zł"
+    r"|\b(?:юан|фунт|йен|драм)|\b(?:лир[аы]?|лари)\b",
+    re.IGNORECASE)
 # число: цифры с пробельными разделителями тысяч и необязательной десятичной частью, затем множитель (тыс, к, k, млн)
 _NUMBER_RE = re.compile(
     r"(\d(?:[\d   ]*\d)?(?:[.,]\d{1,2})?)(?![\d])"
@@ -31,6 +36,8 @@ def detect_currency(text: str, hint: str = "") -> str:
     Подсказка с неизвестным кодом валюту не угадывает: возвращается "" (а не рубли)."""
     hint = (hint or "").strip().upper()
     found = [code for code, pat in _CURRENCY_PATTERNS if pat.search(text or "")]
+    if _OTHER_CURRENCY.search(text or ""):
+        return ""     # валюта, которую не умеем сравнивать, или смесь с известной: не рубли и не угадываем
     if hint in _KNOWN:
         # знак в самом тексте важнее подсказки источника: «500 $» с подсказкой RUB не рубли и не угадывается
         return hint if not found or found == [hint] else ""

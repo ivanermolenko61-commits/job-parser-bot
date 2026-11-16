@@ -61,6 +61,13 @@ class ParseBudgetTest(unittest.TestCase):
         self.assertEqual(parse_budget("1000 ₽", "RUB")["currency"], "RUB")
         self.assertEqual(parse_budget("1000", "RUB")["currency"], "RUB")
 
+    def test_unlisted_currency_is_unknown_even_with_hint(self):
+        for text in ("100 £", "5000 zł", "300 юаней", "5000 ₽ или 100 £", "до 50 CNY"):
+            for hint in ("", "RUB"):
+                b = parse_budget(text, hint)
+                self.assertEqual(b["currency"], "", (text, hint))
+                self.assertEqual(rub_amount(b), 0.0, (text, hint))
+
     def test_two_currencies_are_ambiguous(self):
         b = parse_budget("1000 ₽ или 20 $")
         self.assertEqual(b["currency"], "")
