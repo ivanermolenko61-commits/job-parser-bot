@@ -225,6 +225,7 @@ class PipelineTriageTest(unittest.TestCase):
     def cycle(self, order, triage, mode, full=None):
         scan = alot_client.ScanResult(orders=[order], max_id=order.order_id, raw_count=1)
         with mock.patch.object(pipeline, "TRIAGE_MODE", mode), \
+                mock.patch.object(pipeline, "triage_allowed", return_value=(True, "тест")), \
                 mock.patch.object(pipeline, "fetch_new_orders", return_value=scan), \
                 mock.patch.object(pipeline.ai_scorer, "triage_order", return_value=triage) as tri, \
                 mock.patch.object(pipeline.ai_scorer, "score_order",

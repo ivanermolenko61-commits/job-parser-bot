@@ -266,7 +266,8 @@ class AlotWakeUpHintTest(CycleTestBase):
         text = notify.call_args.args[0]
         self.assertIn("alot.pro снова отдаёт заказы", text)
         self.assertIn("FL.ru и Kwork", text)
-        self.assertIn("Источники", text)
+        self.assertIn("отключать прямые источники", text)   # восстановление alot - не повод их выключать
+        self.assertNotIn("дублируют", text)
         # сразу следующий цикл с новыми заказами - уже без подсказки
         self.run_track(has_new=True).assert_not_called()
 

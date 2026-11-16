@@ -160,6 +160,7 @@ class PipelineBase(unittest.TestCase):
     def run_cycle(self, o, triage=None, mode="on", full=None, min_fit=None):
         scan = alot_client.ScanResult(orders=[o], max_id=o.order_id, raw_count=1)
         patches = [mock.patch.object(pipeline, "TRIAGE_MODE", mode),
+                   mock.patch.object(pipeline, "triage_allowed", return_value=(True, "тест")),
                    mock.patch.object(pipeline, "fetch_new_orders", return_value=scan),
                    mock.patch.object(pipeline.ai_scorer, "triage_order", return_value=triage),
                    mock.patch.object(pipeline.ai_scorer, "score_order", return_value=full)]

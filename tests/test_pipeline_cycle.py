@@ -89,7 +89,8 @@ class SaveRightAfterScoringTest(CycleTestBase):
         with mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan([order])), \
                 mock.patch.object(pipeline.ai_scorer, "score_order", return_value=ai_result(2)):
             res = pipeline._prepare_cycle()
-        self.assertEqual(database.freelance_get(102)["status"], "pending")
+        early = database.freelance_get(102)   # оценка сохранена сразу, но доставки у неё нет
+        self.assertEqual((early["tech"], early["verdict"], early["delivery"]), ("assessed", "low_fit", "none"))
         self.assertEqual(len(res.rejected), 1)
         pipeline.finish_cycle(res, [], [], [])
         self.assertEqual(database.freelance_get(102)["status"], "rejected")
@@ -127,12 +128,14 @@ class QuotaReserveTest(CycleTestBase):
     def orders(self):
         database.kv_set(pipeline.LAST_ID_KEY, 100)
         o = []
+        # приоритет по профилю: слово профиля в названии - 1, категория профиля без слов - 2,
+        # общая категория WEB без слов профиля - 3 (преимущества у WEB нет)
         for oid, title, cats in ((201, "Создать телеграм бота", ["PROG_OTHER"]),   # группа 1
-                                 (202, "Создать телеграм бота", []),               # группа 2
-                                 (203, "Специалист TapLink", [])):                 # группа 3 (бот в тексте)
+                                 (202, "Нужна помощь", ["PROG_OTHER"]),            # группа 2
+                                 (203, "Нужен специалист", ["WEB"])):              # группа 3
             order = make_order(oid, title)
             order.categories = cats
-            order.body = f"нужен бот {oid}"   # разные ключи дублей
+            order.body = f"нужна работа {oid}" if oid != 201 else "нужен бот 201"   # разные тексты
             o.append(order)
         return o
 

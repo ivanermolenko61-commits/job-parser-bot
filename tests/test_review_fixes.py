@@ -194,7 +194,7 @@ class FreshnessBeforeSendTest(unittest.TestCase):
         return pipeline.ScoredOrder(order, {"fit": 8})
 
     def test_stale_order_not_sent(self):
-        fresh, stale = self.sc(1, 1), self.sc(2, 7)
+        fresh, stale = self.sc(1, 1), self.sc(2, 50)   # предел очереди 48 ч (7 ч - уже «не свежий», но уходит с пометкой)
         self.assertFalse(bot._order_is_stale(fresh))
         self.assertTrue(bot._order_is_stale(stale))
         send = mock.AsyncMock(return_value=10)

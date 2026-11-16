@@ -46,10 +46,12 @@ def make_cat(title, categories, body=""):
 
 class PriorityTest(unittest.TestCase):
     def test_groups(self):
-        # примеры из эталонной выборки (fit 7-8, кроме последнего)
-        self.assertEqual(priority(make_cat("Создать сайт на тильде", ["WEB"])), 1)
-        self.assertEqual(priority(make_cat("Написать макрос в excel", ["FINANCE"])), 2)
+        # приоритет по профилю (таблицы, боты, автоматизация), а не по общей категории WEB
+        self.assertEqual(priority(make_cat("Создать сайт на тильде", ["WEB"])), 3)
+        self.assertEqual(priority(make_cat("Нужен разработчик", ["WEB"])), 3)
+        self.assertEqual(priority(make_cat("Написать макрос в excel", ["FINANCE"])), 1)
         self.assertEqual(priority(make_cat("Создать миниапп", ["PROG_OTHER"])), 2)
+        self.assertEqual(priority(make_cat("Помощь", ["WEB"], "нужна выгрузка в таблицу")), 2)
         self.assertEqual(priority(make_cat("Специалист TapLink", ["SEOSMM"], "нужен сайт")), 3)
 
 
@@ -123,6 +125,51 @@ class RejectReasonTest(unittest.TestCase):
         for title in ["Создание тг бота", "Купить диван", "Менеджер"]:
             o = make_cat(title)
             self.assertEqual(is_candidate(o), reject_reason(o) is None)
+
+
+class FalseRejectRegressionTest(unittest.TestCase):
+    """Подтверждённые ложные отказы 2026-11-13: «аналитик», «менеджер», «перевод» в названии заказа на
+    автоматизацию с таблицами. Настоящие вакансии и посторонние услуги остаются отсеянными."""
+
+    SHOULD_PASS = [
+        ("Аналитика продаж WB в Google Таблицах", "Нужен отчёт по продажам Wildberries, обновление раз в день"),
+        ("Автоматизация отчёта для менеджера в Google Sheets", "Сейчас отчёт собираю вручную из выгрузок"),
+        ("Перевод данных из Excel в Google Sheets", "Есть файл с остатками, нужно перенести и настроить формулы"),
+        ("Отчёт для менеджера по продажам: собирать данные из CRM в таблицу", ""),
+        ("Нужно чтобы отчёт для менеджера собирался автоматически", "Данные в Excel, раз в неделю"),
+        ("Аналитик продаж: дашборд по Ozon в таблице", ""),
+        ("Создать ai агента", ""),                      # пропуск живой выборки 2026-11-13
+        ("ИИ-агент для продвижения сайта, Директа и аналитики", ""),
+    ]
+    SHOULD_STAY_REJECTED = [
+        ("Менеджер по продажам", "Работа в офисе, оклад, полный день"),
+        ("Перевод документа с английского", "Договор на 5 страниц"),
+        ("Аналитик данных", "Требуется в штат, оклад от 90 000"),
+        ("Аналитик в отдел продаж (Excel, SQL)", "Вакансия, трудоустройство по ТК РФ, график работы 5/2"),
+        ("Менеджер по продажам (знание Excel)", "Полная занятость, оклад, соцпакет"),
+        ("Перевод текста статьи", "Нужен переводчик, Excel не нужен"),
+        ("Создам бота для вашего бизнеса", ""),
+        ("Агент по аренде коммерческой недвижимости", ""),
+        ("Ищем менеджеров, аналитиков, бухгалтеров для привлечения клиентов на автоматизацию", ""),
+    ]
+
+    def test_false_rejects_now_pass(self):
+        for title, body in self.SHOULD_PASS:
+            self.assertIsNone(reject_reason(make_cat(title, body=body)), title)
+
+    def test_vacancies_and_foreign_services_stay_rejected(self):
+        for title, body in self.SHOULD_STAY_REJECTED:
+            self.assertIsNotNone(reject_reason(make_cat(title, body=body)), title)
+
+    def test_result_signal_without_technology_name(self):
+        """Признак результата автоматизации в тексте пропускает заказ без названия технологии в заголовке."""
+        for title, body in (("Помощь с отчётностью", "нужно, чтобы данные из выгрузки собирались автоматически"),
+                            ("Ежедневный сбор данных", "обработка данных из нескольких файлов, свод в одну таблицу")):
+            self.assertIsNone(reject_reason(make_cat(title, body=body)), title)
+
+    def test_web_category_does_not_raise_priority(self):
+        self.assertEqual(priority(make_cat("Нужен разработчик", ["WEB"])), 3)
+        self.assertEqual(priority(make_cat("Автоматизация отчёта в Google Sheets", ["WEB"])), 1)
 
 
 class PrefilterLogTest(unittest.TestCase):

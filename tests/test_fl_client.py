@@ -216,7 +216,7 @@ class PendingFlTest(CycleTestBase):
         gone = self.pending_order(2)
         pipeline.save_order(pipeline.ScoredOrder(gone, None, "dk"), "sent")
         self.assertEqual(list(pipeline._feed_store_read()), [str(keep.order_id)])
-        old = self.pending_order(3, hours_ago=9)      # старше срока: не сохраняется в хранилище
+        old = self.pending_order(3, hours_ago=60)     # старше предела очереди: не сохраняется в хранилище
         self.assertNotIn(str(old.order_id), pipeline._feed_store_read())
 
     def test_store_ignores_alot_orders(self):
