@@ -63,11 +63,17 @@ class ParseBudgetTest(unittest.TestCase):
 
     def test_unlisted_currency_is_unknown_even_with_hint(self):
         for text in ("100 £", "5000 zł", "300 юаней", "5000 ₽ или 100 £", "до 50 CNY", "500 ₱", "2000 ₹", "100 ¥",
-                     "10 ₿ ", "3 ₾"):
+                     "10 ₿ ", "3 ₾", "500 PHP", "200 AED", "100 SEK "):
             for hint in ("", "RUB"):
                 b = parse_budget(text, hint)
                 self.assertEqual(b["currency"], "", (text, hint))
                 self.assertEqual(rub_amount(b), 0.0, (text, hint))
+
+    def test_supported_iso_codes_and_plain_words_stay_recognised(self):
+        self.assertEqual(parse_budget("5000 RUB")["currency"], "RUB")
+        self.assertEqual(parse_budget("100 USD")["currency"], "USD")
+        self.assertEqual(parse_budget("100 usd")["currency"], "USD")
+        self.assertEqual(parse_budget("до 5000 руб. ТЗ по договору")["currency"], "RUB")
 
     def test_two_currencies_are_ambiguous(self):
         b = parse_budget("1000 ₽ или 20 $")

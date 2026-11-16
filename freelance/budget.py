@@ -33,12 +33,15 @@ _HOURLY_RE = re.compile(r"(?:в|за|/)\s*час\b|\bчас(?:овая|овой)
 
 
 _KNOWN_SIGNS = "$€₽₴₸"
+_ISO_CODE = re.compile(r"(?<![A-Za-z])[A-Z]{3}(?![A-Za-z])")        # заглавный трёхбуквенный код вроде CNY, PHP, GBP
+_ISO_SUPPORTED = {"RUB", "RUR", "UAH", "USD", "EUR", "KZT"}
 
 
 def _has_unlisted_currency(text: str) -> bool:
     """В тексте есть валютный символ Unicode (категория Sc: £, ₱, ₹, ¥ ...), которого нет среди поддерживаемых,
     либо слово/код валюты из _OTHER_CURRENCY."""
     return (any(unicodedata.category(c) == "Sc" and c not in _KNOWN_SIGNS for c in text or "")
+            or any(code not in _ISO_SUPPORTED for code in _ISO_CODE.findall(text or ""))
             or bool(_OTHER_CURRENCY.search(text or "")))
 
 
