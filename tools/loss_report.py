@@ -24,13 +24,12 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     import database
-    if args.db:
-        database.DB_PATH = args.db
-    if not os.path.exists(database.DB_PATH):
-        print(f"БД не найдена: {database.DB_PATH}")
-        return 2
-    database.init_db()   # идемпотентно: мигрирует старую схему, данные не трогает
     from freelance import report
+    source = args.db or database.DB_PATH
+    if not os.path.exists(source):
+        print(f"БД не найдена: {source}")
+        return 2
+    report.use_copy_of(source)   # боевая БД не меняется: отчёт строится по копии
 
     rows = report.load_rows(args.days)
     excluded = report.load_excluded(args.days)

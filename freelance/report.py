@@ -24,6 +24,26 @@ _COLUMNS = (
 )
 
 
+def use_copy_of(path: str) -> str:
+    """Инструменты отчётов НЕ меняют боевую БД: работают с копией во временной папке (рядом лежащие
+    -wal/-shm копируются тоже), на копии идемпотентно мигрирует схема. Возвращает путь копии и ставит
+    её как database.DB_PATH. Временная папка удаляется при выходе из процесса."""
+    import atexit
+    import os
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="freelance_report_")
+    atexit.register(shutil.rmtree, tmp, True)
+    dst = os.path.join(tmp, "copy.db")
+    shutil.copy2(path, dst)
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            shutil.copy2(path + suffix, dst + suffix)
+    database.DB_PATH = dst
+    database.init_db()
+    return dst
+
+
 def load_rows(days: int = 14) -> list[dict]:
     """Строки журнала, впервые увиденные за последние days дней."""
     with database._connect() as conn:

@@ -20,13 +20,12 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     import database
-    if args.db:
-        database.DB_PATH = args.db
-    from freelance import ai_scorer, capacity, pipeline, yandex_budget
+    from freelance import ai_scorer, capacity, pipeline, report, yandex_budget
 
     demand = None
-    if os.path.exists(database.DB_PATH):
-        database.init_db()
+    source = args.db or database.DB_PATH
+    if os.path.exists(source):
+        report.use_copy_of(source)   # боевая БД не меняется: спрос считается по копии
         demand = capacity.demand_per_day(args.days)
     f = capacity.forecast(ai_scorer.status(), demand or 0.0, pipeline.TRIAGE_SHADOW_MAX_PER_DAY,
                           date.today(), yandex_budget.until())

@@ -4,7 +4,7 @@
 провайдеров цепочки и хватает ли их на спрос. Чистая функция forecast() (без БД и сети) плюс чтение спроса
 из журнала. Допущения названы в результате: это оценка, а не измерение.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 # Cloudflare Workers AI: нейроны общие на аккаунт, поэтому быстрый триаж (маленькая модель) и полная оценка
 # (gpt-oss-120b) делят одну дневную квоту. ~185 нейронов на полную оценку замерены 11.10.2026 (комментарий
@@ -78,7 +78,7 @@ def demand_per_day(days: int = 7) -> float | None:
             "AND tech IN ('queued', 'assessed') OR (seen_at >= datetime('now', ?) AND tech = 'stale' "
             "AND COALESCE(stale_reason, '') != 'old_at_discovery')",
             (f"-{int(days)} days", f"-{int(days)} days")).fetchone()[0]
-    span_days = max(1.0, (datetime.utcnow() - datetime.strptime(first, "%Y-%m-%d %H:%M:%S")).total_seconds() / 86400)
+    span_days = max(1.0, (datetime.now(timezone.utc).replace(tzinfo=None) - datetime.strptime(first, "%Y-%m-%d %H:%M:%S")).total_seconds() / 86400)
     return n / min(span_days, float(days))
 
 
