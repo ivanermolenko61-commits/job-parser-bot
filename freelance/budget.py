@@ -6,6 +6,7 @@
 «5 000 ₽ – 10 000 ₽» -> 500010000 в старых строках FL.ru) в расчёты не попадают.
 """
 import re
+import unicodedata
 
 MAX_PLAUSIBLE = 10_000_000.0   # выше - считаем испорченным значением, а не бюджетом
 
@@ -31,12 +32,22 @@ _MULTIPLIERS = {"тыс": 1_000.0, "т.р": 1_000.0, "т. р": 1_000.0, "к": 1_
 _HOURLY_RE = re.compile(r"(?:в|за|/)\s*час\b|\bчас(?:овая|овой)\b|/\s*ч\b|per hour|/h\b|hourly", re.IGNORECASE)
 
 
+_KNOWN_SIGNS = "$€₽₴₸"
+
+
+def _has_unlisted_currency(text: str) -> bool:
+    """В тексте есть валютный символ Unicode (категория Sc: £, ₱, ₹, ¥ ...), которого нет среди поддерживаемых,
+    либо слово/код валюты из _OTHER_CURRENCY."""
+    return (any(unicodedata.category(c) == "Sc" and c not in _KNOWN_SIGNS for c in text or "")
+            or bool(_OTHER_CURRENCY.search(text or "")))
+
+
 def detect_currency(text: str, hint: str = "") -> str:
     """Код валюты по подсказке источника (поле currency alot.pro) или по знакам в тексте; "" - неизвестна.
     Подсказка с неизвестным кодом валюту не угадывает: возвращается "" (а не рубли)."""
     hint = (hint or "").strip().upper()
     found = [code for code, pat in _CURRENCY_PATTERNS if pat.search(text or "")]
-    if _OTHER_CURRENCY.search(text or ""):
+    if _has_unlisted_currency(text):
         return ""     # валюта, которую не умеем сравнивать, или смесь с известной: не рубли и не угадываем
     if hint in _KNOWN:
         # знак в самом тексте важнее подсказки источника: «500 $» с подсказкой RUB не рубли и не угадывается
