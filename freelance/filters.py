@@ -20,6 +20,11 @@ DEV_CATEGORIES = {
     "TESTING", "INTERFACE_DESIGN",
 }
 
+# ИИ-агенты и ИИ-автоматизация входят в профиль (нейросети внутри ботов и автоматизаций). Одно слово
+# «агент» не берём: «агент по недвижимости» - не наш заказ; живая выборка 2026-11-13 потеряла
+# «Создать ai агента» без этих оборотов
+AGENT_WORDS = ["ai агент", "ai-агент", "ии агент", "ии-агент", "ai agent", "ai-agent", "нейро-агент"]
+
 # Слова-признаки подходящего заказа (в title или начале body).
 # Короткие (<=3 символов) _compile ищет целым словом, длинные — по началу слова.
 INCLUDE_WORDS = [
@@ -36,6 +41,7 @@ INCLUDE_WORDS = [
     "таблиц", "apps script", "формул", "vba", "отчет", "отчёт", "дашборд",
     "wildberries", "вайлдберриз", "ozon", "озон", "маркетплейс", "n8n", "sql",
     "нейросет", "gpt",
+    *AGENT_WORDS,
 ]
 
 # Профиль исполнителя - таблицы, боты, автоматизация; сайты не делает. Заказ, где в названии
@@ -55,6 +61,7 @@ STRENGTH_WORDS = [
     "таблиц", "google sheets", "excel", "эксел", "apps script", "формул", "макрос",
     "отчет", "отчёт", "дашборд", "wildberries", "вайлдберриз", "ozon", "озон",
     "маркетплейс", "n8n", "sql", "нейросет", "gpt",
+    *AGENT_WORDS,
 ]
 
 _INCLUDE_RE = _compile(INCLUDE_WORDS)
@@ -75,16 +82,51 @@ EXCLUDE_WORDS = [
 ]
 
 # Широкие стоп-слова: срабатывают на «менеджер по продажам», но не должны глушить заказ
-# на разработку («бот для менеджера», «парсер отзывов»). Если в названии есть явный признак
-# разработки (DEV_INTENT_WORDS), такое слово заказ не отсеивает.
+# на разработку («бот для менеджера», «парсер отзывов») и заказ на автоматизацию с таблицами
+# («Аналитика продаж WB в Google Таблицах», «Автоматизация отчёта для менеджера в Google Sheets»,
+# «Перевод данных из Excel в Google Sheets»). Если в названии есть явный признак разработки
+# (DEV_INTENT_WORDS) либо инструмент или результат автоматизации (RESULT_WORDS), а в названии
+# и начале текста нет признаков найма (EMPLOYMENT_WORDS), такое слово заказ не отсеивает.
 SOFT_EXCLUDE_WORDS = ("менеджер", "аналитик", "отзыв", "перевод")
 DEV_INTENT_WORDS = [
     "бот", "бота", "боты", "ботов", "боту", "ботом", "чат-бот", "чатбот", "тг", "tg",
     "парсер", "парсинг", "скрипт", "python", "питон", "api", "разработ", "программист",
+    *AGENT_WORDS,
+]
+# Результат автоматизации и инструменты данных - по смыслу задачи, не только по названию технологии.
+# Название - сознательная формулировка заказчика, поэтому там работает широкий список (RESULT_TITLE_WORDS);
+# в тексте широкие слова шумят («автоматическая актуализация» у сайта, «синхронизация» в видеомонтаже -
+# проверено на живой выборке 2026-11-13), поэтому там - только узкий (RESULT_BODY_WORDS)
+RESULT_BODY_WORDS = [
+    "google таблиц", "гугл таблиц", "google sheets", "гугл sheets", "google-таблиц", "в таблиц",
+    "apps script", "appscript", "sql", "power bi", "дашборд", "vba", "формул", "макрос",
+    "выгрузк", "импорт данных", "перенос данных", "перенести данные", "переносить данные",
+    "сбор данных", "собирать данные", "формирование отчет", "формирование отчёт",
+    "формировать отчет", "формировать отчёт", "обработка данных", "обработк данных",
+]
+RESULT_TITLE_WORDS = RESULT_BODY_WORDS + [
+    "таблиц", "excel", "эксел", "автоматизац", "автоматизир", "автоматическ", "выгруж", "синхрониз",
+    "подтягив", "импорт из", "собирал", "сводн", "интеграц",
+]
+# Признаки найма в штат и набора персонала: заказ-аналитик «в отдел, оклад» и «ищем менеджеров» -
+# не заказы
+EMPLOYMENT_WORDS = [
+    "в штат", "вакансия", "на постоянн", "полная занятость", "полный день", "оклад", "трудоустро",
+    "зарплат", "з/п", "график работы", "резюме", "full-time", "fulltime", "full time", "в офис",
+    "испытательный срок", "соцпакет", "дмс", "тк рф", "опыт работы от",
+    "ищем", "требуется", "требуются", "приглашаем", "набираем", "в команду",
 ]
 
 _EXCLUDE_RE = _compile(EXCLUDE_WORDS)
 _DEV_INTENT_RE = _compile(DEV_INTENT_WORDS)
+_RESULT_BODY_RE = _compile(RESULT_BODY_WORDS)
+_RESULT_TITLE_RE = _compile(RESULT_TITLE_WORDS)
+_EMPLOYMENT_RE = _compile(EMPLOYMENT_WORDS)
+
+
+def _result_signal(title: str, body: str = "") -> bool:
+    """Признак профиля/результата автоматизации: широкий список в названии, узкий в начале текста."""
+    return bool(_RESULT_TITLE_RE.search(title) or _RESULT_BODY_RE.search((body or "")[:600]))
 
 # Дизайн уже есть у заказчика: эти обороты не считаем словом «дизайн» в EXCLUDE_WORDS
 _DESIGN_GIVEN_RE = re.compile(
@@ -107,8 +149,16 @@ def is_service_offer(title: str) -> bool:
     return bool(_SERVICE_OFFER_RE.match(t))
 
 
+def _soft_stop_overridden(title: str, body: str) -> bool:
+    """Широкое стоп-слово («менеджер», «аналитик», «перевод», «отзыв») не отсеивает заказ, если в
+    названии разработка или инструмент/результат автоматизации, а найма в штат не видно."""
+    if _DEV_INTENT_RE.search(title):
+        return True
+    return bool(_RESULT_TITLE_RE.search(title)) and not _EMPLOYMENT_RE.search(f"{title}\n{(body or '')[:600]}")
+
+
 def reject_reason(order) -> str | None:
-    """Почему префильтр отсеял заказ (None - прошёл). Причина нужна для лога: иначе
+    """Почему префильтр отсеял заказ (None - прошёл). Причина нужна для лога и журнала: иначе
     потерянный заказ нельзя отличить от заказа, которого не было в выдаче alot.
     Коды: excluded_site, reports, service_offer, stop_word:<слово>, site_only, no_include."""
     if order.site in EXCLUDED_SITES:
@@ -124,13 +174,14 @@ def reject_reason(order) -> str | None:
     hard = [w for w in hits if not w.startswith(SOFT_EXCLUDE_WORDS)]
     if hard:
         return f"stop_word:{hard[0]}"
-    if hits and not _DEV_INTENT_RE.search(title):
+    if hits and not _soft_stop_overridden(title, order.body):
         return f"stop_word:{hits[0]}"
-    if _SITE_RE.search(title) and not _STRENGTH_RE.search(f"{title}\n{(order.body or '')[:600]}"):
+    head = f"{title}\n{(order.body or '')[:600]}"
+    if _SITE_RE.search(title) and not (_STRENGTH_RE.search(head) or _result_signal(title, order.body)):
         return "site_only"
     if DEV_CATEGORIES.intersection(order.categories):
         return None
-    if _INCLUDE_RE.search(f"{title}\n{(order.body or '')[:600]}"):
+    if _INCLUDE_RE.search(head) or _result_signal(title, order.body):
         return None
     return "no_include"
 
@@ -140,17 +191,23 @@ def is_candidate(order) -> bool:
     return reject_reason(order) is None
 
 
+# Категории alot.pro, которые сами по себе говорят о профиле. WEB сюда не входит: сайты - не профиль
+# (преимущество общей категории WEB в очереди AI вытесняло таблицы и ботов)
+PROFILE_CATEGORIES = {"PROG_OTHER"}
+
+
 def priority(order) -> int:
-    """Очередь AI-оценки, когда квоты мало (меньше - важнее):
-    1 - категория разработки и ключевое слово в названии,
-    2 - что-то одно из двух,
-    3 - заказ прошёл префильтр только по словам в тексте.
-    На 60 заказах с эталонной оценкой: в группе 1 - 10 из 17 подходящих (fit ≥ 5), в группе 3 - 1 из 17."""
-    dev = bool(DEV_CATEGORIES.intersection(order.categories))
-    in_title = bool(_INCLUDE_RE.search(order.title or ""))
-    if dev and in_title:
+    """Очередь AI-оценки, когда квоты мало (меньше - важнее). Приоритет - по профилю
+    (таблицы, боты, парсеры, скрипты, автоматизация), а не по общей категории разработки:
+    1 - признак профиля или результата автоматизации в названии,
+    2 - признак профиля только в начале текста либо категория профиля (PROG_OTHER),
+    3 - прошёл префильтр иначе (например, категория WEB без слов профиля)."""
+    title = order.title or ""
+    head = f"{title}\n{(order.body or '')[:600]}"
+    if _STRENGTH_RE.search(title) or _RESULT_TITLE_RE.search(title):
         return 1
-    if dev or in_title:
+    if _STRENGTH_RE.search(head) or _RESULT_BODY_RE.search((order.body or "")[:600]) \
+            or PROFILE_CATEGORIES.intersection(order.categories):
         return 2
     return 3
 

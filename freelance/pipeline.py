@@ -10,7 +10,7 @@
     attempts, каждый цикл дозапрашиваются по id (getProjects);
   • без оценки AI заказ в чат не уходит: ждёт в pending, пока AI не ответит
     (о простое AI приходит health-оповещение); «без AI» - только если ключей нет;
-  • pending старше FREELANCE_MAX_AGE_HOURS получает статус expired;
+  • ожидающий старше FREELANCE_QUEUE_MAX_HOURS получает состояние stale с причиной (не исчезает молча);
   • успешно отправленные заказы дополнительно держатся в памяти (_sent_ids), чтобы
     сбой записи в БД не привёл к дублю.
 """
@@ -29,19 +29,26 @@ from zoneinfo import ZoneInfo
 from config import (
     ALOT_SEED_ID,
     ALOT_STALE_HOURS,
-    FREELANCE_MAX_AGE_HOURS,
+    FREELANCE_FRESH_HOURS,
     FREELANCE_MIN_FIT,
+    FREELANCE_QUEUE_MAX_HOURS,
 )
 from database import (
-    freelance_dup_keys,
+    freelance_count_excluded,
+    freelance_dup_candidates,
+    freelance_known,
+    freelance_mark_desc_changed,
+    freelance_mark_filtered,
+    freelance_mark_stale,
     freelance_pending,
+    freelance_requeue,
     freelance_save,
-    freelance_seen_ids,
-    freelance_set_status,
+    freelance_set_queue_reason,
     kv_get,
     kv_set,
 )
 from freelance import ai_scorer, pricing, sources, yandex_budget
+from freelance import journal as jr
 from freelance.alot_client import (
     FreelanceOrder,
     ScanResult,
@@ -53,7 +60,7 @@ from freelance.alot_client import (
 )
 from freelance.fl_client import fetch_fl_orders
 from freelance.kwork_client import fetch_kwork_orders
-from freelance.filters import is_candidate, norm_dedup_key, priority, reject_reason
+from freelance.filters import EXCLUDED_SITES, norm_dedup_key, priority, reject_reason
 from health import monitor
 
 DEDUP_DAYS = 3
@@ -95,6 +102,20 @@ except ValueError:
 TRIAGE_CACHE_MAX = 2000
 _triage_cache: dict[int, int] = {}
 _triage_lock = threading.Lock()
+# Shadow-триаж тратит ту же квоту провайдера (Cloudflare Workers AI делит нейроны между триажем и полной
+# оценкой), поэтому в shadow он ограничен малой выборкой в сутки, а не TRIAGE_MAX_PER_DAY
+try:
+    TRIAGE_SHADOW_MAX_PER_DAY = max(0, int(os.environ.get("TRIAGE_SHADOW_MAX_PER_DAY") or 100))
+except ValueError:
+    TRIAGE_SHADOW_MAX_PER_DAY = 100
+# Отсекающий триаж (on) включается только по накопленным данным shadow: без доказанного отсутствия
+# пропусков хороших заказов он остаётся в shadow. Нужно: выборка не меньше TRIAGE_MIN_SAMPLE,
+# среди неё не меньше TRIAGE_MIN_GOOD подходящих (fit >= порога) и ни одного пропуска
+TRIAGE_MIN_SAMPLE = 150
+TRIAGE_MIN_GOOD = 15
+TRIAGE_EVIDENCE_KEY = "triage_shadow_stats"
+_triage_evidence_lock = threading.Lock()
+_triage_warned = {"on": False}
 LAST_ID_KEY = "alot_last_id"
 AI_FAIL_STREAK_KEY = "freelance_ai_fail_streak"
 QUOTA_OUT_DAY_KEY = "ai_quota_out_day"   # день МСК, за который уже сообщили «квота кончилась»
@@ -107,6 +128,24 @@ MAX_MESSAGE_LEN = 4000
 MSK = ZoneInfo("Europe/Moscow")
 
 _cycle_lock = threading.Lock()  # второй поток prepare_cycle не допускаем
+
+# Старение очереди: заказ группы приоритета 3, прождавший AGING_HOURS, ставится наравне с группой 2 (но не
+# выше): подходящие заказы не вытесняются навсегда потоком более «приоритетных». Выше группы 1 и
+# выше одной ступени не поднимаем - старый заказ чаще уже закрыт
+AGING_HOURS = 12.0
+AGING_MAX_BOOST = 1.0
+
+
+def _queue_rank(sc: "ScoredOrder", now: datetime) -> float:
+    """Ранг в очереди AI (меньше - раньше): группа приоритета минус бонус за ожидание."""
+    group = priority(sc.order)
+    waited = max(0.0, (now - sc.first_seen).total_seconds() / 3600) if sc.first_seen else 0.0
+    return group - min(AGING_MAX_BOOST, waited / AGING_HOURS)
+
+
+def _eff_group(sc: "ScoredOrder", now: datetime) -> int:
+    """Группа приоритета с учётом старения (для резерва квоты)."""
+    return max(1, math.ceil(_queue_rank(sc, now) - 1e-9))
 
 # order_id -> (ScoredOrder, message_id): отправлены в Telegram, но запись в БД
 # могла не удаться. prepare_cycle исключает эти id, finish_cycle дописывает их.
@@ -136,6 +175,8 @@ class ScoredOrder:
     ai: dict | None          # None = «без AI»
     dedup: str = ""
     attempts: int = 0        # неудачных AI-оценок (и сбоев отправки) подряд
+    queue_reason: str | None = None   # почему не оценён (journal.Q_*)
+    first_seen: datetime | None = None   # когда бот впервые увидел заказ (очередь и старение)
 
     @property
     def fit(self) -> int | None:
@@ -152,7 +193,8 @@ class CycleResult:
     to_send: list[ScoredOrder] = field(default_factory=list)   # прошли оценку («без AI» - нет ключей)
     rejected: list[ScoredOrder] = field(default_factory=list)  # низкий fit: запомнить
     unscored: list[ScoredOrder] = field(default_factory=list)  # не оценены: pending
-    batch_dups: list = field(default_factory=list)  # (ScoredOrder, id оригинала)
+    excluded: dict = field(default_factory=dict)   # {площадка: сколько вакансионных заказов отсеяно}
+    intake: dict = field(default_factory=dict)     # счётчики приёма: new, filtered, duplicate, stale, updated
     new_last_id: int = 0
     raw_count: int = 0
     error: str = ""
@@ -253,7 +295,7 @@ def _feed_store_update(order: FreelanceOrder, status: str) -> None:
     """pending - запомнить полный заказ FL.ru/Kwork, любой другой статус - забыть."""
     if not sources.is_feed_id(order.order_id):
         return
-    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
+    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
     try:
         with _feed_store_lock:
             data = _feed_store_read()
@@ -270,49 +312,78 @@ def _feed_store_update(order: FreelanceOrder, status: str) -> None:
         logging.exception("[FREELANCE] не удалось сохранить описание заказа FL.ru/Kwork")
 
 
+def _parse_seen(value) -> datetime | None:
+    """seen_at в БД - время SQLite (UTC, 'YYYY-MM-DD HH:MM:SS')."""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return _parse_dt(value) if value else None
+
+
+def _age_ref(published: datetime | None, seen_at, unreliable: bool) -> datetime | None:
+    """От чего считать возраст заказа. Дата публикации ненадёжна (alot.pro отдаёт для Kwork время
+    своего сбора) - считаем от первого обнаружения."""
+    if unreliable:
+        return _parse_seen(seen_at) or published
+    return published
+
+
+def _expire_pending(row: dict) -> None:
+    """Заказ не дождался оценки/доставки до предела очереди: состояние «устарел» с причиной."""
+    reason = jr.S_DELIVERY_EXPIRED if row.get("tech") == jr.ASSESSED else jr.S_QUEUE_EXPIRED
+    freelance_mark_stale(row["order_id"], reason)
+
+
 def _load_pending(threshold: datetime, sent_now: set[int],
                   feed_orders: list[FreelanceOrder] | None = None,
-                  fetch_alot: bool = True) -> dict[int, ScoredOrder]:
-    """Pending-заказы из БД: просроченные помечает expired, остальные дозапрашивает.
+                  fetch_alot: bool = True,
+                  have: dict[int, FreelanceOrder] | None = None) -> dict[int, ScoredOrder]:
+    """Ожидающие заказы из БД (ждут оценки или доставки): просроченные помечает устаревшими (с причиной),
+    остальные собирает в очередь.
 
-    Заказы alot.pro дозапрашиваются по id (fetch_alot=False - не трогать alot: выключен или
-    лежит), заказы FL.ru и Kwork берутся из свежей ленты цикла (feed_orders), а выпавшие из
-    ленты - из сохранённых полных заказов (_feed_store_*)."""
-    # Все pending (новые первыми): просроченные помечаем expired, иначе при долгом
-    # простое AI старые строки за пределами лимита висели бы pending
+    Заказ берётся из памяти цикла (have: свежий скан и ленты), иначе alot-заказы дозапрашиваются по id
+    (fetch_alot=False - не трогать alot: выключен или лежит), а выпавшие из ленты FL.ru/Kwork
+    восстанавливаются из сохранённых полных заказов (_feed_store_*)."""
+    # Все ожидающие (новые первыми): просроченные помечаем устаревшими, иначе при долгом простое AI
+    # старые строки за пределами лимита висели бы в очереди
     # Какие источники сейчас обрабатываются. Заказы остальных (выключены; alot лежит) в live не
     # попадают и не занимают лимиты выборки: иначе их очередь вытеснила бы заказы включённых
     # источников, которые истекли бы без оценки при свободной квоте AI. Просроченные закрываем всегда
+    have = have or {}
     active = {n: sources.is_enabled(n) and (n != sources.ALOT or fetch_alot) for n in sources.ALL_SOURCES}
     inactive = [n for n in sources.ALL_SOURCES if not active[n]]
     live: dict[int, dict] = {}
+
+    def _expired(row: dict) -> bool:
+        ref = _age_ref(_parse_dt(row["published_at"]), row.get("seen_at"), bool(row.get("pub_unreliable")))
+        return ref is not None and ref < threshold
+
     if inactive:
         for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive)):
-            published = _parse_dt(row["published_at"])
-            if row["order_id"] not in sent_now and published is not None and published < threshold:
-                freelance_set_status(row["order_id"], "expired")
+            if row["order_id"] not in sent_now and _expired(row):
+                _expire_pending(row)
     for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive), exclude_ranges=True):
         oid = row["order_id"]
         if oid in sent_now:
             continue
-        published = _parse_dt(row["published_at"])
-        if published is not None and published < threshold:
-            freelance_set_status(oid, "expired")
+        if _expired(row):
+            _expire_pending(row)
             continue
         if len(live) < PENDING_FETCH_LIMIT:
             live[oid] = row
     if not live:
         return {}
     items: list[dict] = []
-    ids = sorted((i for i in live if not sources.is_feed_id(i)), reverse=True)  # новые первыми: при сбое сети теряем хвост
+    ids = sorted((i for i in live if not sources.is_feed_id(i) and i not in have), reverse=True)  # новые первыми: при сбое сети теряем хвост
     for i in range(0, len(ids), PENDING_BATCH):
         try:
             items += _fetch_items(ids[i:i + PENDING_BATCH])
         except Exception:
-            # Сеть/alot недоступны: pending остаются в БД и будут запрошены в следующий раз
-            logging.exception("[FREELANCE] не удалось дозапросить pending-заказы")
+            # Сеть/alot недоступны: ожидающие остаются в БД и будут запрошены в следующий раз
+            logging.exception("[FREELANCE] не удалось дозапросить ожидающие заказы")
             break
     fetched = [o for o in (_parse_item(item) for item in items) if o]
+    fetched += [have[i] for i in live if i in have and not sources.is_feed_id(i)]
     # FL.ru/Kwork: заказ из свежей ленты; выпавший из ленты (или лента не получена, или был
     # перезапуск) - полный заказ с описанием из сохранённых. Без описания заказ не оцениваем, он
     # ждёт, пока не истечёт срок. Заказы выключенного источника не берём: они тратили бы квоту AI
@@ -328,14 +399,16 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     fetched += [o for oid, o in feed_by_id.items() if oid in live]
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
-        if order.order_id not in live:
+        if order.order_id not in live or order.order_id in result:
             continue
         row = live[order.order_id]
-        if order.published_at < threshold:
-            freelance_set_status(order.order_id, "expired")
+        ref = _age_ref(order.published_at, row.get("seen_at"), bool(row.get("pub_unreliable")))
+        if ref is not None and ref < threshold:
+            _expire_pending(row)
             continue
-        if not is_candidate(order):
-            freelance_set_status(order.order_id, "rejected")
+        why = reject_reason(order)
+        if why is not None:
+            freelance_mark_filtered(order.order_id, why)
             continue
         ai = None
         if row.get("ai_json"):
@@ -347,9 +420,131 @@ def _load_pending(threshold: datetime, sent_now: set[int],
                 ai = None
         result[order.order_id] = ScoredOrder(
             order, ai, row.get("dedup_key") or norm_dedup_key(order),
-            attempts=int(row.get("attempts") or 0),
+            attempts=int(row.get("attempts") or 0), queue_reason=row.get("queue_reason"),
+            first_seen=_parse_seen(row.get("seen_at")),
         )
+    # без описания (выпал из ленты FL.ru/Kwork, перезапуск): ждёт, причина видна в журнале
+    for oid, row in live.items():
+        if oid not in result and sources.is_feed_id(oid) and row.get("tech") == jr.QUEUED \
+                and row.get("queue_reason") != jr.Q_NO_TEXT:
+            freelance_set_queue_reason(oid, jr.Q_NO_TEXT)
     return result
+
+
+def _full_snippet(o: FreelanceOrder) -> str:
+    """Обезличенный текст заказа для повторной оценки: ровно то, что видит AI."""
+    return ai_scorer.mask_contacts(o.body or "")[:ai_scorer.BODY_LIMIT]
+
+
+def _journal_new(o: FreelanceOrder, tech: str, *, full: bool, **states) -> None:
+    """Первая запись об увиденном заказе. Название в строках без карточки (отсеян, дубль, устарел)
+    маскируется: контакты заказчика в журнал не попадают."""
+    origin = sources.source_of(o.order_id)
+    snippet = _full_snippet(o)
+    if not full:
+        snippet = snippet[:jr.SNIPPET_FILTERED]
+    title = o.title if full else ai_scorer.mask_contacts(o.title or "")
+    freelance_save(
+        o.order_id, o.site, title, o.url, o.price_text, o.published_at.isoformat(),
+        norm_dedup_key(o), None, "", "pending", 0, None,
+        budget=o.price_value if o.price_value and o.price_value > 0 else None,
+        origin=origin, title_key=jr.title_key(o.site, o.title),
+        content_hash=jr.content_hash(o.title, o.body), snippet=snippet,
+        pub_unreliable=jr.pub_unreliable(o.site, origin), tech=tech, **states,
+    )
+
+
+def _find_duplicate(o: FreelanceOrder) -> int | None:
+    """Оригинал, из-за которого заказ не надо оценивать заново. У alot.pro нет ни ссылки, ни id исходной
+    биржи, поэтому «биржа + id» работает только внутри одного источника (order_id уже в БД). Между
+    источниками (alot и прямой FL.ru/Kwork) совпадают биржа и название, а текст сравнивается как
+    вспомогательный признак (journal.same_listing); по одному названию заказы не склеиваются."""
+    origin = sources.source_of(o.order_id)
+    cands = freelance_dup_candidates(jr.title_key(o.site, o.title), DEDUP_DAYS, o.order_id)
+    if not cands:
+        return None
+    new = {"body": jr.norm_text(_full_snippet(o)), "origin": origin, "price": o.price_value or 0,
+           "published_ts": o.published_at.timestamp(), "reliable": not jr.pub_unreliable(o.site, origin)}
+    for c in cands:
+        published = _parse_dt(c.get("published_at"))
+        other = {"body": jr.norm_text(c.get("snippet") or ""), "origin": c.get("origin"),
+                 "price": c.get("price") or 0, "published_ts": published.timestamp() if published else 0,
+                 "reliable": not c.get("unreliable") and published is not None}
+        if jr.same_listing(new, other):
+            return int(c["order_id"])
+    return None
+
+
+def _handle_updated(o: FreelanceOrder, known: dict, stats: dict) -> None:
+    """Заказ уже в журнале, но заказчик мог поправить описание (отпечаток содержимого изменился).
+    Ожидающий оценки возьмёт новый текст сам; отсеянный правилом получает шанс пройти заново; уже
+    оценённый не оценивается повторно, на нём остаётся пометка desc_changed."""
+    old_hash = known.get("content_hash")
+    new_hash = jr.content_hash(o.title, o.body)
+    if not old_hash or old_hash == new_hash:
+        return
+    snippet = _full_snippet(o)
+    stats["updated"] = stats.get("updated", 0) + 1
+    if known.get("tech") == jr.FILTERED and reject_reason(o) is None:
+        freelance_requeue(o.order_id, new_hash, snippet)
+    else:
+        freelance_mark_desc_changed(o.order_id, new_hash, snippet)
+
+
+def _intake(orders, last_id: int,
+            sent_now: set[int]) -> tuple[dict[int, FreelanceOrder], dict, list[FreelanceOrder]]:
+    """Приём всех увиденных заказов: каждый получает объяснимое состояние в журнале. Порядок - от старых
+    к новым, чтобы оригиналом считался первый опубликованный. Возвращает ({order_id: заказ} для
+    дальнейшей работы в памяти, счётчики, новые заказы к оценке). Вакансионные доски строк не получают (их тысячи в сутки),
+    только счётчик; считаются лишь новые за курсором alot (хвост окна скан перечитывает)."""
+    uniq: dict[int, FreelanceOrder] = {}
+    for o in orders:
+        uniq.setdefault(o.order_id, o)
+    known = freelance_known(list(uniq))
+    stats: dict = {"new": 0, "filtered": 0, "duplicate": 0, "stale": 0, "updated": 0, "excluded": {}}
+    new_orders: list[FreelanceOrder] = []
+    reasons: dict[str, int] = {}
+    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
+    for o in sorted(uniq.values(), key=lambda x: (x.published_at, x.order_id)):
+        if o.order_id in sent_now:
+            continue
+        if o.site in EXCLUDED_SITES:
+            if sources.source_of(o.order_id) == sources.ALOT and o.order_id > last_id:
+                stats["excluded"][o.site] = stats["excluded"].get(o.site, 0) + 1
+            continue
+        if o.order_id in known:
+            _handle_updated(o, known[o.order_id], stats)
+            continue
+        origin = sources.source_of(o.order_id)
+        why = reject_reason(o)
+        if why is not None:
+            key = why.split(":", 1)[0]
+            reasons[key] = reasons.get(key, 0) + 1
+            if (o.site == "youdoru" or key == "stop_word") and o.order_id not in _prefilter_logged:
+                if len(_prefilter_logged) >= _PREFILTER_LOG_MAX:
+                    _prefilter_logged.clear()
+                _prefilter_logged.add(o.order_id)
+                title = ai_scorer.mask_contacts(o.title or "")[:80]
+                logging.info(f"[FREELANCE] префильтр: {why}, {o.site} {o.order_id}, {title!r}")
+            _journal_new(o, jr.FILTERED, full=False, reject_reason=why)
+            stats["filtered"] += 1
+            continue
+        if not jr.pub_unreliable(o.site, origin) and o.published_at < threshold:
+            _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
+            stats["stale"] += 1
+            continue
+        dup_of = _find_duplicate(o)
+        if dup_of is not None:
+            _log_dropped(o, f"дубль заказа {dup_of}")
+            _journal_new(o, jr.DUPLICATE, full=False, dup_of=dup_of)
+            stats["duplicate"] += 1
+            continue
+        _journal_new(o, jr.QUEUED, full=True, queue_reason=jr.Q_WAIT)
+        stats["new"] += 1
+        new_orders.append(o)
+    if reasons:
+        logging.info(f"[FREELANCE] префильтр отсеял: {reasons}")
+    return uniq, stats, new_orders
 
 
 _PREFILTER_LOG_MAX = 2000
@@ -480,8 +675,9 @@ def _track_alot_activity(has_new: bool) -> None:
     if direct:
         monitor.notify(
             f"🟢 <b>alot.pro снова отдаёт заказы</b>\n"
-            f"{' и '.join(direct)} дублируют его заказы и тратят квоту AI. Если они больше не нужны: "
-            f"💼 Фриланс → 🔌 Источники."
+            f"{' и '.join(direct)} работают напрямую и обычно быстрее alot.pro. Один и тот же заказ с двух "
+            f"источников определяется до AI и оценивается один раз, квота не тратится дважды; "
+            f"отключать прямые источники из-за восстановления alot.pro не нужно."
         )
 
 
@@ -571,48 +767,22 @@ def _prepare_cycle() -> CycleResult:
     with _sent_lock:
         sent_now = set(_sent_ids)
 
-    # Свежесть, префильтр, уже виденные (заказы всех источников - в одном потоке)
-    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_MAX_AGE_HOURS)
-    fresh = _prefilter(o for o in [*scan.orders, *feed_orders] if o.published_at >= threshold)
-    seen = freelance_seen_ids([o.order_id for o in fresh])
-    fresh = [o for o in fresh if o.order_id not in seen and o.order_id not in sent_now]
+    # Приём: каждый увиденный заказ получает состояние в журнале (отсеян с причиной, дубль с оригиналом,
+    # устарел, ждёт оценки). Свежесть от публикации больше не отбрасывает заказ молча
+    have, intake, new_orders = _intake([*scan.orders, *feed_orders], last_id, sent_now)
+    res.intake = intake
+    res.excluded = intake["excluded"]
+    seen_now = datetime.now(timezone.utc)
+    fresh = [ScoredOrder(o, None, norm_dedup_key(o), queue_reason=jr.Q_WAIT, first_seen=seen_now)
+             for o in new_orders]
 
-    # Pending: alot дозапрашиваем по id (если включён), FL.ru и Kwork берём из ленты этого цикла
-    pending = _load_pending(threshold, sent_now, feed_orders, fetch_alot=alot_ok)
+    # Ожидающие (новые и прежние): alot-заказы из скана берутся из памяти, остальные дозапрашиваются по id,
+    # FL.ru и Kwork - из ленты этого цикла
+    threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
+    pending = _load_pending(threshold, sent_now, feed_orders, fetch_alot=alot_ok, have=have)
     res.pending_loaded = len(pending)
-
-    pool_orders: list[tuple[FreelanceOrder, ScoredOrder | None]] = [(o, None) for o in fresh]
-    pool_orders += [(sc.order, sc) for sc in pending.values()]
-    # новые первыми: по времени публикации (id FL.ru и alot.pro несравнимы), при равенстве по id
-    pool_orders.sort(key=lambda t: (t[0].published_at, t[0].order_id), reverse=True)
-
-    # Дубли: в БД за DEDUP_DAYS и внутри самой выборки
-    keys = {o.order_id: (sc.dedup if sc else norm_dedup_key(o)) for o, sc in pool_orders}
-    known = freelance_dup_keys(list(keys.values()), DEDUP_DAYS)
-    # Для pending: оригинал мог уйти в чат уже после того, как заказ стал pending.
-    # Считаем только реально отправленные, без самих pending (иначе два pending
-    # с одним ключом отбросили бы друг друга)
-    pending_ids = list(pending)
-    known_sent = freelance_dup_keys(
-        [keys[i] for i in pending_ids], DEDUP_DAYS, sent_only=True, exclude_ids=pending_ids
-    ) if pending_ids else set()
-    candidates: list[ScoredOrder] = []
-    first_id: dict[str, int] = {}
-    for o, existing in pool_orders:
-        k = keys[o.order_id]
-        if (existing is None and k in known) or (existing is not None and k in known_sent):
-            # дубль уже отправленного/оценённого заказа: запоминаем сразу
-            # (для pending статус pending меняется на rejected)
-            _log_dropped(o, "дубль отправленного/оценённого")
-            _save_retry(existing or ScoredOrder(o, None, k), "rejected")
-        elif k and k in first_id:
-            # дубль внутри пачки: сохраним в finish_cycle, если оригинал обработан
-            _log_dropped(o, f"дубль заказа {first_id[k]} в этой пачке")
-            res.batch_dups.append((existing or ScoredOrder(o, None, k), first_id[k]))
-        else:
-            if k:
-                first_id[k] = o.order_id
-            candidates.append(existing or ScoredOrder(o, None, k))
+    fresh_ids = {sc.order.order_id for sc in fresh}
+    candidates: list[ScoredOrder] = fresh + [sc for oid, sc in pending.items() if oid not in fresh_ids]
     res.candidates = len(candidates)
 
     # AI-оценка в несколько потоков, новые первыми. Заказ без оценки (лимит, дедлайн,
@@ -622,20 +792,24 @@ def _prepare_cycle() -> CycleResult:
     # Очередь: сначала группа приоритета 1 (см. filters.priority), внутри группы новые первыми.
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
-    to_score.sort(key=lambda sc: (priority(sc.order), -sc.order.published_at.timestamp(),
-                                  -sc.order.order_id))
+    now_ts = datetime.now(timezone.utc)
+    to_score.sort(key=lambda sc: (_queue_rank(sc, now_ts), -sc.order.published_at.timestamp()))
     # Квоты нет ни у кого: не дёргаем провайдеров (каждая попытка была бы «сбоем» и
     # через 3 цикла - ложным «AI не работает»), заказы ждут в pending
     res.quota_out = ai_scorer.quota_exhausted() if to_score else None
+
+    triage_mode = effective_triage_mode()
 
     def _score(item):
         idx, sc = item
         if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
             return _SKIPPED
-        will_score = not res.quota_out and not _quota_reserved(priority(sc.order))
+        will_score = not res.quota_out and not _quota_reserved(_eff_group(sc, now_ts))
         # shadow: быстрая оценка нужна только для сравнения с полной, значит, когда полная будет
-        triage = _triage(sc) if (TRIAGE_MODE == "on" or (TRIAGE_MODE == "shadow" and will_score)) else None
-        if TRIAGE_MODE == "on" and triage is not None and triage <= TRIAGE_REJECT_MAX:
+        shadow_ok = (triage_mode == "shadow" and will_score
+                     and ai_scorer.triage_today() < TRIAGE_SHADOW_MAX_PER_DAY)
+        triage = _triage(sc) if (triage_mode == "on" or shadow_ok) else None
+        if triage_mode == "on" and triage is not None and triage <= TRIAGE_REJECT_MAX:
             return {"fit": triage, "triage": True, "model": f"triage:{ai_scorer.TRIAGE_MODEL}",
                     "summary": "отсеян быстрым фильтром"}
         if not will_score:
@@ -647,7 +821,7 @@ def _prepare_cycle() -> CycleResult:
             return None
         if result is not None:
             _save_scored_now(sc, result)
-        if TRIAGE_MODE == "shadow" and triage is not None and result is not None:
+        if triage_mode == "shadow" and triage is not None and result is not None:
             _log_triage_shadow(sc, triage, result)
         return result
 
@@ -666,6 +840,9 @@ def _prepare_cycle() -> CycleResult:
             if r is _SKIPPED or r is _RESERVED:
                 if r is _RESERVED:
                     res.reserved += 1
+                    sc.queue_reason = jr.Q_NO_QUOTA if res.quota_out else jr.Q_RESERVED
+                else:
+                    sc.queue_reason = jr.Q_WAIT
                 res.unscored.append(sc)
                 continue
             if not (isinstance(r, dict) and r.get("triage")):
@@ -674,6 +851,7 @@ def _prepare_cycle() -> CycleResult:
                 res.ai_attempted += 1
             if r is None:
                 sc.attempts += 1
+                sc.queue_reason = jr.Q_ERROR
                 res.unscored.append(sc)
                 continue
             if r.get("triage"):
@@ -700,7 +878,8 @@ def _prepare_cycle() -> CycleResult:
 
     quota_note = f", квота пуста до {res.quota_out.astimezone(MSK):%H:%M}" if res.quota_out else ""
     logging.info(
-        f"[FREELANCE] скан: {res.raw_count}, pending: {res.pending_loaded}, "
+        f"[FREELANCE] приём: {res.intake}, "
+        f"скан: {res.raw_count}, pending: {res.pending_loaded}, "
         f"кандидатов: {len(candidates)}, к отправке: {len(res.to_send)}, "
         f"отсеяно AI: {len(res.rejected)}, ждут оценки: {len(res.unscored)} "
         f"(из них в резерве квоты: {res.reserved}{quota_note}), "
@@ -748,6 +927,51 @@ def _triage(sc: ScoredOrder) -> int | None:
     return value
 
 
+def triage_evidence() -> dict:
+    """Накопленное сравнение быстрой и полной оценки: {n, good, miss}. Хранится в kv (переживает рестарт)."""
+    try:
+        data = json.loads(kv_get(TRIAGE_EVIDENCE_KEY, "") or "{}")
+        return {k: int(data.get(k) or 0) for k in ("n", "good", "miss")}
+    except (ValueError, TypeError, AttributeError):
+        return {"n": 0, "good": 0, "miss": 0}
+
+
+def _record_triage_evidence(miss: bool, good: bool) -> None:
+    try:
+        with _triage_evidence_lock:
+            ev = triage_evidence()
+            ev["n"] += 1
+            ev["good"] += 1 if good else 0
+            ev["miss"] += 1 if miss else 0
+            kv_set(TRIAGE_EVIDENCE_KEY, json.dumps(ev))
+    except Exception:
+        logging.exception("[TRIAGE] не удалось записать выборку сравнения")
+
+
+def triage_allowed() -> tuple[bool, str]:
+    """Можно ли включать отсекающий триаж: (да/нет, пояснение)."""
+    ev = triage_evidence()
+    if ev["n"] < TRIAGE_MIN_SAMPLE or ev["good"] < TRIAGE_MIN_GOOD:
+        return False, (f"мало данных shadow: оценок {ev['n']} из {TRIAGE_MIN_SAMPLE}, "
+                       f"подходящих {ev['good']} из {TRIAGE_MIN_GOOD}")
+    if ev["miss"]:
+        return False, f"shadow показал пропуски подходящих: {ev['miss']} из {ev['good']}"
+    return True, f"пропусков нет на {ev['n']} оценках ({ev['good']} подходящих)"
+
+
+def effective_triage_mode() -> str:
+    """Режим триажа в этом цикле: запрошенный on без проверки пропусков сводится к shadow."""
+    if TRIAGE_MODE != "on":
+        return TRIAGE_MODE
+    ok, why = triage_allowed()
+    if not ok:
+        if not _triage_warned["on"]:
+            _triage_warned["on"] = True
+            logging.warning(f"[TRIAGE] FREELANCE_TRIAGE=on не применён, остаётся shadow: {why}")
+        return "shadow"
+    return "on"
+
+
 def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict) -> None:
     """Сравнение быстрой и полной оценки (режим shadow): по этим строкам решаем, включать ли триаж."""
     try:
@@ -755,6 +979,7 @@ def _log_triage_shadow(sc: ScoredOrder, triage: int, result: dict) -> None:
     except (KeyError, TypeError, ValueError):
         return
     miss = triage <= TRIAGE_REJECT_MAX and full >= FREELANCE_MIN_FIT
+    _record_triage_evidence(miss, full >= FREELANCE_MIN_FIT)
     title = ai_scorer.mask_contacts(sc.order.title or "")[:60]
     logging.info(f"[TRIAGE] заказ {sc.order.order_id}: быстрая {triage}, полная {full}"
                  f"{' - ПРОПУСТИЛ БЫ ХОРОШИЙ' if miss else ''} {title!r}")
@@ -853,7 +1078,7 @@ def _report_quota_out(res: CycleResult) -> None:
     monitor.notify(
         f"⏸ <b>AI-квота на сегодня кончилась</b> ({now:%H:%M} МСК)\n"
         f"Оценка продолжится ~{res.quota_out.astimezone(MSK):%H:%M} МСК. Заказы ждут оценки "
-        f"{FREELANCE_MAX_AGE_HOURS} ч, сейчас в очереди: {len(res.unscored)}."
+        f"до {FREELANCE_QUEUE_MAX_HOURS} ч после публикации, сейчас в очереди: {len(res.unscored)}."
     )
 
 
@@ -889,16 +1114,38 @@ def _report_yandex_grant(st: dict) -> None:
                    bad_text="внимание", reason=text)
 
 
-def save_order(sc: ScoredOrder, status: str, message_id: int | None = None) -> None:
+def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
+               delivery: str | None = None) -> None:
+    """Запись заказа с тремя независимыми состояниями (journal). status - прежний язык цикла:
+    pending (ждёт оценки или доставки), sent/taken/dismissed (карточка доставлена), rejected (оценён,
+    не доставляется отдельной карточкой). delivery задаёт способ доставки явно (сводка)."""
     o = sc.order
+    ai = sc.ai or {}
+    states: dict = {}
+    if sc.fit is not None:
+        low = sc.fit < FREELANCE_MIN_FIT or bool(ai.get("triage"))
+        states["tech"] = jr.ASSESSED
+        states["verdict"] = jr.V_TRIAGE if ai.get("triage") else (jr.V_LOW if low else jr.V_OK)
+        if status == "pending":
+            states["delivery"] = jr.D_NONE if low else jr.D_PENDING
+    elif status == "pending":
+        states["tech"] = jr.QUEUED
+        states["queue_reason"] = sc.queue_reason or (jr.Q_ERROR if sc.attempts else jr.Q_WAIT)
+    if delivery:
+        states["delivery"] = delivery
+    origin = sources.source_of(o.order_id)
     freelance_save(
         o.order_id, o.site, o.title, o.url, o.price_text,
         o.published_at.isoformat(), sc.dedup, sc.fit,
         json.dumps(sc.ai, ensure_ascii=False) if sc.ai else "",
         status, sc.attempts, message_id,
-        category=(sc.ai or {}).get("category"),
+        category=ai.get("category"),
         budget=o.price_value if o.price_value and o.price_value > 0 else None,
-        hours=(sc.ai or {}).get("hours") or None,
+        hours=ai.get("hours") or None,
+        origin=origin, title_key=jr.title_key(o.site, o.title),
+        content_hash=jr.content_hash(o.title, o.body) if o.body else None,
+        snippet=_full_snippet(o) if o.body else None,
+        pub_unreliable=jr.pub_unreliable(o.site, origin), **states,
     )
     _feed_store_update(o, status)
 
@@ -928,10 +1175,10 @@ def save_sent(sc: ScoredOrder, message_id: int | None) -> bool:
     return False
 
 
-def _save_retry(sc: ScoredOrder, status: str) -> bool:
+def _save_retry(sc: ScoredOrder, status: str, delivery: str | None = None) -> bool:
     for i in range(SAVE_RETRIES):
         try:
-            save_order(sc, status)
+            save_order(sc, status, delivery=delivery)
             return True
         except Exception:
             logging.exception(f"[FREELANCE] запись {status} {sc.order.url} не удалась ({i + 1}/{SAVE_RETRIES})")
@@ -953,8 +1200,14 @@ def finish_cycle(res: CycleResult, sent: list[ScoredOrder], skipped: list[Scored
     """
     done_ids = {sc.order.order_id for sc in sent}
     failed = False
-    for sc in res.rejected + skipped:
+    for sc in res.rejected:
         if _save_retry(sc, "rejected"):
+            done_ids.add(sc.order.order_id)
+        else:
+            failed = True
+    # показанные сводкой «ещё N» - оценены хорошо, доставлены строкой сводки; отвергнутыми AI не считаются
+    for sc in skipped:
+        if _save_retry(sc, "rejected", delivery=jr.D_DIGEST):
             done_ids.add(sc.order.order_id)
         else:
             failed = True
@@ -966,11 +1219,6 @@ def finish_cycle(res: CycleResult, sent: list[ScoredOrder], skipped: list[Scored
         sc.attempts += 1
         if not _save_retry(sc, "pending"):
             failed = True
-
-    # Дубли внутри пачки сохраняем, только если оригинал обработан
-    for dup, orig_id in res.batch_dups:
-        if orig_id in done_ids:
-            _save_retry(dup, "rejected")
 
     # Отправленные, но не записанные ранее: дописываем (защита от дубля)
     with _sent_lock:
@@ -993,6 +1241,10 @@ def finish_cycle(res: CycleResult, sent: list[ScoredOrder], skipped: list[Scored
         current = int(stored) if stored and stored.isdigit() else 0
         if res.new_last_id > current:
             kv_set(LAST_ID_KEY, res.new_last_id)
+            try:   # счётчик вакансионных заказов - вместе с курсором: повторный скан того же окна не удваивает
+                freelance_count_excluded(datetime.now(MSK).date().isoformat(), res.excluded)
+            except Exception:
+                logging.exception("[FREELANCE] не удалось записать счётчик отсеянных площадок")
     elif failed:
         logging.error("[FREELANCE] курсор не сдвинут из-за ошибок записи в БД")
     kv_set("freelance_last_ok", datetime.now(timezone.utc).isoformat())
@@ -1085,6 +1337,33 @@ def _price_note(ai: dict) -> str:
     return ""
 
 
+def _hours_text(hours: float) -> str:
+    if hours < 1:
+        return f"{max(1, round(hours * 60))} мин"
+    if hours < 48:
+        return f"{hours:.0f} ч" if hours >= 10 else f"{hours:.1f}".rstrip("0").rstrip(".") + " ч"
+    return f"{hours / 24:.0f} дн"
+
+
+def _age_line(sc: ScoredOrder, now: datetime | None = None) -> str:
+    """Предупреждение о возрасте: устаревший заказ не выдаём за свежий, актуальность проверяют перед откликом."""
+    o = sc.order
+    if jr.pub_unreliable(o.site, sources.source_of(o.order_id)):
+        return "🕰 дата публикации неизвестна - проверьте, что заказ ещё открыт"
+    age = ((now or datetime.now(timezone.utc)) - o.published_at).total_seconds() / 3600
+    if age > FREELANCE_FRESH_HOURS:
+        return f"🕰 опубликован {_hours_text(age)} назад - не свежий, проверьте, что заказ ещё открыт"
+    return ""
+
+
+def _lag_line(sc: ScoredOrder) -> str:
+    """Через сколько после публикации бот впервые увидел заказ (задержка источника, не очередь AI)."""
+    if sc.first_seen is None or jr.pub_unreliable(sc.order.site, sources.source_of(sc.order.order_id)):
+        return ""
+    lag = (sc.first_seen - sc.order.published_at).total_seconds() / 3600
+    return f"⏱ обнаружен через {_hours_text(max(0.0, lag))} после публикации" if lag * 60 >= 10 else ""
+
+
 def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False) -> str:
     """HTML-сообщение о заказе. По умолчанию короткая карточка; detailed=True добавляет
     вилку цены, расчёт, риск, компоненты и сложность (кнопка «Подробнее»).
@@ -1096,6 +1375,13 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
     t = o.published_at.astimezone(MSK).strftime("%H:%M")
     money = f"💰 {e((o.price_text or 'не указана')[:100])} · 🕒 {t}"
     lines = [f"{fire}💼 <b>{e((o.title or '')[:200])}</b>   [{e(site_name(o.site))}]"]
+    age = _age_line(sc)
+    if age:
+        lines.append(age)
+    if detailed:
+        lag = _lag_line(sc)
+        if lag:
+            lines.append(lag)
     if ai and fit is not None:
         parts = [f"🤖 {fit}/10"]
         hours = _fmt_hours(ai.get("hours"))
