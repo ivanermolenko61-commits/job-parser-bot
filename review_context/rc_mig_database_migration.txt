@@ -1,0 +1,100 @@
+##### ВЫДЕРЖКА (дословно, без правок) | файл: database.py | коммит: 2c19296 | blob: cd3803f0b7c136348d69d637720d44a6a3773112 | строки 380-477 | sha256 фрагмента: 8751cf9f363cfb9058a6a645c7dd18a9683c297c3e0d1b405cff637b9cb0680b
+            published_at TEXT,
+            dedup_key TEXT,
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMP
+        )
+    """)
+    # Миграция: новые колонки добавляем в существующую БД без потери данных
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(freelance_orders)")}
+    if "attempts" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN attempts INTEGER DEFAULT 0")
+    if "message_id" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN message_id INTEGER")
+    if "status" not in cols:
+        conn.execute("ALTER TABLE freelance_orders ADD COLUMN status TEXT")
+        conn.execute(
+            "UPDATE freelance_orders SET status = "
+            "CASE WHEN sent_at IS NOT NULL THEN 'sent' ELSE 'rejected' END"
+        )
+    for col, ddl in (("category", "TEXT"), ("budget", "REAL"),
+                     ("hours", "REAL"), ("deal_price", "REAL")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
+    # Журнал увиденных заказов (freelance/journal.py): три независимых измерения вместо одного status
+    for col, ddl in (
+        ("origin", "TEXT"), ("title_key", "TEXT"), ("content_hash", "TEXT"), ("snippet", "TEXT"),
+        ("pub_unreliable", "INTEGER DEFAULT 0"), ("tech", "TEXT"), ("queue_reason", "TEXT"),
+        ("reject_reason", "TEXT"), ("verdict", "TEXT"), ("dup_of", "INTEGER"), ("delivery", "TEXT"),
+        ("assessed_at", "TEXT"), ("delivered_at", "TEXT"), ("card_deleted_at", "TEXT"),
+        ("stale_at", "TEXT"), ("stale_reason", "TEXT"), ("desc_changed", "INTEGER DEFAULT 0"),
+        ("lead", "TEXT"), ("lead_reason", "TEXT"), ("lead_at", "TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
+    _backfill_journal(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_title_key ON freelance_orders(title_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_tech ON freelance_orders(tech)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_lead ON freelance_orders(lead)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_category ON freelance_orders(category)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fl_status ON freelance_orders(status)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_funnel_daily (
+            day TEXT, site TEXT, reason TEXT, n INTEGER DEFAULT 0,
+            PRIMARY KEY (day, site, reason)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+
+def _backfill_journal(conn) -> None:
+    """Старые строки (до журнала) получают новые измерения из status. Без выдумывания истории:
+    время оценки и удаления карточки неизвестно (NULL / 'unknown'), «rejected» с высоким fit - это
+    сводка «ещё N» либо дубль оценённого, различить нельзя (delivery='unknown'), «rejected» без
+    оценки - tech='legacy' с причиной legacy_unknown. Идемпотентно: трогает только tech IS NULL."""
+    if conn.execute("SELECT 1 FROM freelance_orders WHERE tech IS NULL LIMIT 1").fetchone() is None:
+        return
+    conn.execute(
+        """
+        UPDATE freelance_orders SET
+          origin = CASE WHEN order_id >= 20000000000 THEN 'kwork'
+                        WHEN order_id >= 10000000000 THEN 'flru' ELSE 'alot' END,
+          tech = CASE
+            WHEN status = 'pending' AND fit IS NULL THEN 'queued'
+            WHEN status = 'expired' AND sent_at IS NULL THEN 'stale'
+            WHEN status = 'rejected' AND fit IS NULL THEN 'legacy'
+            WHEN status IN ('pending', 'sent', 'taken', 'dismissed', 'expired', 'rejected') THEN 'assessed'
+            ELSE 'legacy' END,
+          queue_reason = CASE WHEN status = 'pending' AND fit IS NULL
+                              THEN CASE WHEN COALESCE(attempts, 0) > 0 THEN 'ai_error' ELSE 'ai_wait' END END,
+          verdict = CASE WHEN fit IS NULL THEN CASE WHEN sent_at IS NOT NULL THEN 'no_ai' END
+                         WHEN fit < ? THEN 'low_fit' ELSE 'ok' END,
+          delivery = CASE WHEN sent_at IS NOT NULL THEN 'card'
+                          WHEN status = 'pending' AND fit IS NOT NULL THEN 'pending'
+                          WHEN status = 'rejected' AND fit >= ? THEN 'unknown'
+                          ELSE 'none' END,
+          delivered_at = sent_at,
+          lead = CASE status WHEN 'taken' THEN 'agreed' WHEN 'dismissed' THEN 'lost' END,
+          lead_reason = CASE WHEN status = 'dismissed' THEN 'не подходит' END,
+          card_deleted_at = CASE WHEN status = 'expired' AND sent_at IS NOT NULL THEN 'unknown' END,
+          stale_reason = CASE WHEN status = 'expired' AND sent_at IS NULL THEN 'legacy_expired' END,
+          reject_reason = CASE WHEN status = 'rejected' AND fit IS NULL THEN 'legacy_unknown' END
+        WHERE tech IS NULL
+        """,
+        (FREELANCE_MIN_FIT, FREELANCE_MIN_FIT),
+    )
+
+
+##### КОНЕЦ ВЫДЕРЖКИ database.py:380-477

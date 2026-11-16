@@ -1,0 +1,23 @@
+##### ВЫДЕРЖКА (дословно, без правок) | файл: tests/test_journal.py | коммит: 2c19296 | blob: 578cff311c861e75aeba8b2446495bdff94012ab | строки 27-47 | sha256 фрагмента: 48451445c81bb7e68e3e3a1b2c98cdccea9d572c18ebb21b301bc990a8f5b2b7
+def seed_cut_orders(n, start=70000, triage=1):
+    """n заказов с быстрой оценкой <= порога (триаж их отсёк бы) при ТЕКУЩИХ настройках: в БД и в выборке сравнений."""
+    scores = pipeline._load_scores()
+    sig = pipeline._evidence_signature()
+    for i in range(n):
+        oid = start + i
+        database.freelance_save(oid, "flru", f"Отсекаемый заказ {oid}", f"https://x/{oid}", "", "2026-11-16T10:00:00",
+                                f"cut{oid}", 5, "", "pending", 0, None)
+        scores[str(oid)] = [triage, sig]
+    database.kv_set(pipeline.TRIAGE_SCORES_KEY, __import__("json").dumps(scores))
+
+
+def approve_audit(n=None):
+    """Пройти выборку владельца честно: выдача партий и подтверждение каждой по коду (подходящих нет)."""
+    n = n or pipeline.TRIAGE_AUDIT_MIN
+    seed_cut_orders(n)
+    while pipeline.triage_approval()["checked"] < n:
+        batch = pipeline.triage_audit_sample(20)
+        assert batch["rows"], "выборка кончилась раньше времени"
+        pipeline.approve_triage(batch["code"], [])
+
+##### КОНЕЦ ВЫДЕРЖКИ tests/test_journal.py:27-47
