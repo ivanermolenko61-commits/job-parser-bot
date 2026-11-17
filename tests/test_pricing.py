@@ -617,5 +617,27 @@ class ExtraReviewTest(MarketAndCleanupTest):
         self.assertFalse(deal_wait.ambiguous(p, 1, None, now=deal_wait.DEAL_TTL_SEC + 1))
 
 
+class AccuracyTextTest(unittest.TestCase):
+    """«Точность цен»: калибровка часов по фактам не зависит от наличия сделок с ценой (misc F1)."""
+
+    def text(self, actuals):
+        os.environ.setdefault("BOT_TOKEN", "123456:TEST")
+        import bot
+        with mock.patch.object(bot, "freelance_deal_rows", return_value=[]),                 mock.patch.object(bot, "freelance_actuals_rows", return_value=actuals):
+            return bot._accuracy_text()
+
+    def test_no_deals_but_enough_actual_hours_shows_calibration(self):
+        rows = [{"category": "tg_bot", "hours_est": 4.0, "hours_actual": 6.0} for _ in range(pricing.MIN_POINTS)]
+        text = self.text(rows)
+        self.assertIn("Сделок с ценой и расчётом пока нет", text)
+        self.assertIn("Часы по фактам", text)
+        self.assertIn("1.50", text)
+
+    def test_no_deals_and_no_actuals_explains_lack_of_data(self):
+        text = self.text([])
+        self.assertIn("Сделок с ценой и расчётом пока нет", text)
+        self.assertIn("/actual", text)
+
+
 if __name__ == "__main__":
     unittest.main()

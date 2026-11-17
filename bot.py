@@ -835,8 +835,9 @@ def _accuracy_text() -> str:
     rep = pricing.accuracy_report(rows)
     calibration = pricing.hours_calibration(freelance_actuals_rows())
     if not rep["total"]:
-        return ("📊 <b>Точность цен</b>\n\nСделок с ценой и расчётом пока нет. "
+        head = ("📊 <b>Точность цен</b>\n\nСделок с ценой и расчётом пока нет. "
                 "Нажимайте «Взял» и отвечайте, за сколько договорились.")
+        return "\n".join([head] + _calibration_lines(calibration))     # часы по фактам не зависят от цен сделок
     lines = [f"📊 <b>Точность цен</b>\nСделок с расчётом: {rep['total']}\n"]
     for cat, c in sorted(rep["by_category"].items(), key=lambda kv: -kv[1]["n"]):
         direction = "завышаем" if c["bias"] > 0 else "занижаем"
