@@ -1006,8 +1006,9 @@ def freelance_replace_assessment(order_id: int, content_hash: str, fit: int | No
         if row.get("delivery") in (jr.D_CARD, jr.D_DIGEST):
             fields.pop("delivery", None)
             fields.pop("verdict", None)
-        elif delivery is not None:
-            fields["delivery"] = delivery
+        else:
+            if delivery is not None:
+                fields["delivery"] = delivery
             if verdict is not None:
                 fields["verdict"] = verdict
         return True

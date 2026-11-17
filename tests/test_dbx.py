@@ -45,6 +45,25 @@ class AssessmentHistoryTest(CycleTestBase):
         self.assertTrue(database.freelance_replace_assessment(602, "v1", 3, "{}", "script", 2.0))
         self.assertEqual(database.freelance_get(602)["fit"], 3)
 
+    def test_replace_verdict_and_delivery_independent_for_undelivered(self):
+        for oid, kw, exp in ((610, {"verdict": jr.V_LOW}, (jr.D_PENDING, jr.V_LOW)),
+                             (611, {"delivery": jr.D_NONE}, (jr.D_NONE, jr.V_OK)),
+                             (612, {"delivery": jr.D_NONE, "verdict": jr.V_LOW}, (jr.D_NONE, jr.V_LOW))):
+            database.freelance_save(oid, "flru", "Бот", f"https://x/{oid}", "", "2026-11-16T10:00:00", "k", 8, "{}",
+                                    "pending", 0, None, content_hash="v1", tech=jr.ASSESSED,
+                                    delivery=jr.D_PENDING, verdict=jr.V_OK)
+            self.assertTrue(database.freelance_replace_assessment(oid, "v1", 3, "{}", None, None, **kw))
+            row = database.freelance_get(oid)
+            self.assertEqual((row["delivery"], row["verdict"]), exp)
+
+    def test_replace_keeps_delivery_and_verdict_of_card(self):
+        database.freelance_save(613, "flru", "Бот", "https://x/613", "", "2026-11-16T10:00:00", "k", 8, "{}",
+                                "pending", 0, None, content_hash="v1", tech=jr.ASSESSED,
+                                delivery=jr.D_CARD, verdict=jr.V_OK)
+        self.assertTrue(database.freelance_replace_assessment(613, "v1", 3, "{}", None, None, jr.D_NONE, jr.V_LOW))
+        row = database.freelance_get(613)
+        self.assertEqual((row["delivery"], row["verdict"], row["fit"]), (jr.D_CARD, jr.V_OK, 3))
+
     def test_reassess_queue_same_hash_is_idempotent(self):
         self.assertTrue(database.freelance_reassess_queue(603, "h", 0.5, True, 8, 4000))
         self.assertFalse(database.freelance_reassess_queue(603, "h", 0.5, True, 5, 1))
