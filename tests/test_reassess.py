@@ -153,6 +153,57 @@ class SignificantEditTest(ReassessBase):
         res, _ = self.cycle(alot=[order(207, body=NEW_BODY)], score=boom)
         self.assertEqual(res.reassessed, 0)
         self.assertEqual(database.freelance_get(207)["fit"], 8)
+        for _ in range(4):
+            self.cycle(alot=[], score=boom)
+        self.assertEqual(boom.call_count, pipeline.REASSESS_MAX_ATTEMPTS)    # исключение - тоже неудачная попытка
+        self.assertEqual(database.freelance_reassess_state(207)["attempts"], pipeline.REASSESS_MAX_ATTEMPTS)
+        self.assertEqual(database.freelance_get(207)["fit"], 8)
+
+    def test_exception_of_one_order_does_not_block_next(self):
+        titles = {214: "Выгрузка заказов из Wildberries", 215: "Отчёт по остаткам в Google Таблице"}
+        for oid, title in titles.items():
+            self.cycle(alot=[order(oid, title=title)])
+        down = mock.patch.object(pipeline.ai_scorer, "quota_exhausted",
+                                 return_value=datetime(2099, 1, 1, tzinfo=timezone.utc))
+        with down:
+            self.cycle(alot=[order(oid, title=t, body=NEW_BODY + f" {oid}") for oid, t in titles.items()])
+        score = mock.Mock(side_effect=[RuntimeError("сбой"), result(6)])
+        res, _ = self.cycle(alot=[], score=score)
+        self.assertEqual((score.call_count, res.reassessed), (2, 1))
+        self.assertEqual(database.freelance_reassess_state(214)["attempts"], 1)
+
+    def test_quota_is_rechecked_before_each_order(self):
+        titles = {216: "Выгрузка заказов из Wildberries", 217: "Отчёт по остаткам в Google Таблице"}
+        for oid, title in titles.items():
+            self.cycle(alot=[order(oid, title=title)])
+        down = mock.patch.object(pipeline.ai_scorer, "quota_exhausted",
+                                 return_value=datetime(2099, 1, 1, tzinfo=timezone.utc))
+        with down:
+            self.cycle(alot=[order(oid, title=t, body=NEW_BODY + f" {oid}") for oid, t in titles.items()])
+        spent = {"v": False}
+
+        def one_call(_order):
+            spent["v"] = True
+            return result(6)
+        score = mock.Mock(side_effect=one_call)
+        with mock.patch.object(pipeline.ai_scorer, "quota_exhausted",
+                               side_effect=lambda: datetime(2099, 1, 1, tzinfo=timezone.utc) if spent["v"] else None):
+            self.cycle(alot=[], score=score)
+        self.assertEqual(score.call_count, 1)
+        pending = [database.freelance_reassess_state(o)["status"] for o in titles]
+        self.assertEqual(sorted(pending), ["done", "pending"])
+
+    def test_minor_edit_after_pending_significant_edit_still_reassessed(self):
+        self.cycle(alot=[order(218)])
+        down = mock.patch.object(pipeline.ai_scorer, "quota_exhausted",
+                                 return_value=datetime(2099, 1, 1, tzinfo=timezone.utc))
+        with down:
+            self.cycle(alot=[order(218, body=NEW_BODY)])
+            self.cycle(alot=[order(218, body=NEW_BODY + " Спасибо.")])      # B -> C: мелочь
+        state = database.freelance_reassess_state(218)
+        self.assertEqual((state["status"], state["significant"], state["old_fit"]), ("pending", 1, 8))
+        res, score = self.cycle(alot=[])
+        self.assertEqual((score.call_count, res.reassessed), (1, 1))
 
     def test_per_cycle_limit(self):
         titles = {211: "Выгрузка заказов из Wildberries", 212: "Отчёт по остаткам в Google Таблице",

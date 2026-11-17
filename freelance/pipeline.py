@@ -588,6 +588,9 @@ def _queue_reassess(order_id: int, new_hash: str, old_snippet: str, new_snippet:
     """Оценённый заказ получил новое описание: запись о повторной оценке (оценка прежняя до её выполнения)."""
     try:
         similarity, significant = _text_change(old_snippet, new_snippet)
+        waiting = freelance_reassess_state(order_id)
+        if waiting and waiting.get("status") == "pending" and waiting.get("significant"):
+            significant = True      # незавершённая существенная правка не отменяется мелкой последующей
         row = freelance_get(order_id) or {}
         try:
             ai = json.loads(row.get("ai_json") or "{}")
@@ -1008,9 +1011,9 @@ def _reassess_changed(res: CycleResult) -> None:
     квоты хватает: не больше REASSESS_PER_CYCLE за цикл, не больше REASSESS_MAX_ATTEMPTS попыток на версию текста.
     Любой сбой не должен ломать цикл."""
     try:
-        if not ai_scorer.is_enabled() or ai_scorer.quota_exhausted() or _quota_reserved(3):
-            return
         for row in freelance_reassess_pending(REASSESS_PER_CYCLE, REASSESS_MAX_ATTEMPTS):
+            if not ai_scorer.is_enabled() or ai_scorer.quota_exhausted() or _quota_reserved(3):
+                return      # квота проверяется перед каждым заказом: запись остаётся pending
             try:
                 _reassess_one(res, row)
             except Exception:
@@ -1040,9 +1043,13 @@ def _reassess_one(res: CycleResult, row: dict) -> None:
             order_id=oid, site=cur.get("site") or "", title=cur.get("title") or "", body=cur.get("snippet") or "",
             price_text=cur.get("price_text") or "", price_value=0.0, categories=[],
             published_at=_parse_dt(cur.get("published_at")) or datetime.now(timezone.utc), url=cur.get("url") or "")
-        result = ai_scorer.score_order(order)
+        try:
+            result = ai_scorer.score_order(order)
+        except Exception:
+            logging.exception(f"[FREELANCE] повторная оценка заказа {oid}: сбой AI")
+            result = None
         if result is None:
-            freelance_reassess_attempt(oid, version)
+            freelance_reassess_attempt(oid, version)     # и пустой ответ, и исключение - неудачная попытка версии
             return
         sc = ScoredOrder(order, dict(result), cur.get("dedup_key") or "")
         _ensure_price(sc)
