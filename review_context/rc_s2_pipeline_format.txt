@@ -1,5 +1,7 @@
 Дословные выдержки (без изменений) для проверки: карточка заказа (ScoredOrder, format_order и помощники) для tests/test_pricing.py
 Файл: freelance/pipeline.py; коммит: e83d659; blob: 74b473a7e533bb3442c7a62fbfb04e8a4c9aac4f
+НЕ выдержка (поправка к выдержке, сокращено ради лимита запроса): из блока строк 1720-2008 опущены функции _hours_text, _age_line, _lag_line и format_order_plain
+(возраст/задержка и запасной формат без HTML; tests/test_pricing.py их не проверяет). sha256 блока относится к полному тексту. Остальной текст дословный.
 --- freelance/pipeline.py, строки 222-241, sha256 38ad3b877763
 class ScoredOrder:
     order: FreelanceOrder
@@ -178,33 +180,6 @@ def _price_note(ai: dict) -> str:
     return ""
 
 
-def _hours_text(hours: float) -> str:
-    if hours < 1:
-        return f"{max(1, round(hours * 60))} мин"
-    if hours < 48:
-        return f"{hours:.0f} ч" if hours >= 10 else f"{hours:.1f}".rstrip("0").rstrip(".") + " ч"
-    return f"{hours / 24:.0f} дн"
-
-
-def _age_line(sc: ScoredOrder, now: datetime | None = None) -> str:
-    """Предупреждение о возрасте: устаревший заказ не выдаём за свежий, актуальность проверяют перед откликом."""
-    o = sc.order
-    if jr.pub_unreliable(o.site, sources.source_of(o.order_id)):
-        return "🕰 дата публикации неизвестна - проверьте, что заказ ещё открыт"
-    age = ((now or datetime.now(timezone.utc)) - o.published_at).total_seconds() / 3600
-    if age > FREELANCE_FRESH_HOURS:
-        return f"🕰 опубликован {_hours_text(age)} назад - не свежий, проверьте, что заказ ещё открыт"
-    return ""
-
-
-def _lag_line(sc: ScoredOrder) -> str:
-    """Через сколько после публикации бот впервые увидел заказ (задержка источника, не очередь AI)."""
-    if sc.first_seen is None or jr.pub_unreliable(sc.order.site, sources.source_of(sc.order.order_id)):
-        return ""
-    lag = (sc.first_seen - sc.order.published_at).total_seconds() / 3600
-    return f"⏱ обнаружен через {_hours_text(max(0.0, lag))} после публикации" if lag * 60 >= 10 else ""
-
-
 def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False) -> str:
     """HTML-сообщение о заказе. По умолчанию короткая карточка; detailed=True добавляет
     вилку цены, расчёт, риск, компоненты и сложность (кнопка «Подробнее»).
@@ -298,17 +273,3 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
             return format_order(sc, compact=True)
         return format_order_plain(sc)  # HTML резать нельзя: сломаются теги
     return text
-
-
-def format_order_plain(sc: ScoredOrder) -> str:
-    """Запасной формат без HTML: название, цена, ссылка (и оценка, если есть)."""
-    o = sc.order
-    t = o.published_at.astimezone(MSK).strftime("%H:%M")
-    lines = [
-        f"💼 {(o.title or '')[:200]}   [{site_name(o.site)}]",
-        f"💰 {(o.price_text or 'не указана')[:100]} · 🕒 {t}",
-    ]
-    fit = sc.fit
-    lines.append(f"🤖 {fit}/10" if fit is not None else "🤖 без AI")
-    lines.append(f"🔗 {o.url}")
-    return "\n".join(lines)[:MAX_MESSAGE_LEN]
