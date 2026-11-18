@@ -1,7 +1,7 @@
 """Ф08: действия с лидом (этапы, следующее действие, напоминание, отмена) поверх БД и метки триажа.
 
 Единственное место, где состояние лида и разметка триажа меняются вместе: каждое действие и каждая отмена
-пересчитывают метку заказа по итоговому состоянию (правило - journal.lead_label). Бот (кнопки, /lead_<id>,
+пересчитывают метку заказа по итоговому состоянию и истории решений (journal.lead_label). Бот (кнопки, /lead_<id>,
 /next) вызывает только эти функции. Заказчикам ничего не отправляется: здесь нет сетевых вызовов.
 """
 from datetime import datetime, timedelta, timezone
@@ -47,13 +47,11 @@ def default_next(lead: str, now: datetime | None = None) -> tuple[str | None, st
     return text, to_sql(_utc(now) + timedelta(days=days))
 
 
-def _relabel(order_id: int, res: dict) -> dict:
+def _relabel(order_id: int, res: dict, old_label: str | None) -> dict:
     """Метка триажа по состоянию ДО и ПОСЛЕ действия (при отмене - так же, по итоговому состоянию)."""
     if res.get("ok") and res.get("changed"):
-        before, after = res["before"], res["after"]
         res["label"] = pipeline.retarget_triage_label(
-            order_id, jr.lead_label(before.get("lead"), before.get("lead_reason")),
-            jr.lead_label(after.get("lead"), after.get("lead_reason")))
+            order_id, old_label, database.freelance_lead_label(order_id))
     return res
 
 
@@ -63,14 +61,16 @@ def set_stage(order_id: int, lead: str, reason: str | None = None, now: datetime
     плюс label ('good'/'bad'/'miss'/'removed'/None)."""
     now = _utc(now)
     text, remind = default_next(lead, now)
+    old_label = database.freelance_lead_label(order_id)
     res = database.freelance_lead_stage(order_id, lead, reason, next_action=text, remind_at=remind, now=to_sql(now))
-    return _relabel(order_id, res)
+    return _relabel(order_id, res, old_label)
 
 
 def undo(order_id: int, now: datetime | None = None) -> dict:
     """«↩️ Отменить последнее» / «↩️ Вернуть»: возврат состояния и пересчёт метки. Нечего отменять -
     {'ok': False, 'reason': 'nothing'}."""
-    return _relabel(order_id, database.freelance_lead_undo(order_id, now=to_sql(_utc(now))))
+    old_label = database.freelance_lead_label(order_id)
+    return _relabel(order_id, database.freelance_lead_undo(order_id, now=to_sql(_utc(now))), old_label)
 
 
 def set_next(order_id: int, text: str | None, now: datetime | None = None) -> dict:

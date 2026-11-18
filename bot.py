@@ -42,6 +42,7 @@ from database import (
     freelance_get,
     freelance_last_deal_price,
     freelance_lead_events,
+    freelance_lead_can_undo,
     freelance_lead_get,
     freelance_leads_active,
     freelance_leads_closed,
@@ -844,16 +845,16 @@ async def msg_deal_price(message: Message, deal_key: tuple[int, int] | None):
             prev = await asyncio.to_thread(freelance_last_deal_price, order_id)
             row = await asyncio.to_thread(freelance_get, order_id) or {}
             if prev and not row.get("deal_price") and row.get("lead") in jr.LEAD_PRICE_STAGES:
-                await asyncio.to_thread(freelance_set_deal_price, order_id, prev)
-                await message.answer(f"Ок, оставил прежнюю цену: {lv.money(prev)}.")
-                return
+                if await asyncio.to_thread(freelance_set_deal_price, order_id, prev, require_price_stage=True):
+                    await message.answer(f"Ок, оставил прежнюю цену: {lv.money(prev)}.")
+                    return
         except Exception:
             logging.exception("[FREELANCE] deal_price skip")
         await message.answer("Ок, цену не записываю.")
         return
     try:
-        ok = await asyncio.to_thread(freelance_set_deal_price, order_id, deal_wait.parse_deal(text))
-        await message.answer("✅ Записано." if ok else "⚠️ Заказ не найден в базе, цену записать не удалось.")
+        ok = await asyncio.to_thread(freelance_set_deal_price, order_id, deal_wait.parse_deal(text), require_price_stage=True)
+        await message.answer("✅ Записано." if ok else "⚠️ Заказ не найден или этап сделки изменился. Цену не записал.")
     except Exception:
         logging.exception("[FREELANCE] deal_price")
         await message.answer("⚠️ Не удалось записать цену, подробности в логе.")
@@ -1072,6 +1073,8 @@ async def _order_stage_action(call: CallbackQuery, stage: str, notice: str) -> N
         if not res.get("ok"):
             await call.answer(NOT_SAVED_YET, show_alert=True)
             return
+        if res.get("changed"):
+            deal_wait.drop_order(_pending_deals, order_id)
         await _render_order_card(call, order_id, _is_detailed(call), notice)
     except Exception:
         await _answer_error(call, f"fl_{stage}")
@@ -1137,9 +1140,9 @@ def _lead_card_data(order_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     lead = freelance_lead_get(order_id)
     if lead is None:
         return None
-    events = freelance_lead_events(order_id, 20)
+    events = freelance_lead_events(order_id, lv.EVENT_LIMIT)
     text = lv.lead_card_text(lead, events, freelance_last_deal_price(order_id))
-    return text, _kb(lv.lead_card_buttons(lead, events))
+    return text, _kb(lv.lead_card_buttons(lead, events, undo_available=freelance_lead_can_undo(order_id)))
 
 
 async def _show_lead_card(target: Message | CallbackQuery, order_id: int, edit: bool) -> bool:
@@ -1235,6 +1238,8 @@ async def cb_fl_stage(call: CallbackQuery):
         if not res.get("ok"):
             await call.answer("Заказ не найден")
             return
+        if res.get("changed"):
+            deal_wait.drop_order(_pending_deals, order_id)
         await call.answer(f"Этап: {lv.stage_label(stage)}")
         await _show_lead_card(call, order_id, edit=True)
         if stage == jr.LEAD_AGREED and res.get("changed"):
@@ -1318,6 +1323,8 @@ async def cb_fl_undo(call: CallbackQuery):
             await call.answer("Некорректная кнопка")
             return
         res = await asyncio.to_thread(leads.undo, order_id)
+        if res.get("ok") and res.get("undone_kind") == "stage":
+            deal_wait.drop_order(_pending_deals, order_id)
         await call.answer("Отменено" if res.get("ok") else "Нечего отменять")
         await _show_lead_card(call, order_id, edit=True)
     except Exception:

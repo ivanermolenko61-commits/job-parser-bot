@@ -69,6 +69,7 @@ class PartialStreakTest(unittest.TestCase):
         p = self.pipeline
         with mock.patch.object(p, "fetch_new_orders", return_value=scan), \
                 mock.patch.object(p, "_load_pending", return_value={}), \
+                mock.patch.object(p, "_fetch_feed_orders", return_value=[]), \
                 mock.patch.object(p.monitor, "record") as rec:
             p._prepare_cycle()
         return [c for c in rec.call_args_list if c.args and c.args[0] == "alot"][-1]

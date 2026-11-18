@@ -147,6 +147,60 @@ class LeadCardHandlersTest(BotBase):
         run(bot.cb_fl_stage(c))
         c.message.answer.assert_not_awaited()
 
+    def test_undo_and_backwards_stage_invalidate_price_question(self):
+        for oid in (1, 2):
+            run(bot.cb_fl_stage(make_call(f"fl_st:{oid}:agreed")))
+            key = next(k for k, v in bot._pending_deals.items() if v[0] == oid)
+            if oid == 1:
+                run(bot.cb_fl_undo(make_call(f"fl_undo:{oid}")))
+            else:
+                run(bot.cb_fl_stage(make_call(f"fl_st:{oid}:saved")))
+            self.assertNotIn(key, bot._pending_deals)
+            run(bot.msg_deal_price(make_message("9000"), key))
+            self.assertIsNone(row(oid)["deal_price"])
+
+    def test_order_card_early_actions_invalidate_price_question(self):
+        for oid, handler, action in ((1, bot.cb_fl_save, "fl_save"), (2, bot.cb_fl_apply, "fl_apply")):
+            run(bot.cb_fl_stage(make_call(f"fl_st:{oid}:agreed")))
+            run(handler(make_call(f"{action}:{oid}")))
+            self.assertFalse(any(v[0] == oid for v in bot._pending_deals.values()))
+            self.assertIsNone(row(oid)["deal_price"])
+
+    def test_stale_pending_price_cannot_write_after_stage_change(self):
+        for reply in ("9000", "/skip"):
+            with self.subTest(reply=reply):
+                leads.set_stage(1, jr.LEAD_AGREED)
+                database.freelance_set_deal_price(1, 7000)
+                leads.set_stage(1, jr.LEAD_SAVED)
+                # Simulate an in-flight answer or stale pending entry from an earlier question.
+                deal_wait.add(bot._pending_deals, CHAT, 555, 1)
+                run(bot.msg_deal_price(make_message(reply), (CHAT, 555)))
+                self.assertIsNone(row(1)["deal_price"])
+
+    def test_price_answer_and_skip_restore_previous_price(self):
+        run(bot.cb_fl_stage(make_call("fl_st:1:agreed")))
+        run(bot.msg_deal_price(make_message("9000"), (CHAT, 555)))
+        self.assertEqual(row(1)["deal_price"], 9000)
+        run(bot.cb_fl_stage(make_call("fl_st:1:saved")))
+        run(bot.cb_fl_stage(make_call("fl_st:1:agreed")))
+        run(bot.msg_deal_price(make_message("/skip"), (CHAT, 555)))
+        self.assertEqual(row(1)["deal_price"], 9000)
+
+    def test_undo_button_survives_long_history_of_undone_events(self):
+        leads.set_stage(1, jr.LEAD_SAVED)
+        for n in range(10):
+            leads.set_next(1, str(n))
+        for _ in range(10):
+            leads.undo(1)
+        self.assertFalse(bot.lv.can_undo(database.freelance_lead_events(1, 20)))
+        _, kb = bot._lead_card_data(1)
+        buttons = [b.callback_data for r in kb.inline_keyboard for b in r]
+        self.assertIn("fl_undo:1", buttons)
+        run(bot.cb_fl_undo(make_call("fl_undo:1")))
+        self.assertIsNone(row(1)["lead"])
+        _, kb = bot._lead_card_data(1)
+        self.assertNotIn("fl_undo:1", [b.callback_data for r in kb.inline_keyboard for b in r])
+
     def test_reasons_remind_and_undo_handlers(self):
         leads.set_stage(1, jr.LEAD_APPLIED)
         run(bot.cb_fl_lost_reason(make_call("fl_lr:1:1")))

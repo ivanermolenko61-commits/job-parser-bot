@@ -842,11 +842,13 @@ def freelance_set_status(order_id: int, status: str) -> bool:
     return freelance_get(order_id) is not None
 
 
-def freelance_set_deal_price(order_id: int, price: float | None) -> bool:
-    """Записывает цену, о которой договорились (None - сбросить). True, если заказ найден."""
+def freelance_set_deal_price(order_id: int, price: float | None, *, require_price_stage: bool = False) -> bool:
+    """Цена сделки (None - сброс). require_price_stage атомарно отклоняет ответ на раннем этапе.
+    Без флага сохраняет совместимость старого API; True означает, что строка обновлена."""
+    stage_guard = " AND lead IN ('agreed', 'done')" if require_price_stage else ""
     with _connect() as conn:
         cur = conn.execute(
-            "UPDATE freelance_orders SET deal_price = ? WHERE order_id = ?",
+            "UPDATE freelance_orders SET deal_price = ? WHERE order_id = ?" + stage_guard,
             (price, order_id),
         )
         return cur.rowcount > 0
@@ -982,6 +984,36 @@ def freelance_lead_undo(order_id: int, now: str | None = None) -> dict:
         res = _lead_write(conn, row, "undo", changes, ev["kind"], now)
         res["undone_kind"] = ev["kind"]
         return res
+
+
+def freelance_lead_can_undo(order_id: int) -> bool:
+    """Наличие отмены независимо от ограничения отображаемой истории."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM freelance_lead_events WHERE order_id = ? AND undone = 0 "
+            "AND kind != 'undo' LIMIT 1", (order_id,)).fetchone() is not None
+
+
+def freelance_lead_label(order_id: int) -> str | None:
+    """Отказ по экономике сохраняет последнее решение о профиле, в том числе после отмены."""
+    with _connect() as conn:
+        row = _lead_row(conn, order_id)
+        if row is None:
+            return None
+        if row.get("lead") != jr.LEAD_LOST or row.get("lead_reason") in (
+                jr.LOST_NOT_MY_PROFILE, jr.LOST_LEGACY):
+            return jr.lead_label(row.get("lead"), row.get("lead_reason"))
+        event = conn.execute(
+            "SELECT to_lead, reason FROM freelance_lead_events WHERE order_id = ? "
+            "AND kind = 'stage' AND undone = 0 AND (to_lead != 'lost' OR reason IN (?, ?)) "
+            "ORDER BY id DESC LIMIT 1", (order_id, jr.LOST_NOT_MY_PROFILE, jr.LOST_LEGACY)).fetchone()
+        if event is not None:
+            return jr.lead_label(event["to_lead"], event["reason"])
+        # Старое решение может предшествовать журналу; исходный снимок сохраняется после отмены.
+        first = conn.execute(
+            "SELECT from_lead, prev_reason FROM freelance_lead_events WHERE order_id = ? "
+            "AND kind = 'stage' ORDER BY id LIMIT 1", (order_id,)).fetchone()
+        return jr.lead_label(first["from_lead"], first["prev_reason"]) if first else None
 
 
 def freelance_lead_events(order_id: int, limit: int = 3) -> list[dict]:

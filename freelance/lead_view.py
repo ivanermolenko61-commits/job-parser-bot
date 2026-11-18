@@ -159,7 +159,7 @@ def lead_card_text(lead: dict, events: list[dict], prev_price: float | None = No
     return "\n".join(lines)
 
 
-def lead_card_buttons(lead: dict, events: list[dict]) -> list[list[Btn]]:
+def lead_card_buttons(lead: dict, events: list[dict], *, undo_available: bool | None = None) -> list[list[Btn]]:
     """Кнопки карточки лида: следующие этапы, отказ с причиной, напоминание, отмена последнего."""
     oid, stage = lead["order_id"], lead.get("lead")
     rows: list[list[Btn]] = []
@@ -174,7 +174,7 @@ def lead_card_buttons(lead: dict, events: list[dict]) -> list[list[Btn]]:
     if tail:
         rows.append(tail)
     bottom = []
-    if can_undo(events):
+    if (can_undo(events) if undo_available is None else undo_available):
         bottom.append(Btn("↩️ Отменить последнее", f"fl_undo:{oid}"))
     if lead.get("url"):
         bottom.append(Btn("🔗 Открыть", url=lead["url"]))

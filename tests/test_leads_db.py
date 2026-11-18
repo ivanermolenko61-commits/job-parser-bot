@@ -354,17 +354,84 @@ class TriageLabelTest(CycleTestBase):
         ev = ev_snapshot()
         self.assertEqual((ev["lab_good"], ev["lab_miss"], ev["lab_bad"]), (0, 0, 0))
 
-    def test_other_lost_reason_removes_label_and_not_my_profile_flips_it(self):
+    def test_other_lost_reason_preserves_label_and_not_my_profile_flips_it(self):
         self.seed_score(1, 7)
         base = ev_snapshot()
         leads.set_stage(1, jr.LEAD_APPLIED, now=NOW)                       # good
-        self.assertEqual(leads.set_stage(1, jr.LEAD_LOST, "мало денег", NOW)["label"], "removed")
-        self.assertEqual(ev_snapshot(), base)
+        good = ev_snapshot()
+        self.assertIsNone(leads.set_stage(1, jr.LEAD_LOST, "мало денег", NOW)["label"])
+        self.assertEqual(ev_snapshot(), good)
         self.assertEqual(leads.set_stage(1, jr.LEAD_LOST, jr.LOST_NOT_MY_PROFILE, NOW)["label"], "bad")
         self.assertEqual(ev_snapshot()["lab_bad"], base["lab_bad"] + 1)
         self.assertEqual(leads.set_stage(1, jr.LEAD_APPLIED, now=NOW)["label"], "good")   # bad -> good
         ev = ev_snapshot()
         self.assertEqual((ev["lab_good"], ev["lab_bad"]), (base["lab_good"] + 1, base["lab_bad"]))
+
+    def test_economic_refusals_preserve_missed_good_and_undo_back_to_unlabeled(self):
+        self.seed_score(1, 1)
+        base = ev_snapshot()
+        leads.set_stage(1, jr.LEAD_SAVED, now=NOW)
+        leads.set_stage(1, jr.LEAD_APPLIED, now=NOW)
+        good = ev_snapshot()
+        self.assertEqual((good["lab_good"], good["lab_miss"]), (1, 1))
+        for reason in jr.LOST_REASONS[1:]:
+            with self.subTest(reason=reason):
+                leads.set_stage(1, jr.LEAD_LOST, reason, NOW)
+                self.assertEqual(ev_snapshot(), good)
+                # Repeating the refusal and changing its reason cannot add another label.
+                leads.set_stage(1, jr.LEAD_LOST, reason, NOW)
+                self.assertEqual(ev_snapshot(), good)
+        for _ in jr.LOST_REASONS[1:]:
+            leads.undo(1, NOW)
+            self.assertEqual(ev_snapshot(), good)
+        leads.undo(1, NOW)  # applied -> saved
+        self.assertEqual(ev_snapshot(), base)
+        leads.undo(1, NOW)
+        self.assertEqual(ev_snapshot(), base)
+
+    def test_neutral_refusal_preserves_bad_and_undo_restores_previous_good(self):
+        self.seed_score(1, 1)
+        leads.set_stage(1, jr.LEAD_APPLIED, now=NOW)
+        good = ev_snapshot()
+        leads.set_stage(1, jr.LEAD_LOST, jr.LOST_REASONS[1], NOW)
+        leads.set_stage(1, jr.LEAD_LOST, jr.LOST_NOT_MY_PROFILE, NOW)
+        bad = ev_snapshot()
+        self.assertEqual((bad["lab_good"], bad["lab_bad"], bad["lab_miss"]), (0, 1, 0))
+        leads.set_stage(1, jr.LEAD_LOST, jr.LOST_REASONS[2], NOW)
+        self.assertEqual(ev_snapshot(), bad)
+        leads.undo(1, NOW)
+        self.assertEqual(ev_snapshot(), bad)
+        leads.undo(1, NOW)
+        self.assertEqual(ev_snapshot(), good)
+
+    def test_neutral_refusal_without_decision_stays_unlabeled(self):
+        self.seed_score(1, 1)
+        base = ev_snapshot()
+        leads.set_stage(1, jr.LEAD_SAVED, now=NOW)
+        leads.set_stage(1, jr.LEAD_LOST, jr.LOST_REASONS[1], NOW)
+        self.assertEqual(ev_snapshot(), base)
+        leads.set_stage(1, jr.LEAD_APPLIED, now=NOW)
+        leads.undo(1, NOW)
+        self.assertEqual(ev_snapshot(), base)
+
+    def test_legacy_profile_decision_survives_neutral_refusal(self):
+        self.seed_score(1, 1)
+        database.freelance_set_lead(1, jr.LEAD_APPLIED)
+        pipeline.record_triage_label(1, suitable=True)
+        good = ev_snapshot()
+        leads.set_stage(1, jr.LEAD_LOST, jr.LOST_REASONS[1], NOW)
+        self.assertEqual(ev_snapshot(), good)
+        leads.undo(1, NOW)
+        self.assertEqual(ev_snapshot(), good)
+
+    def test_guarded_price_write_rejects_early_stage(self):
+        save(1)
+        self.assertFalse(database.freelance_set_deal_price(1, 9000, require_price_stage=True))
+        leads.set_stage(1, jr.LEAD_AGREED, now=NOW)
+        self.assertTrue(database.freelance_set_deal_price(1, 9000, require_price_stage=True))
+        leads.undo(1, NOW)
+        self.assertFalse(database.freelance_set_deal_price(1, 9000, require_price_stage=True))
+        self.assertIsNone(database.freelance_get(1)["deal_price"])
 
     def test_progress_between_good_stages_does_not_double_count(self):
         self.seed_score(1, 7)
