@@ -41,6 +41,38 @@ LEAD_SAVED, LEAD_APPLIED, LEAD_DISCUSSING, LEAD_AGREED, LEAD_DONE, LEAD_LOST = (
     "saved", "applied", "discussing", "agreed", "done", "lost")
 LEAD_STAGES = (LEAD_SAVED, LEAD_APPLIED, LEAD_DISCUSSING, LEAD_AGREED, LEAD_DONE, LEAD_LOST)
 LEAD_ACTIVE = (LEAD_SAVED, LEAD_APPLIED, LEAD_DISCUSSING, LEAD_AGREED)
+# цена сделки (deal_price) осмысленна только на этих этапах; при уходе с них обнуляется
+LEAD_PRICE_STAGES = (LEAD_AGREED, LEAD_DONE)
+LEAD_TEXT_MAX = 300   # предел текста следующего действия и причины отказа
+
+# Причины отказа (lead_reason при lead=lost). «не подходит» - причина кнопки «Не подходит» и старой записи
+LOST_NOT_MY_PROFILE = "не мой профиль"
+LOST_LEGACY = "не подходит"
+LOST_REASONS = (LOST_NOT_MY_PROFILE, "мало денег", "заказчик пропал", "выбрали другого", "сам отказался", "другое")
+
+# Следующее действие и срок напоминания (дней) по умолчанию при смене этапа; у done/lost снимаются
+LEAD_DEFAULT_NEXT = {
+    LEAD_SAVED: ("откликнуться", 1),
+    LEAD_APPLIED: ("проверить ответ", 2),
+    LEAD_DISCUSSING: ("ответить/уточнить ТЗ", 1),
+    LEAD_AGREED: ("сдать работу", 3),
+}
+
+# Метки быстрого триажа (разметка владельца): good - «подходит», bad - «не подходит», None - метки нет
+LABEL_GOOD, LABEL_BAD = "good", "bad"
+_LABEL_GOOD_STAGES = (LEAD_APPLIED, LEAD_DISCUSSING, LEAD_AGREED, LEAD_DONE)
+
+
+def lead_label(lead: str | None, reason: str | None = None) -> str | None:
+    """Метка триажа по итоговому состоянию лида. «Сохранён» - интерес, не решение: без метки.
+    Отклик и все этапы дальше (включая старый «Взял» = agreed) - «подходит». Отказ с причиной «не мой профиль»
+    и кнопка «Не подходит» - «не подходит»; отказ по другой причине (деньги, заказчик, другой исполнитель...)
+    о профиле ничего не говорит и метку не ставит."""
+    if lead in _LABEL_GOOD_STAGES:
+        return LABEL_GOOD
+    if lead == LEAD_LOST and reason in (LOST_NOT_MY_PROFILE, LOST_LEGACY):
+        return LABEL_BAD
+    return None
 
 # Тело короче этого (в нормализованных символах) не позволяет судить о дубле по тексту:
 # «Нужен сайт» с пустым описанием у двух разных заказчиков - два разных заказа

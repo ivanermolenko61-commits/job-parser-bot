@@ -1270,6 +1270,55 @@ def record_triage_label(order_id: int, suitable: bool) -> str | None:
         return None
 
 
+def retarget_triage_label(order_id: int, old: str | None, new: str | None) -> str | None:
+    """Пересчёт метки заказа после действия или отмены (Ф08): old/new - метки (jr.LABEL_GOOD/LABEL_BAD/None)
+    по состоянию лида ДО и ПОСЛЕ. Снимает прежнюю метку (счётчики lab_good/lab_bad/lab_miss уменьшаются, не ниже 0)
+    и ставит новую, так что ошибочный клик и его отмена в статистике не остаются. Если быстрая оценка заказа
+    набрана при других настройках (отпечаток сменился), счётчики не трогаются - снимается лишь пометка заказа.
+    Возвращает 'good' / 'bad' / 'miss' для поставленной метки, 'removed' - только сняли, None - ничего не изменилось."""
+    if old == new:
+        return None
+    try:
+        with _triage_evidence_lock:
+            scores = _load_scores()
+            rec = scores.get(str(order_id))
+            if not rec:
+                return None
+            labeled = len(rec) > 2 and bool(rec[2])
+            if rec[1] != _evidence_signature():
+                if labeled:
+                    scores[str(order_id)] = [rec[0], rec[1]]
+                    kv_set(TRIAGE_SCORES_KEY, json.dumps(scores))
+                return None
+            if labeled and old is None:
+                return None   # метка есть, а какая - неизвестно: счётчики не трогаем и не удваиваем
+            ev = triage_evidence()
+            cut = int(rec[0]) <= TRIAGE_REJECT_MAX
+            if labeled:
+                if old == jr.LABEL_GOOD:
+                    ev["lab_good"] = max(0, ev["lab_good"] - 1)
+                    ev["lab_miss"] = max(0, ev["lab_miss"] - (1 if cut else 0))
+                else:
+                    ev["lab_bad"] = max(0, ev["lab_bad"] - 1)
+            kind = "removed" if labeled else None
+            if new == jr.LABEL_GOOD:
+                ev["lab_good"] += 1
+                ev["lab_miss"] += 1 if cut else 0
+                kind = "miss" if cut else "good"
+            elif new == jr.LABEL_BAD:
+                ev["lab_bad"] += 1
+                kind = "bad"
+            if kind is None:
+                return None
+            _save_evidence(ev)
+            scores[str(order_id)] = [rec[0], rec[1], 1] if new else [rec[0], rec[1]]
+            kv_set(TRIAGE_SCORES_KEY, json.dumps(scores))
+            return kind
+    except Exception:
+        logging.exception("[TRIAGE] не удалось пересчитать разметку")
+        return None
+
+
 def triage_allowed() -> tuple[bool, str]:
     """Можно ли включать отсекающий триаж: (да/нет, пояснение)."""
     ev = triage_evidence()

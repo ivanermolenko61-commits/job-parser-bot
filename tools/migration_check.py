@@ -117,6 +117,10 @@ save(base + 3, "pending", tech="queued", queue_reason="no_quota")
 save(base + 4, "expired", tech="stale", stale_reason="queue_expired")
 save(base + 5, "sent", tech="assessed", verdict="ok", delivery="card")
 database.freelance_set_lead(base + 5, "applied")
+# Ф08: лид с историей (событие, следующее действие, напоминание) - прежний код должен открыть и такую БД
+from freelance import leads
+leads.set_stage(base + 5, "discussing")
+leads.set_next(base + 5, "ответить заказчику")
 print("ok")
 '''
 
@@ -275,6 +279,18 @@ def main(argv=None) -> int:
                                     "AND COALESCE(reject_reason, '') NOT IN ('', 'legacy_unknown')").fetchone()[0]
         finally:
             conn.close()
+        conn = sqlite3.connect(migrated)
+        try:
+            cols_now = {r[1] for r in conn.execute("PRAGMA table_info(freelance_orders)")}
+            tables_now = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            lead_events = conn.execute("SELECT COUNT(*) FROM freelance_lead_events").fetchone()[0] \
+                if "freelance_lead_events" in tables_now else -1
+        finally:
+            conn.close()
+        check({"next_action", "remind_at", "reminded_at", "offered_at"} <= cols_now,
+              "Ф08: столбцы next_action, remind_at, reminded_at, offered_at добавлены")
+        check("freelance_lead_events" in tables_now and lead_events == 0,
+              "Ф08: таблица событий лидов создана и пуста (событий у старых записей нет)")
         check(empty == 0, "у каждого заказа есть состояние журнала tech")
         check(invented == 0, "у старых записей причины отсева не выдуманы (допустим только маркер legacy_unknown)")
 

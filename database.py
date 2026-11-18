@@ -345,6 +345,9 @@ def cleanup_old(days: int = 5) -> int:
             (f'-{FREELANCE_KEEP_DAYS} days', *jr.LEAD_ACTIVE, FREELANCE_MIN_FIT,
              f'-{FREELANCE_MARKET_DAYS} days', f'-{FREELANCE_DEAL_DAYS} days'),
         )
+        # события удалённых заказов не остаются; события активных лидов живут, пока жив заказ
+        conn.execute("DELETE FROM freelance_lead_events "
+                     "WHERE order_id NOT IN (SELECT order_id FROM freelance_orders)")
         conn.execute("DELETE FROM freelance_funnel_daily WHERE day < date('now', ?)",
                      (f'-{FREELANCE_KEEP_DAYS * 2} days',))
         conn.commit()
@@ -408,6 +411,8 @@ def _init_freelance(conn) -> None:
         ("assessed_at", "TEXT"), ("delivered_at", "TEXT"), ("card_deleted_at", "TEXT"),
         ("stale_at", "TEXT"), ("stale_reason", "TEXT"), ("desc_changed", "INTEGER DEFAULT 0"),
         ("lead", "TEXT"), ("lead_reason", "TEXT"), ("lead_at", "TEXT"),
+        # Ф08: следующее действие, напоминание (UTC), отправленное напоминание, автоподборка необработанных
+        ("next_action", "TEXT"), ("remind_at", "TEXT"), ("reminded_at", "TEXT"), ("offered_at", "TEXT"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
@@ -415,6 +420,7 @@ def _init_freelance(conn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_title_key ON freelance_orders(title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_tech ON freelance_orders(tech)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_lead ON freelance_orders(lead)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_remind ON freelance_orders(remind_at)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fl_dedup ON freelance_orders(dedup_key)"
     )
@@ -449,6 +455,20 @@ def _init_freelance(conn) -> None:
             order_id INTEGER PRIMARY KEY, hours REAL, expenses REAL, updated_at TEXT
         )
     """)
+    # История действий по лиду (Ф08): основа для отмены; событие хранит состояние ДО действия
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_lead_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            from_lead TEXT, to_lead TEXT,
+            prev_reason TEXT, prev_next TEXT, prev_remind TEXT, prev_deal_price REAL,
+            reason TEXT,
+            undone INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_lead_ev ON freelance_lead_events(order_id, id)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
@@ -830,6 +850,247 @@ def freelance_set_deal_price(order_id: int, price: float | None) -> bool:
             (price, order_id),
         )
         return cur.rowcount > 0
+
+
+# --- Ф08: этапы сделки с историей, отменой, следующим действием и напоминанием. Только аддитивно:
+# freelance_set_lead / freelance_set_status (старый API) работают как раньше и событий не пишут ---
+
+_KEEP = object()   # «поле не менять» (None - это «очистить»)
+_LEAD_COLS = ("order_id, site, title, url, fit, lead, lead_reason, lead_at, next_action, remind_at, "
+              "reminded_at, deal_price, delivered_at, card_deleted_at, message_id")
+_LEAD_STATE = ("lead", "lead_reason", "next_action", "remind_at", "deal_price")
+LEAD_LOST_REASONS = (*jr.LOST_REASONS, jr.LOST_LEGACY)
+
+
+def _lead_snapshot(row: dict) -> dict:
+    return {k: row.get(k) for k in _LEAD_STATE}
+
+
+def _lead_write(conn, row: dict, kind: str, changes: dict, event_reason: str | None, now: str) -> dict:
+    """Запись изменения лида и события в ТЕКУЩЕЙ транзакции (вызывающий уже сделал BEGIN IMMEDIATE)."""
+    merged = {**row, **changes}
+    merged["status"] = jr.legacy_status(merged.get("tech"), merged.get("delivery"), merged.get("lead"),
+                                        bool(merged.get("card_deleted_at")))
+    names = [*changes, "status"]
+    conn.execute(
+        f"UPDATE freelance_orders SET {','.join(f'{n} = ?' for n in names)} WHERE order_id = ?",
+        (*(merged[n] for n in names), row["order_id"]),
+    )
+    cur = conn.execute(
+        "INSERT INTO freelance_lead_events (order_id, at, kind, from_lead, to_lead, prev_reason, prev_next, "
+        "prev_remind, prev_deal_price, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (row["order_id"], now, kind, row.get("lead"), merged.get("lead"), row.get("lead_reason"),
+         row.get("next_action"), row.get("remind_at"), row.get("deal_price"), event_reason),
+    )
+    return {"ok": True, "changed": True, "event_id": cur.lastrowid,
+            "before": _lead_snapshot(row), "after": _lead_snapshot(merged)}
+
+
+def _lead_row(conn, order_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM freelance_orders WHERE order_id = ?", (order_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def freelance_lead_stage(order_id: int, lead: str, reason: str | None = None, *, next_action=_KEEP,
+                         remind_at=_KEEP, now: str | None = None) -> dict:
+    """Перевод лида на этап, одной транзакцией со строкой события (из него работает отмена).
+    Неизвестный этап и отказ без причины из списка - ValueError, строка не меняется. Тот же этап и та же
+    причина - changed=False без события. При уходе с agreed/done на любой этап, кроме agreed/done (более
+    ранний или отказ), deal_price обнуляется (прежнее значение остаётся в prev_deal_price события).
+    next_action/remind_at: _KEEP - не менять.
+    Возвращает {ok, changed, before, after, event_id} либо {ok: False, reason: 'not_found'}."""
+    if lead not in jr.LEAD_STAGES:
+        raise ValueError(f"неизвестный этап сделки: {lead}")
+    if lead == jr.LEAD_LOST:
+        if reason not in LEAD_LOST_REASONS:
+            raise ValueError(f"причина отказа не из списка: {reason!r}")
+    else:
+        reason = None
+    now = now or _now_sql()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _lead_row(conn, order_id)
+        if row is None:
+            return {"ok": False, "changed": False, "reason": "not_found"}
+        if row.get("lead") == lead and row.get("lead_reason") == reason:
+            snap = _lead_snapshot(row)
+            return {"ok": True, "changed": False, "before": snap, "after": snap}
+        changes = {"lead": lead, "lead_reason": reason, "lead_at": now}
+        if next_action is not _KEEP:
+            changes["next_action"] = next_action
+        if remind_at is not _KEEP:
+            changes["remind_at"] = remind_at
+        if row.get("lead") in jr.LEAD_PRICE_STAGES and lead not in jr.LEAD_PRICE_STAGES:
+            changes["deal_price"] = None   # цена сделки есть только у agreed/done (отказ её не оставляет)
+        return _lead_write(conn, row, "stage", changes, reason, now)
+
+
+
+def _lead_active_change(order_id: int, kind: str, changes: dict, event_reason: str | None,
+                        now: str | None) -> dict:
+    now = now or _now_sql()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _lead_row(conn, order_id)
+        if row is None:
+            return {"ok": False, "changed": False, "reason": "not_found"}
+        if row.get("lead") not in jr.LEAD_ACTIVE:
+            return {"ok": False, "changed": False, "reason": "no_active_lead"}
+        if all(row.get(k) == v for k, v in changes.items()):
+            snap = _lead_snapshot(row)
+            return {"ok": True, "changed": False, "before": snap, "after": snap}
+        return _lead_write(conn, row, kind, changes, event_reason, now)
+
+
+def freelance_lead_next(order_id: int, text: str | None, now: str | None = None) -> dict:
+    """Своё следующее действие у активного лида (None - убрать). Срок напоминания не меняется."""
+    if text is not None:
+        text = " ".join(str(text).split())[:jr.LEAD_TEXT_MAX] or None
+    return _lead_active_change(order_id, "next", {"next_action": text}, text, now)
+
+
+def freelance_lead_remind(order_id: int, remind_at: str | None, now: str | None = None) -> dict:
+    """Срок напоминания у активного лида (UTC 'YYYY-MM-DD HH:MM:SS'; None - без напоминания)."""
+    return _lead_active_change(order_id, "remind", {"remind_at": remind_at}, remind_at, now)
+
+
+def freelance_lead_undo(order_id: int, now: str | None = None) -> dict:
+    """Отмена последнего действия с лидом: восстанавливает этап, причину, действие и срок; цена сделки - на
+    agreed/done прежняя (если своей нет), на более ранних этапах её нет. Повторная отмена идёт на шаг назад.
+    Нет событий - {ok: False, reason: 'nothing'}."""
+    now = now or _now_sql()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _lead_row(conn, order_id)
+        if row is None:
+            return {"ok": False, "changed": False, "reason": "not_found"}
+        ev = conn.execute(
+            "SELECT * FROM freelance_lead_events WHERE order_id = ? AND undone = 0 AND kind != 'undo' "
+            "ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
+        if ev is None:
+            return {"ok": False, "changed": False, "reason": "nothing"}
+        ev = dict(ev)
+        changes = {"next_action": ev["prev_next"], "remind_at": ev["prev_remind"]}
+        if ev["kind"] == "stage":
+            target = ev["from_lead"]
+            changes.update(lead=target, lead_reason=ev["prev_reason"], lead_at=now if target else None)
+            if target in jr.LEAD_PRICE_STAGES:
+                changes["deal_price"] = row.get("deal_price") or ev["prev_deal_price"]
+            else:
+                changes["deal_price"] = None
+        conn.execute("UPDATE freelance_lead_events SET undone = 1 WHERE id = ?", (ev["id"],))
+        res = _lead_write(conn, row, "undo", changes, ev["kind"], now)
+        res["undone_kind"] = ev["kind"]
+        return res
+
+
+def freelance_lead_events(order_id: int, limit: int = 3) -> list[dict]:
+    """Последние события лида (новые первыми)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM freelance_lead_events WHERE order_id = ? ORDER BY id DESC LIMIT ?",
+            (order_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_last_deal_price(order_id: int) -> float | None:
+    """Последняя обнулённая цена сделки (из событий): подсказка «было N ₽» при повторном «Договорились»."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT prev_deal_price FROM freelance_lead_events WHERE order_id = ? AND prev_deal_price > 0 "
+            "ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
+        return float(row["prev_deal_price"]) if row else None
+
+
+def freelance_lead_get(order_id: int) -> dict | None:
+    """Строка лида для карточки /lead_<id>: только из БД (работает после TTL и рестарта)."""
+    with _connect() as conn:
+        row = conn.execute(f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE order_id = ?",
+                           (order_id,)).fetchone()
+        return dict(row) if row else None
+
+
+
+def freelance_leads_active() -> list[dict]:
+    """Активные лиды (saved/applied/discussing/agreed); группировку по этапам делает вызывающий."""
+    marks = ",".join("?" * len(jr.LEAD_ACTIVE))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE lead IN ({marks}) "
+            "ORDER BY remind_at IS NULL, remind_at, lead_at", jr.LEAD_ACTIVE).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_leads_closed(days: int = 7) -> list[dict]:
+    """Закрытые (done/lost) за последние days дней - для исправления ошибочного закрытия."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE lead IN ('done', 'lost') "
+            "AND lead_at >= datetime('now', ?) ORDER BY lead_at DESC", (f"-{days} days",)).fetchall()
+        return [dict(r) for r in rows]
+
+
+_UNPROCESSED = ("verdict = 'ok' AND delivery IN ('card', 'digest') AND COALESCE(lead, '') = '' "
+                "AND delivered_at >= datetime('now', ?)")
+
+
+def freelance_unprocessed(days: int = 3, limit: int = 30) -> list[dict]:
+    """Необработанные интересные: оценён как подходящий, доставлен карточкой или сводкой «ещё N»
+    не раньше days дней назад, решения по лиду нет."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE {_UNPROCESSED} "
+            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_claim_offers(limit: int = 10, days: int = 3, now: str | None = None) -> tuple[str, list[dict]]:
+    """Подборка необработанных: заказы, ещё не бывшие в автоподборке, помечаются offered_at в той же транзакции -
+    каждый заказ попадает в подборку один раз. Возвращает (метка занятия, строки); при сбое отправки
+    freelance_release_offers(метка, id) возвращает их."""
+    now = now or _now_sql()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE {_UNPROCESSED} AND offered_at IS NULL "
+            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", limit)).fetchall()]
+        for r in rows:
+            conn.execute("UPDATE freelance_orders SET offered_at = ? WHERE order_id = ?", (now, r["order_id"]))
+        return now, rows
+
+
+def freelance_release_offers(claimed_at: str, order_ids: list[int]) -> int:
+    """Подборка не ушла: вернуть заказам право попасть в следующую (только занятые именно этим вызовом)."""
+    if not order_ids:
+        return 0
+    marks = ",".join("?" * len(order_ids))
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE freelance_orders SET offered_at = NULL WHERE offered_at = ? AND order_id IN ({marks})",
+            (claimed_at, *order_ids))
+        return cur.rowcount
+
+
+def freelance_reminders_due(now: str | None = None, limit: int = 20) -> list[dict]:
+    """Активные лиды, у которых срок напоминания наступил, а последнее напоминание было раньше этого срока."""
+    marks = ",".join("?" * len(jr.LEAD_ACTIVE))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE lead IN ({marks}) AND remind_at IS NOT NULL "
+            "AND remind_at <= ? AND (reminded_at IS NULL OR reminded_at < remind_at) "
+            "ORDER BY remind_at LIMIT ?", (*jr.LEAD_ACTIVE, now or _now_sql(), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def freelance_mark_reminded(order_id: int, remind_at: str, now: str | None = None) -> bool:
+    """Напоминание отправлено. Срок, который успели поменять, не гасится: условие - прежний remind_at."""
+    marks = ",".join("?" * len(jr.LEAD_ACTIVE))
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE freelance_orders SET reminded_at = ? WHERE order_id = ? AND remind_at = ? "
+            f"AND lead IN ({marks})", (now or _now_sql(), order_id, remind_at, *jr.LEAD_ACTIVE))
+        return cur.rowcount > 0
+
 
 
 def market_stats(category: str, days: int = 90, min_points: int = 5,

@@ -38,14 +38,24 @@ from database import (
     freelance_actuals_rows,
     freelance_deal_rows,
     freelance_expired_messages,
+    freelance_claim_offers,
     freelance_get,
+    freelance_last_deal_price,
+    freelance_lead_events,
+    freelance_lead_get,
+    freelance_leads_active,
+    freelance_leads_closed,
+    freelance_mark_reminded,
     freelance_recent,
+    freelance_release_offers,
+    freelance_reminders_due,
     freelance_set_actuals,
     freelance_set_deal_price,
     freelance_mark_card_deleted,
     freelance_set_status,
     freelance_day_summary,
     freelance_stats,
+    freelance_unprocessed,
     get_recent_vacancies,
     init_db,
     kv_get,
@@ -54,6 +64,9 @@ from database import (
     stats,
 )
 from freelance import ai_scorer, capacity, deal_wait, pricing, report, sources, yandex_budget
+from freelance import journal as jr
+from freelance import lead_view as lv
+from freelance import leads
 from freelance.alot_client import site_name
 from freelance.pipeline import (
     LAST_ID_KEY,
@@ -344,6 +357,7 @@ async def _freelance_subscribed() -> bool:
 async def freelance_menu_kb() -> InlineKeyboardMarkup:
     toggle = "⏸ Пауза" if await _freelance_subscribed() else "▶️ Включить"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Входящие", callback_data="fl_inbox")],
         [InlineKeyboardButton(text="📋 Последние заказы", callback_data="fl_recent")],
         [InlineKeyboardButton(text="🔍 Проверить сейчас", callback_data="fl_check")],
         [
@@ -355,10 +369,17 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _kb(rows) -> InlineKeyboardMarkup:
+    """Клавиатура из описания freelance.lead_view (Btn: либо callback_data, либо url)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=b.text, url=b.url) if b.url else InlineKeyboardButton(text=b.text, callback_data=b.data)
+         for b in row] for row in rows])
+
+
 def _order_kb(order_id: int, url: str | None, taken: bool = False,
               detailed: bool = False, actions: bool = True) -> InlineKeyboardMarkup:
-    """Кнопки заказа: открыть + «Подробнее»/«Свернуть», «Взял» / «Не подходит»
-    (после «Взял» - «В работе»)."""
+    """Кнопки СТАРОГО вида («Взял» / «Не подходит», после «Взял» - «В работе»): нужны обработчикам
+    fl_take/fl_skip для сообщений, отправленных до Ф08. Новые карточки - lv.order_card_buttons."""
     if detailed:
         more = InlineKeyboardButton(text="🔼 Свернуть", callback_data=f"fl_less:{order_id}")
     else:
@@ -394,12 +415,12 @@ async def _send_order(sc):
     o = sc.order
     variants = []
     try:
-        variants.append((format_order(sc), "HTML", _order_kb(o.order_id, o.url)))
+        variants.append((format_order(sc), "HTML", _kb(lv.order_card_buttons(o.order_id, o.url))))
     except Exception:
         logging.exception(f"[FREELANCE] ошибка форматирования {o.url}")
-    variants.append((format_order_plain(sc), None, _order_kb(o.order_id, o.url)))
+    variants.append((format_order_plain(sc), None, _kb(lv.order_card_buttons(o.order_id, o.url))))
     # последний шанс: без кнопки-ссылки (URL мог оказаться невалидным для Telegram)
-    variants.append((format_order_plain(sc), None, _order_kb(o.order_id, None)))
+    variants.append((format_order_plain(sc), None, _kb(lv.order_card_buttons(o.order_id, None))))
     last_exc: Exception | None = None
     for text, parse_mode, markup in variants:
         try:
@@ -420,7 +441,12 @@ async def _set_order_status(order_id: int, status: str) -> None:
     запоминается в памяти, и finish_cycle запишет его вместо «sent».
     Решение владельца («Взял» / «Не подходит») заодно служит независимой разметкой для проверки триажа."""
     if status in ("taken", "dismissed"):
-        await asyncio.to_thread(record_triage_label, order_id, status == "taken")
+        # Ф08: старые кнопки идут тем же путём, что и новые (событие, отмена, пересчёт метки триажа)
+        stage, reason = (jr.LEAD_AGREED, None) if status == "taken" else (jr.LEAD_LOST, jr.LOST_LEGACY)
+        res = await asyncio.to_thread(leads.set_stage, order_id, stage, reason)
+        if res.get("ok"):
+            return
+        await asyncio.to_thread(record_triage_label, order_id, status == "taken")   # записи ещё нет: прежний путь
     if await asyncio.to_thread(freelance_set_status, order_id, status):
         return
     if await asyncio.to_thread(mark_sent_status, order_id, status):
@@ -813,6 +839,16 @@ async def msg_deal_price(message: Message, deal_key: tuple[int, int] | None):
     order_id = pending[0]
     text = message.text.strip()
     if text.startswith("/"):
+        # /skip: прежняя цена (обнулённая отменой/шагом назад) возвращается, если новой ещё нет
+        try:
+            prev = await asyncio.to_thread(freelance_last_deal_price, order_id)
+            row = await asyncio.to_thread(freelance_get, order_id) or {}
+            if prev and not row.get("deal_price") and row.get("lead") in jr.LEAD_PRICE_STAGES:
+                await asyncio.to_thread(freelance_set_deal_price, order_id, prev)
+                await message.answer(f"Ок, оставил прежнюю цену: {lv.money(prev)}.")
+                return
+        except Exception:
+            logging.exception("[FREELANCE] deal_price skip")
         await message.answer("Ок, цену не записываю.")
         return
     try:
@@ -951,6 +987,30 @@ async def cb_fl_skip(call: CallbackQuery):
             pass
 
 
+async def _render_order_card(call: CallbackQuery, order_id: int, detailed: bool,
+                             notice: str | None = None) -> None:
+    """Перерисовывает сообщение с заказом из БД: текст и кнопки по текущему этапу лида.
+    notice - ответ на нажатие кнопки (одно нажатие - один ответ)."""
+    row = await asyncio.to_thread(freelance_get, order_id)
+    if row is None:
+        await call.answer("Заказ не найден", show_alert=False)
+        return
+    sc = scored_from_row(row)
+    text = format_order(sc, detailed=detailed)
+    # plain-формат (откат при слишком длинном тексте) - без HTML-разметки
+    parse_mode = None if text == format_order_plain(sc) else "HTML"
+    lead = row.get("lead")
+    actions = row.get("status") in ("pending", "sent", "taken") or lead in jr.LEAD_ACTIVE
+    kb = _kb(lv.order_card_buttons(order_id, sc.order.url or None, lead=lead, detailed=detailed, actions=actions))
+    await call.answer(notice)
+    try:
+        await call.message.edit_text(text, parse_mode=parse_mode, reply_markup=kb,
+                                     disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
 async def _toggle_order_detail(call: CallbackQuery, detailed: bool):
     """Разворачивает/сворачивает карточку заказа (заказ читаем из БД)."""
     try:
@@ -958,24 +1018,7 @@ async def _toggle_order_detail(call: CallbackQuery, detailed: bool):
         if order_id is None:
             await call.answer("Некорректная кнопка")
             return
-        row = await asyncio.to_thread(freelance_get, order_id)
-        if row is None:
-            await call.answer("Заказ не найден", show_alert=False)
-            return
-        sc = scored_from_row(row)
-        text = format_order(sc, detailed=detailed)
-        # plain-формат (откат при слишком длинном тексте) - без HTML-разметки
-        parse_mode = None if text == format_order_plain(sc) else "HTML"
-        status = row.get("status")
-        kb = _order_kb(order_id, sc.order.url or None, taken=status == "taken",
-                       detailed=detailed, actions=status in ("pending", "sent", "taken"))
-        await call.answer()
-        try:
-            await call.message.edit_text(text, parse_mode=parse_mode, reply_markup=kb,
-                                         disable_web_page_preview=True)
-        except TelegramBadRequest as e:
-            if "message is not modified" not in str(e):
-                raise
+        await _render_order_card(call, order_id, detailed)
     except Exception:
         logging.exception("[FREELANCE] fl_more/fl_less")
         try:
@@ -997,6 +1040,402 @@ async def cb_fl_less(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("fl_noop:"))
 async def cb_fl_noop(call: CallbackQuery):
     await call.answer("Заказ уже в работе")
+
+# ---------- Ф08: этапы сделки, карточка лида, «Входящие», напоминания ----------
+
+NOT_SAVED_YET = "Заказ ещё не записан в базу, повторите через минуту"
+
+
+def _is_detailed(call: CallbackQuery) -> bool:
+    """Карточка заказа развёрнута, если на ней кнопка «Свернуть»."""
+    markup = call.message.reply_markup if call.message else None
+    return any((b.callback_data or "").startswith("fl_less:")
+               for row in (markup.inline_keyboard if markup else []) for b in row)
+
+
+async def _answer_error(call: CallbackQuery, where: str) -> None:
+    logging.exception(f"[FREELANCE] {where}")
+    try:
+        await call.answer("Ошибка, см. лог")
+    except Exception:
+        pass
+
+
+async def _order_stage_action(call: CallbackQuery, stage: str, notice: str) -> None:
+    """«Сохранить» / «Откликнулся» на карточке заказа: этап, событие, метка триажа; карточка перерисовывается."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        res = await asyncio.to_thread(leads.set_stage, order_id, stage)
+        if not res.get("ok"):
+            await call.answer(NOT_SAVED_YET, show_alert=True)
+            return
+        await _render_order_card(call, order_id, _is_detailed(call), notice)
+    except Exception:
+        await _answer_error(call, f"fl_{stage}")
+
+
+@dp.callback_query(F.data.startswith("fl_save:"))
+async def cb_fl_save(call: CallbackQuery):
+    await _order_stage_action(call, jr.LEAD_SAVED, "Сохранено во «Входящих»")
+
+
+@dp.callback_query(F.data.startswith("fl_apply:"))
+async def cb_fl_apply(call: CallbackQuery):
+    await _order_stage_action(call, jr.LEAD_APPLIED, "Отмечено: откликнулись")
+
+
+@dp.callback_query(F.data.startswith("fl_np:"))
+async def cb_fl_not_mine(call: CallbackQuery):
+    """«Не подходит» на новой карточке: не удаляет её, а сворачивает в одну строку с «↩️ Вернуть»."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        res = await asyncio.to_thread(leads.set_stage, order_id, jr.LEAD_LOST, jr.LOST_LEGACY)
+        if not res.get("ok"):
+            await call.answer(NOT_SAVED_YET, show_alert=True)
+            return
+        deal_wait.drop_order(_pending_deals, order_id)
+        row = await asyncio.to_thread(freelance_get, order_id) or {"order_id": order_id}
+        await call.answer("Убрано")
+        try:
+            await call.message.edit_text(lv.collapsed_text(row), parse_mode="HTML",
+                                         reply_markup=_kb(lv.collapsed_buttons(order_id)))
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+    except Exception:
+        await _answer_error(call, "fl_np")
+
+
+@dp.callback_query(F.data.startswith("fl_back:"))
+async def cb_fl_back(call: CallbackQuery):
+    """«↩️ Вернуть» на свёрнутой карточке: отменяет «Не подходит» и возвращает карточку заказа."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        last = (await asyncio.to_thread(freelance_lead_events, order_id, 1) or [None])[0]
+        if last and last["kind"] == "stage" and last["to_lead"] == jr.LEAD_LOST and not last["undone"]:
+            await asyncio.to_thread(leads.undo, order_id)
+            notice = "Возвращено"
+        else:
+            notice = "Состояние уже изменено, показываю текущее"
+        await _render_order_card(call, order_id, False, notice)
+    except Exception:
+        await _answer_error(call, "fl_back")
+
+
+
+def _lead_card_data(order_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Текст и кнопки карточки лида ТОЛЬКО из БД (после TTL и рестарта работает так же). None - заказа нет."""
+    lead = freelance_lead_get(order_id)
+    if lead is None:
+        return None
+    events = freelance_lead_events(order_id, 20)
+    text = lv.lead_card_text(lead, events, freelance_last_deal_price(order_id))
+    return text, _kb(lv.lead_card_buttons(lead, events))
+
+
+async def _show_lead_card(target: Message | CallbackQuery, order_id: int, edit: bool) -> bool:
+    """Показывает карточку лида: edit=True - правит сообщение кнопки, иначе новое сообщение."""
+    data = await asyncio.to_thread(_lead_card_data, order_id)
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    if data is None:
+        if isinstance(target, CallbackQuery):
+            await target.answer("Заказ не найден")
+        else:
+            await msg.answer("Заказ не найден.")
+        return False
+    text, kb = data
+    if edit:
+        try:
+            await msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+    else:
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    return True
+
+
+def _ids_from(data: str) -> tuple[int, str] | None:
+    """'fl_xx:<id>:<значение>' -> (id, значение); иначе None."""
+    chunks = data.split(":", 2)
+    try:
+        return int(chunks[1]), chunks[2]
+    except (IndexError, ValueError):
+        return None
+
+
+async def _ask_deal_price(message: Message, order_id: int, title: str) -> None:
+    """Вопрос «За сколько договорились?» после перехода в «Договорились»; ответ ловит msg_deal_price."""
+    deal_wait.purge(_pending_deals)
+    prev = await asyncio.to_thread(freelance_last_deal_price, order_id)
+    hint = f" (было {lv.money(prev)}, /skip — оставить прежнюю)" if prev else " или /skip"
+    question = await message.answer(
+        f"💰 За сколько договорились: {html.escape(title[:60])}?\nОтветьте числом в ₽{hint}",
+        parse_mode="HTML", reply_markup=ForceReply(input_field_placeholder="Цена в рублях"))
+    deal_wait.add(_pending_deals, message.chat.id, question.message_id, order_id)
+
+
+@dp.message(F.text.regexp(r"^/lead_(\d+)(@\w+)?\s*$").as_("lead_match"))
+async def cmd_lead(message: Message, lead_match):
+    """/lead_<id> - карточка лида из БД."""
+    try:
+        await _show_lead_card(message, int(lead_match.group(1)), edit=False)
+    except Exception:
+        logging.exception("[FREELANCE] /lead")
+        await message.answer("⚠️ Не удалось показать карточку, подробности в логе.")
+
+
+@dp.callback_query(F.data.startswith("fl_lead:"))
+async def cb_fl_lead(call: CallbackQuery):
+    """Кнопка «📋 Лид» на карточке заказа: карточка лида отдельным сообщением."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await call.answer()
+        await _show_lead_card(call, order_id, edit=False)
+    except Exception:
+        await _answer_error(call, "fl_lead")
+
+
+@dp.callback_query(F.data.startswith("fl_card:"))
+async def cb_fl_card(call: CallbackQuery):
+    """«◀️ Назад» из выбора причины/срока и «📋 Лид» из напоминания: карточка лида на месте сообщения."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await call.answer()
+        await _show_lead_card(call, order_id, edit=True)
+    except Exception:
+        await _answer_error(call, "fl_card")
+
+
+@dp.callback_query(F.data.startswith("fl_st:"))
+async def cb_fl_stage(call: CallbackQuery):
+    """Кнопки этапов на карточке лида. «Договорились» спрашивает цену, как прежний «Взял»."""
+    try:
+        parsed = _ids_from(call.data)
+        if parsed is None or parsed[1] not in jr.LEAD_STAGES or parsed[1] == jr.LEAD_LOST:
+            await call.answer("Некорректная кнопка")
+            return
+        order_id, stage = parsed
+        res = await asyncio.to_thread(leads.set_stage, order_id, stage)
+        if not res.get("ok"):
+            await call.answer("Заказ не найден")
+            return
+        await call.answer(f"Этап: {lv.stage_label(stage)}")
+        await _show_lead_card(call, order_id, edit=True)
+        if stage == jr.LEAD_AGREED and res.get("changed"):
+            row = await asyncio.to_thread(freelance_get, order_id) or {}
+            await _ask_deal_price(call.message, order_id, row.get("title") or f"заказ {order_id}")
+    except Exception:
+        await _answer_error(call, "fl_st")
+
+
+@dp.callback_query(F.data.startswith("fl_lost:"))
+async def cb_fl_lost(call: CallbackQuery):
+    """«❌ Отказ»: выбор причины."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await call.answer()
+        await call.message.edit_reply_markup(reply_markup=_kb(lv.lost_reason_buttons(order_id)))
+    except Exception:
+        await _answer_error(call, "fl_lost")
+
+
+@dp.callback_query(F.data.startswith("fl_lr:"))
+async def cb_fl_lost_reason(call: CallbackQuery):
+    """Причина отказа выбрана: lead=lost, действие и напоминание снимаются, метка триажа пересчитывается."""
+    try:
+        parsed = _ids_from(call.data)
+        if parsed is None or not parsed[1].isdigit() or int(parsed[1]) >= len(jr.LOST_REASONS):
+            await call.answer("Некорректная кнопка")
+            return
+        order_id, reason = parsed[0], jr.LOST_REASONS[int(parsed[1])]
+        res = await asyncio.to_thread(leads.set_stage, order_id, jr.LEAD_LOST, reason)
+        if not res.get("ok"):
+            await call.answer("Заказ не найден")
+            return
+        deal_wait.drop_order(_pending_deals, order_id)
+        await call.answer(f"Отказ: {reason}")
+        await _show_lead_card(call, order_id, edit=True)
+    except Exception:
+        await _answer_error(call, "fl_lr")
+
+
+@dp.callback_query(F.data.startswith("fl_rm:"))
+async def cb_fl_remind_menu(call: CallbackQuery):
+    """«⏰ Напомнить»: выбор срока."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        await call.answer()
+        await call.message.edit_reply_markup(reply_markup=_kb(lv.remind_buttons(order_id)))
+    except Exception:
+        await _answer_error(call, "fl_rm")
+
+
+@dp.callback_query(F.data.startswith("fl_rc:"))
+async def cb_fl_remind_choice(call: CallbackQuery):
+    try:
+        parsed = _ids_from(call.data)
+        if parsed is None or parsed[1] not in leads.REMIND_CHOICES:
+            await call.answer("Некорректная кнопка")
+            return
+        res = await asyncio.to_thread(leads.set_remind, parsed[0], parsed[1])
+        if not res.get("ok"):
+            await call.answer("Напоминание есть только у активного лида", show_alert=True)
+            return
+        await call.answer("Срок обновлён")
+        await _show_lead_card(call, parsed[0], edit=True)
+    except Exception:
+        await _answer_error(call, "fl_rc")
+
+
+@dp.callback_query(F.data.startswith("fl_undo:"))
+async def cb_fl_undo(call: CallbackQuery):
+    """«↩️ Отменить последнее»: возврат состояния и метки триажа; повторное нажатие идёт на шаг дальше."""
+    try:
+        order_id = _order_id_from(call.data)
+        if order_id is None:
+            await call.answer("Некорректная кнопка")
+            return
+        res = await asyncio.to_thread(leads.undo, order_id)
+        await call.answer("Отменено" if res.get("ok") else "Нечего отменять")
+        await _show_lead_card(call, order_id, edit=True)
+    except Exception:
+        await _answer_error(call, "fl_undo")
+
+
+@dp.message(Command("next"))
+async def cmd_next(message: Message):
+    """/next <id> <текст> - своё следующее действие по лиду; без текста действие убирается."""
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Формат: /next номер_заказа текст действия\nНапример: /next 12345 выслать смету")
+        return
+    order_id = int(parts[1])
+    try:
+        res = await asyncio.to_thread(leads.set_next, order_id, parts[2] if len(parts) > 2 else None)
+    except Exception:
+        logging.exception("[FREELANCE] /next")
+        await message.answer("⚠️ Не удалось записать, подробности в логе.")
+        return
+    if not res.get("ok"):
+        await message.answer("Заказ не найден." if res.get("reason") == "not_found"
+                             else "Действие задаётся у активного лида (сохранён → договорились).")
+        return
+    await _show_lead_card(message, order_id, edit=False)
+
+
+async def _inbox_text() -> str:
+    active, unprocessed, closed = await asyncio.gather(
+        asyncio.to_thread(freelance_leads_active), asyncio.to_thread(freelance_unprocessed),
+        asyncio.to_thread(freelance_leads_closed, 7))
+    return lv.inbox_text(active, unprocessed, closed)
+
+
+async def _send_inbox(message: Message) -> None:
+    try:
+        text = await _inbox_text()
+        for chunk in _split_messages(text):
+            await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        logging.exception("[FREELANCE] inbox")
+        await message.answer("⚠️ Не удалось собрать «Входящие», подробности в логе.")
+
+
+@dp.callback_query(F.data == "fl_inbox")
+async def cb_fl_inbox(call: CallbackQuery):
+    await call.answer()
+    await _send_inbox(call.message)
+
+
+@dp.message(Command("inbox"))
+async def cmd_inbox(message: Message):
+    await _send_inbox(message)
+
+
+_reminder_lock = asyncio.Lock()
+
+
+async def send_lead_reminders():
+    """Раз в 5 минут: активные лиды с наступившим сроком - напоминание ТОЛЬКО в MY_CHAT_ID. reminded_at
+    ставится после успешной отправки: при ошибке Telegram напоминание уйдёт в следующий раз; пропущенное за
+    время простоя уходит после рестарта один раз. Закрытые лиды (done/lost) напоминаний не получают."""
+    if _reminder_lock.locked():
+        return
+    async with _reminder_lock:
+        try:
+            for row in await asyncio.to_thread(freelance_reminders_due):
+                try:
+                    await bot.send_message(chat_id=MY_CHAT_ID, text=lv.reminder_text(row), parse_mode="HTML",
+                                           reply_markup=_kb(lv.reminder_buttons(row["order_id"])),
+                                           disable_web_page_preview=True)
+                except TelegramRetryAfter as e:
+                    logging.warning(f"[FREELANCE] flood control при напоминании, ждём {e.retry_after} с")
+                    return
+                except Exception:
+                    logging.exception(f"[FREELANCE] напоминание по заказу {row['order_id']} не отправлено")
+                    continue
+                await asyncio.to_thread(freelance_mark_reminded, row["order_id"], row["remind_at"])
+                await asyncio.sleep(0.1)
+        except Exception:
+            logging.exception("[FREELANCE] send_lead_reminders")
+
+
+OFFER_HOUR_MSK = 10
+OFFER_DAY_KEY = "freelance_offer_day"   # дата (МСК) последней отправленной подборки
+OFFER_LIMIT = 10
+_offer_lock = asyncio.Lock()
+
+
+async def send_lead_offers():
+    """Раз в сутки (10:00 МСК) подборка необработанных интересных заказов, до 10. Каждый заказ попадает в
+    автоподборку один раз (offered_at). Пустая подборка и пауза фриланса - ничего не отправляют."""
+    async with _offer_lock:
+        claimed, rows = None, []
+        try:
+            if not await _freelance_subscribed():
+                return
+            today = datetime.now(MSK).date().isoformat()
+            if await asyncio.to_thread(kv_get, OFFER_DAY_KEY) == today:
+                return
+            claimed, rows = await asyncio.to_thread(freelance_claim_offers, OFFER_LIMIT)
+            if rows:
+                await bot.send_message(chat_id=MY_CHAT_ID, text=lv.offers_text(rows), parse_mode="HTML",
+                                       disable_web_page_preview=True)
+            await asyncio.to_thread(kv_set, OFFER_DAY_KEY, today)
+        except Exception:
+            logging.exception("[FREELANCE] send_lead_offers")
+            if claimed and rows:   # не ушло: заказы вернуть в подборку, день не отмечаем (повтор в следующий раз)
+                try:
+                    await asyncio.to_thread(freelance_release_offers, claimed, [r["order_id"] for r in rows])
+                except Exception:
+                    logging.exception("[FREELANCE] не удалось вернуть заказы в подборку")
+
+
+async def catch_up_lead_offers():
+    """После рестарта: если 10:00 МСК уже прошло, а подборка за сегодня не уходила - отправить."""
+    if datetime.now(MSK).hour >= OFFER_HOUR_MSK:
+        await send_lead_offers()
 
 
 async def cleanup_freelance_messages():
@@ -1507,8 +1946,25 @@ async def main():
         misfire_grace_time=1800,  # задержка планировщика; после рестарта - catch_up_freelance_summary
         coalesce=True,
     )
+    scheduler.add_job(
+        send_lead_reminders,
+        "interval",
+        minutes=5,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        send_lead_offers,
+        "cron",
+        hour=OFFER_HOUR_MSK,
+        minute=0,
+        timezone=MSK,
+        misfire_grace_time=1800,  # после рестарта - catch_up_lead_offers
+        coalesce=True,
+    )
     scheduler.start()
     asyncio.create_task(catch_up_freelance_summary())
+    asyncio.create_task(catch_up_lead_offers())
     logging.info(f"Планировщик запущен: проверка каждые {CHECK_INTERVAL_MINUTES} мин")
     logging.info(f"Бот запущен. Разрешён только user_id={MY_CHAT_ID}")
 
