@@ -405,7 +405,7 @@ def _init_freelance(conn) -> None:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
     # Журнал увиденных заказов (freelance/journal.py): три независимых измерения вместо одного status
     for col, ddl in (
-        ("origin", "TEXT"), ("title_key", "TEXT"), ("content_hash", "TEXT"), ("snippet", "TEXT"),
+        ("origin", "TEXT"), ("manual_key", "TEXT"), ("title_key", "TEXT"), ("content_hash", "TEXT"), ("snippet", "TEXT"),
         ("pub_unreliable", "INTEGER DEFAULT 0"), ("tech", "TEXT"), ("queue_reason", "TEXT"),
         ("reject_reason", "TEXT"), ("verdict", "TEXT"), ("dup_of", "INTEGER"), ("delivery", "TEXT"),
         ("assessed_at", "TEXT"), ("delivered_at", "TEXT"), ("card_deleted_at", "TEXT"),
@@ -416,6 +416,7 @@ def _init_freelance(conn) -> None:
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_key ON freelance_orders(manual_key) WHERE manual_key IS NOT NULL")
     _backfill_journal(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_title_key ON freelance_orders(title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_tech ON freelance_orders(tech)")
@@ -1409,6 +1410,7 @@ def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None 
     id_ranges - полуинтервалы [от, до) order_id: по умолчанию выбираются только заказы из них,
     с exclude_ranges=True - все, кроме них (так лимит не занимают заказы неактивных источников)."""
     where, params = "(tech = 'queued' OR (tech = 'assessed' AND delivery = 'pending'))", []
+    where += " AND NOT (COALESCE(origin, '')='manual' AND COALESCE(queue_reason, '')='no_text')"
     if id_ranges:
         cond = " OR ".join("(order_id >= ? AND order_id < ?)" for _ in id_ranges)
         where += f" AND {'NOT ' if exclude_ranges else ''}({cond})"
@@ -1416,11 +1418,11 @@ def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None 
     with _connect() as conn:
         rows = conn.execute(
             f"""
-            SELECT order_id, attempts, ai_json, published_at, dedup_key, seen_at, queue_reason,
+            SELECT order_id, attempts, ai_json, published_at, dedup_key, seen_at, queue_reason, origin, title, site, snippet, url, price_text,
                    tech, delivery, COALESCE(pub_unreliable, 0) AS pub_unreliable
             FROM freelance_orders
             WHERE {where}
-            ORDER BY published_at DESC, order_id DESC
+            ORDER BY COALESCE(published_at,seen_at) DESC, order_id DESC
             LIMIT ?
             """,
             (*params, limit),

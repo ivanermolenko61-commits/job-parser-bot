@@ -69,6 +69,7 @@ from freelance import ai_scorer, capacity, deal_wait, pricing, report, sources, 
 from freelance import journal as jr
 from freelance import lead_view as lv
 from freelance.draft import draft_messages
+from freelance import manual as manual_orders
 from freelance import leads
 from freelance.alot_client import site_name
 from freelance.pipeline import (
@@ -361,6 +362,7 @@ async def freelance_menu_kb() -> InlineKeyboardMarkup:
     toggle = "⏸ Пауза" if await _freelance_subscribed() else "▶️ Включить"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 Входящие", callback_data="fl_inbox")],
+        [InlineKeyboardButton(text="Оценить свой заказ", callback_data="fl_add")],
         [InlineKeyboardButton(text="📋 Последние заказы", callback_data="fl_recent")],
         [InlineKeyboardButton(text="🔍 Проверить сейчас", callback_data="fl_check")],
         [
@@ -406,7 +408,7 @@ def _order_kb(order_id: int, url: str | None, taken: bool = False,
 def _sort_key_for_cap(sc) -> tuple:
     # Без AI считаем «средним» (5), чтобы не вытеснять оценённые. При равной оценке - свежее первым
     # по времени публикации: order_id разных источников (alot.pro, FL.ru, Kwork) несравнимы
-    return (sc.fit if sc.fit is not None else 5, sc.order.published_at.timestamp())
+    return (sc.fit if sc.fit is not None else 5, (sc.order.published_at or sc.first_seen).timestamp() if sc.order.published_at or sc.first_seen else 0)
 
 
 async def _send_order(sc):
@@ -463,7 +465,13 @@ def _order_is_stale(sc) -> bool:
     отправки, он мог состариться. Такой в чат не уходит, а получает состояние «устарел» с причиной.
     Заказ старше FREELANCE_FRESH_HOURS уходит с пометкой возраста в карточке."""
     limit = timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
-    return datetime.now(timezone.utc) - sc.order.published_at > limit
+    ref = sc.order.published_at
+    return bool(ref and datetime.now(timezone.utc) - ref > limit)
+
+
+def _sort_delivery_time(sc):
+    ref = sc.order.published_at or sc.first_seen
+    return ref.timestamp() if ref else 0
 
 
 async def _deliver_freelance(res, progress: dict | None = None) -> dict:
@@ -485,7 +493,7 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     stale_ids = {sc.order.order_id for sc in stale}
     ranked = sorted((sc for sc in res.to_send if sc.order.order_id not in stale_ids),
                     key=_sort_key_for_cap, reverse=True)
-    chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=lambda sc: sc.order.published_at)
+    chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=_sort_delivery_time)
     extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
     sent_ok = progress.setdefault("sent", [])
@@ -590,7 +598,8 @@ async def _send_reassess_notes(res) -> None:
 
 
 async def _check_freelance_impl(manual: bool = False) -> dict | None:
-    if not manual and not await _freelance_subscribed():
+    only_manual = not manual and not await _freelance_subscribed()
+    if only_manual and not await asyncio.to_thread(manual_orders.pending):
         logging.info("[FREELANCE] пауза, пропуск")
         return None
     if _freelance_lock.locked():
@@ -600,7 +609,7 @@ async def _check_freelance_impl(manual: bool = False) -> dict | None:
     async with _freelance_lock:
         try:
             res = await asyncio.wait_for(
-                asyncio.to_thread(prepare_cycle), timeout=PREPARE_TIMEOUT_SEC
+                asyncio.to_thread(prepare_cycle, True) if only_manual else asyncio.to_thread(prepare_cycle), timeout=PREPARE_TIMEOUT_SEC
             )
         except Exception:
             logging.exception("[FREELANCE] ошибка проверки")
@@ -1925,6 +1934,66 @@ async def btn_pause(message: Message):
 @dp.message(F.text == "▶️ Возобновить")
 async def btn_resume(message: Message):
     await cmd_start(message)
+
+
+MANUAL_PROMPT = "Пришли текст, подпись или пересылку с описанием задачи. Если есть ссылка на исходное объявление, добавь её. /cancel — отменить."
+MANUAL_WAIT = "freelance_manual_wait"
+
+
+@dp.callback_query(F.data == "fl_add")
+async def cb_manual_start(call: CallbackQuery):
+    await call.answer()
+    await asyncio.to_thread(kv_set, MANUAL_WAIT, "new")
+    await call.message.answer(MANUAL_PROMPT)
+
+
+@dp.message(Command("cancel"))
+async def cmd_manual_cancel(message: Message):
+    await asyncio.to_thread(kv_set, MANUAL_WAIT, "")
+    await message.answer("Ручной ввод завершён.")
+
+
+async def _store_manual(message, text, wait):
+    entities = message.entities or message.caption_entities or []
+    urls = [e.url for e in entities if e.url]
+    origin = message.forward_origin
+    channel = getattr(origin, "chat", None)
+    if channel and channel.username and getattr(origin, "message_id", None):
+        urls.append(f"https://t.me/{channel.username}/{origin.message_id}")
+    oid, short = await asyncio.to_thread(manual_orders.store, message.message_id, text, urls,
+                                         int(wait) if wait and wait.isdigit() else None)
+    await asyncio.to_thread(kv_set, MANUAL_WAIT, str(oid) if short else "")
+    if short:
+        await message.answer(f"Сохранил /lead_{oid}. Пришли описание результата и исходных данных, чтобы дополнить этот заказ.")
+    else:
+        await message.answer(f"Заказ в журнале: /lead_{oid}. Оценка доступна в карточке после обработки очереди.")
+
+
+@dp.message(Command("add"))
+async def cmd_manual_add(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        await _store_manual(message, parts[1], "")
+        return
+    reply = message.reply_to_message
+    if reply and (reply.text or reply.caption):
+        await _store_manual(reply, reply.text or reply.caption, "")
+        return
+    await asyncio.to_thread(kv_set, MANUAL_WAIT, "new")
+    await message.answer(MANUAL_PROMPT)
+
+
+async def _manual_input(message: Message):
+    text = message.text or message.caption or ""
+    if not text or text.startswith("/"):
+        return False
+    wait = await asyncio.to_thread(kv_get, MANUAL_WAIT, "")
+    return {"manual_wait": wait or ""} if wait or message.forward_origin else False
+
+
+@dp.message(_manual_input)
+async def msg_manual_input(message: Message, manual_wait: str):
+    await _store_manual(message, message.text or message.caption, manual_wait)
 
 
 # ---------- Точка входа ----------

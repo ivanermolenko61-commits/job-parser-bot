@@ -59,7 +59,7 @@ from database import (
     kv_get,
     kv_set,
 )
-from freelance import ai_scorer, pricing, profile, sources, yandex_budget
+from freelance import ai_scorer, manual, pricing, profile, sources, yandex_budget
 from freelance.budget import parse_budget, rub_amount
 from freelance import journal as jr
 from freelance.alot_client import (
@@ -262,7 +262,7 @@ class CycleResult:
     reassess_notes: list[str] = field(default_factory=list)   # повторные уведомления об обновлённой оценке
 
 
-def prepare_cycle() -> CycleResult:
+def prepare_cycle(only_manual: bool = False) -> CycleResult:
     """Собирает новые заказы и оценивает их. Ничего не отправляет.
 
     Если предыдущий поток (переживший wait_for в боте) ещё работает,
@@ -271,7 +271,7 @@ def prepare_cycle() -> CycleResult:
     if not _cycle_lock.acquire(blocking=False):
         return CycleResult(busy=True, error="предыдущая проверка ещё выполняется")
     try:
-        return _prepare_cycle()
+        return _prepare_cycle(only_manual) if only_manual else _prepare_cycle()
     finally:
         _cycle_lock.release()
 
@@ -298,7 +298,7 @@ def scored_from_row(row: dict) -> ScoredOrder:
     order = FreelanceOrder(
         order_id=int(row["order_id"]), site=row.get("site") or "", title=row.get("title") or "",
         body="", price_text=row.get("price_text") or "", price_value=0.0, categories=[],
-        published_at=_parse_dt(row.get("published_at")) or datetime.now(timezone.utc),
+        published_at=_parse_dt(row.get("published_at")),
         url=row.get("url") or "",
     )
     return ScoredOrder(order, ai, row.get("dedup_key") or "", stale_note=_stale_note(row, ai))
@@ -407,7 +407,7 @@ def _expire_pending(row: dict) -> None:
 def _load_pending(threshold: datetime, sent_now: set[int],
                   feed_orders: list[FreelanceOrder] | None = None,
                   fetch_alot: bool = True,
-                  have: dict[int, FreelanceOrder] | None = None) -> dict[int, ScoredOrder]:
+                  have: dict[int, FreelanceOrder] | None = None, only_manual: bool = False) -> dict[int, ScoredOrder]:
     """Ожидающие заказы из БД (ждут оценки или доставки): просроченные помечает устаревшими (с причиной),
     остальные собирает в очередь.
 
@@ -425,14 +425,17 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     live: dict[int, dict] = {}
 
     def _expired(row: dict) -> bool:
+        if row.get("origin") == "manual" and not row.get("published_at"):
+            return False
         ref = _age_ref(_parse_dt(row["published_at"]), row.get("seen_at"), bool(row.get("pub_unreliable")))
         return ref is not None and ref < threshold
 
-    if inactive:
+    if inactive and not only_manual:
         for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive)):
             if row["order_id"] not in sent_now and _expired(row):
                 _expire_pending(row)
-    for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive), exclude_ranges=True):
+    ranges = [(sources.MANUAL_ID_OFFSET, 1 << 62)] if only_manual else sources.id_ranges(inactive)
+    for row in freelance_pending(PENDING_SCAN_LIMIT, ranges, exclude_ranges=not only_manual):
         oid = row["order_id"]
         if oid in sent_now:
             continue
@@ -444,7 +447,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     if not live:
         return {}
     items: list[dict] = []
-    ids = sorted((i for i in live if not sources.is_feed_id(i) and i not in have), reverse=True)  # новые первыми: при сбое сети теряем хвост
+    ids = sorted((i for i in live if sources.source_of(i) == sources.ALOT and i not in have), reverse=True)  # новые первыми: при сбое сети теряем хвост
     for i in range(0, len(ids), PENDING_BATCH):
         try:
             items += _fetch_items(ids[i:i + PENDING_BATCH])
@@ -467,13 +470,14 @@ def _load_pending(threshold: datetime, sent_now: set[int],
         if o is not None:
             feed_by_id[oid] = o
     fetched += [o for oid, o in feed_by_id.items() if oid in live]
+    fetched += [manual.from_row(row) for row in live.values() if row.get("origin") == "manual"]
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
         if order.order_id not in live or order.order_id in result:
             continue
         row = live[order.order_id]
         ref = _age_ref(order.published_at, row.get("seen_at"), bool(row.get("pub_unreliable")))
-        if ref is not None and ref < threshold:
+        if row.get("origin") != "manual" and ref is not None and ref < threshold:
             _expire_pending(row)
             continue
         why = reject_reason(order)
@@ -537,11 +541,14 @@ def _find_duplicate(o: FreelanceOrder) -> int | None:
     источниками (alot и прямой FL.ru/Kwork) совпадают биржа и название, а текст сравнивается как
     вспомогательный признак (journal.same_listing); по одному названию заказы не склеиваются."""
     origin = sources.source_of(o.order_id)
+    canonical = manual.original(o.url)
+    if canonical is not None and canonical != o.order_id:
+        return canonical
     cands = freelance_dup_candidates(jr.title_key(o.site, o.title), DEDUP_DAYS, o.order_id)
     if not cands:
         return None
     new = {"body": jr.norm_text(_full_snippet(o)), "origin": origin, "price": o.price_value or 0,
-           "published_ts": o.published_at.timestamp(), "reliable": not jr.pub_unreliable(o.site, origin)}
+           "published_ts": o.published_at.timestamp() if o.published_at else 0, "reliable": bool(o.published_at) and not jr.pub_unreliable(o.site, origin)}
     for c in cands:
         published = _parse_dt(c.get("published_at"))
         other = {"body": jr.norm_text(c.get("snippet") or ""), "origin": c.get("origin"),
@@ -625,6 +632,12 @@ def _intake(orders, last_id: int,
             continue
         if o.order_id in known:
             _handle_updated(o, known[o.order_id], stats)
+            continue
+        canonical = manual.original(o.url)
+        if canonical is not None and canonical != o.order_id:
+            manual.complete_from_feed(canonical, o)
+            _journal_new(o, jr.DUPLICATE, full=False, dup_of=canonical)
+            stats["duplicate"] += 1
             continue
         origin = sources.source_of(o.order_id)
         why = reject_reason(o)
@@ -822,12 +835,12 @@ def _scan_alot() -> tuple[ScanResult, int]:
     return fetch_new_orders(last_id, max_ahead=max_ahead), last_id
 
 
-def _prepare_cycle() -> CycleResult:
+def _prepare_cycle(only_manual: bool = False) -> CycleResult:
     started = time.monotonic()
     res = CycleResult()
     scan, last_id = ScanResult(), 0
     alot_ok, alot_err = False, None
-    if sources.is_enabled(sources.ALOT):
+    if not only_manual and sources.is_enabled(sources.ALOT):
         try:
             scan, last_id = _scan_alot()
             alot_ok = True
@@ -835,13 +848,13 @@ def _prepare_cycle() -> CycleResult:
             logging.exception("[FREELANCE] ошибка получения заказов")
             monitor.record("alot", 0, e, label="Источник фриланс-заказов alot.pro")
             alot_err = e
-    else:
+    elif not only_manual:
         monitor.reset_streak("alot")   # выключен намеренно: не поломка
         monitor.reset_streak("alot_feed")
-    feed_orders = _fetch_feed_orders()   # FL.ru и Kwork (если включены)
+    feed_orders = [] if only_manual else _fetch_feed_orders()   # FL.ru и Kwork (если включены)
     # Ошибка цикла - только когда брать заказы неоткуда. Пустая лента включённого FL.ru/Kwork -
     # нормальный исход: pending из БД (в том числе выпавшие из ленты) всё равно дообрабатываются
-    if not alot_ok and not feed_orders and not any(
+    if not alot_ok and not feed_orders and not manual.pending() and not any(
             sources.is_enabled(n) for n in (sources.FLRU, sources.KWORK)):
         res.error = (f"{type(alot_err).__name__}: {alot_err}" if alot_err
                      else "нет включённых источников заказов")
@@ -873,14 +886,16 @@ def _prepare_cycle() -> CycleResult:
             kv_set("freelance_stale", stale + 1)
         _track_alot_activity(scan.max_id > last_id)
     res.raw_count = scan.raw_count + len(feed_orders)
-    kv_set("freelance_last_raw", res.raw_count)
+    if not only_manual:
+        kv_set("freelance_last_raw", res.raw_count)
 
     with _sent_lock:
         sent_now = set(_sent_ids)
 
     # Приём: каждый увиденный заказ получает состояние в журнале (отсеян с причиной, дубль с оригиналом,
     # устарел, ждёт оценки). Свежесть от публикации больше не отбрасывает заказ молча
-    have, intake, new_orders = _intake([*scan.orders, *feed_orders], last_id, sent_now)
+    with manual.intake_lock:
+        have, intake, new_orders = _intake([*scan.orders, *feed_orders], last_id, sent_now)
     res.intake = intake
     res.excluded = intake["excluded"]
     seen_now = datetime.now(timezone.utc)
@@ -890,7 +905,7 @@ def _prepare_cycle() -> CycleResult:
     # Ожидающие (новые и прежние): alot-заказы из скана берутся из памяти, остальные дозапрашиваются по id,
     # FL.ru и Kwork - из ленты этого цикла
     threshold = datetime.now(timezone.utc) - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
-    pending = _load_pending(threshold, sent_now, feed_orders, fetch_alot=alot_ok, have=have)
+    pending = _load_pending(threshold, sent_now, feed_orders, fetch_alot=alot_ok, have=have, only_manual=only_manual)
     res.pending_loaded = len(pending)
     fresh_ids = {sc.order.order_id for sc in fresh}
     candidates: list[ScoredOrder] = fresh + [sc for oid, sc in pending.items() if oid not in fresh_ids]
@@ -904,7 +919,7 @@ def _prepare_cycle() -> CycleResult:
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
     now_ts = datetime.now(timezone.utc)
-    to_score.sort(key=lambda sc: (_queue_rank(sc, now_ts), -sc.order.published_at.timestamp()))
+    to_score.sort(key=lambda sc: (_queue_rank(sc, now_ts), -(sc.order.published_at or sc.first_seen or now_ts).timestamp()))
     # Квоты нет ни у кого: не дёргаем провайдеров (каждая попытка была бы «сбоем» и
     # через 3 цикла - ложным «AI не работает»), заказы ждут в pending
     res.quota_out = ai_scorer.quota_exhausted() if to_score else None
@@ -986,7 +1001,8 @@ def _prepare_cycle() -> CycleResult:
         else:
             res.to_send.append(sc)
 
-    _reassess_changed(res)
+    if not only_manual:
+        _reassess_changed(res)
     _report_ai_health(res)
 
     quota_note = f", квота пуста до {res.quota_out.astimezone(MSK):%H:%M}" if res.quota_out else ""
@@ -1042,7 +1058,7 @@ def _reassess_one(res: CycleResult, row: dict) -> None:
         order = FreelanceOrder(
             order_id=oid, site=cur.get("site") or "", title=cur.get("title") or "", body=cur.get("snippet") or "",
             price_text=cur.get("price_text") or "", price_value=0.0, categories=[],
-            published_at=_parse_dt(cur.get("published_at")) or datetime.now(timezone.utc), url=cur.get("url") or "")
+            published_at=_parse_dt(cur.get("published_at")), url=cur.get("url") or "")
         try:
             result = ai_scorer.score_order(order)
         except Exception:
@@ -1657,7 +1673,7 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
     freelance_save(
         o.order_id, o.site, ai_scorer.mask_contacts(o.title or ""), o.url,
         ai_scorer.mask_contacts(o.price_text or ""),
-        o.published_at.isoformat(), sc.dedup, sc.fit,
+        o.published_at.isoformat() if o.published_at else None, sc.dedup, sc.fit,
         json.dumps(sc.ai, ensure_ascii=False) if sc.ai else "",
         status, sc.attempts, message_id,
         category=ai.get("category"),
@@ -1666,7 +1682,7 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
         origin=origin, title_key=jr.title_key(o.site, o.title),
         content_hash=jr.content_hash(o.title, o.body) if o.body else None,
         snippet=_full_snippet(o) if o.body else None,
-        pub_unreliable=jr.pub_unreliable(o.site, origin), **states,
+        pub_unreliable=o.published_at is None or jr.pub_unreliable(o.site, origin), **states,
     )
     _feed_store_update(o, status)
 
@@ -1939,7 +1955,7 @@ def _hours_text(hours: float) -> str:
 def _age_line(sc: ScoredOrder, now: datetime | None = None) -> str:
     """Предупреждение о возрасте: устаревший заказ не выдаём за свежий, актуальность проверяют перед откликом."""
     o = sc.order
-    if jr.pub_unreliable(o.site, sources.source_of(o.order_id)):
+    if not o.published_at or jr.pub_unreliable(o.site, sources.source_of(o.order_id)):
         return "🕰 дата публикации неизвестна - проверьте, что заказ ещё открыт"
     age = ((now or datetime.now(timezone.utc)) - o.published_at).total_seconds() / 3600
     if age > FREELANCE_FRESH_HOURS:
@@ -1949,7 +1965,7 @@ def _age_line(sc: ScoredOrder, now: datetime | None = None) -> str:
 
 def _lag_line(sc: ScoredOrder) -> str:
     """Через сколько после публикации бот впервые увидел заказ (задержка источника, не очередь AI)."""
-    if sc.first_seen is None or jr.pub_unreliable(sc.order.site, sources.source_of(sc.order.order_id)):
+    if not sc.order.published_at or sc.first_seen is None or jr.pub_unreliable(sc.order.site, sources.source_of(sc.order.order_id)):
         return ""
     lag = (sc.first_seen - sc.order.published_at).total_seconds() / 3600
     return f"⏱ обнаружен через {_hours_text(max(0.0, lag))} после публикации" if lag * 60 >= 10 else ""
@@ -1963,7 +1979,7 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
     e = html.escape
     fit = sc.fit
     fire = "🔥 " if fit is not None and fit >= 9 else ""
-    t = o.published_at.astimezone(MSK).strftime("%H:%M")
+    t = o.published_at.astimezone(MSK).strftime("%H:%M") if o.published_at else "дата неизвестна"
     money = f"💰 {e((o.price_text or 'не указана')[:100])} · 🕒 {t}"
     lines = [f"{fire}💼 <b>{e((o.title or '')[:200])}</b>   [{e(site_name(o.site))}]"]
     age = _age_line(sc)
@@ -2053,7 +2069,7 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
 def format_order_plain(sc: ScoredOrder) -> str:
     """Запасной формат без HTML: название, цена, ссылка (и оценка, если есть)."""
     o = sc.order
-    t = o.published_at.astimezone(MSK).strftime("%H:%M")
+    t = o.published_at.astimezone(MSK).strftime("%H:%M") if o.published_at else "дата неизвестна"
     lines = [
         f"💼 {(o.title or '')[:200]}   [{site_name(o.site)}]",
         f"💰 {(o.price_text or 'не указана')[:100]} · 🕒 {t}",

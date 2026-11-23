@@ -57,7 +57,7 @@ class FreelanceOrder:
     price_text: str
     price_value: float
     categories: list[str]
-    published_at: datetime  # aware, UTC
+    published_at: datetime | None  # UTC, если известна
     url: str
     is_suspicious: bool = False
 

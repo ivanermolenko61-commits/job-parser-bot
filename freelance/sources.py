@@ -16,6 +16,7 @@ from database import kv_get, kv_set
 # (~1.7·10⁷) и друг с другом в общей таблице freelance_orders
 FL_ID_OFFSET = 10 ** 10
 KWORK_ID_OFFSET = 2 * 10 ** 10
+MANUAL_ID_OFFSET = 1 << 40
 FEED_ID_MIN = FL_ID_OFFSET
 
 ALOT, FLRU, KWORK = "alot", "flru", "kwork"
@@ -27,11 +28,13 @@ _OFF_KEY = "freelance_sources_off"
 
 def is_feed_id(order_id: int) -> bool:
     """Заказ пришёл напрямую с FL.ru/Kwork (а не из alot.pro) - его нельзя дозапросить по id."""
-    return order_id >= FEED_ID_MIN
+    return FEED_ID_MIN <= order_id < MANUAL_ID_OFFSET
 
 
 def source_of(order_id: int) -> str:
     """Источник заказа по его order_id (диапазоны смещений)."""
+    if order_id >= MANUAL_ID_OFFSET:
+        return "manual"
     if order_id >= KWORK_ID_OFFSET:
         return KWORK
     if order_id >= FL_ID_OFFSET:
@@ -40,7 +43,7 @@ def source_of(order_id: int) -> str:
 
 
 _INF = 1 << 62
-_RANGES = {ALOT: (0, FL_ID_OFFSET), FLRU: (FL_ID_OFFSET, KWORK_ID_OFFSET), KWORK: (KWORK_ID_OFFSET, _INF)}
+_RANGES = {ALOT: (0, FL_ID_OFFSET), FLRU: (FL_ID_OFFSET, KWORK_ID_OFFSET), KWORK: (KWORK_ID_OFFSET, MANUAL_ID_OFFSET)}
 
 
 def id_ranges(names) -> list[tuple[int, int]]:
