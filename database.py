@@ -1426,7 +1426,7 @@ def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None 
                    tech, delivery, COALESCE(pub_unreliable, 0) AS pub_unreliable
             FROM freelance_orders
             WHERE {where}
-            ORDER BY COALESCE(published_at,seen_at) DESC, order_id DESC
+            ORDER BY julianday(COALESCE(published_at,seen_at)) DESC, order_id DESC
             LIMIT ?
             """,
             (*params, limit),

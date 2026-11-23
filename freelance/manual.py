@@ -30,7 +30,8 @@ def listing(url):
         return None
     if host not in PATTERNS:
         ids = [(k.lower(), v) for k, v in parse_qsl(parts.query) if k.lower() in ("id", "task", "project") and v.isdecimal()]
-        if not parts.path.strip("/") and not ids:
+        job_path = re.search(r"/(?:tasks?|projects?|jobs?|orders?|wants?)/[^/]+", parts.path, re.I)
+        if not job_path and not ids:
             return None
         path = parts.path.rstrip("/")
         canonical = "https://" + host + path + ("?" + urlencode(sorted(ids)) if ids else "")
@@ -120,9 +121,13 @@ def store(message_id, text, urls=(), supplement=None):
                              "AND (manual_key=? OR order_id=?) ORDER BY order_id LIMIT 1",
                              (oid, key, direct)).fetchone()
         title = next((s.strip() for s in clean.splitlines() if s.strip()), "Заказ по ссылке")[:180]
-        if found and found["queue_reason"] == jr.Q_NO_TEXT and not old:
+        if found and found["queue_reason"] == jr.Q_NO_TEXT:
             previous = conn.execute("SELECT * FROM freelance_orders WHERE order_id=? AND origin='manual'", (found["order_id"],)).fetchone()
             if previous:
+                if old:
+                    conn.execute("UPDATE freelance_orders SET tech='duplicate',dup_of=?,queue_reason=NULL WHERE order_id=?",
+                                 (previous["order_id"], oid))
+                    conn.execute("UPDATE freelance_manual_inputs SET order_id=? WHERE order_id=?", (previous["order_id"], oid))
                 old, oid, found = previous, previous["order_id"], None
                 clean = "\n".join(filter(None,(old["snippet"],clean)))[:ai_scorer.BODY_LIMIT]
                 title = next((s.strip() for s in clean.splitlines() if s.strip()), title)[:180]

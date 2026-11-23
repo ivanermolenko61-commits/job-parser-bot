@@ -64,8 +64,18 @@ class ManualTests(CycleTestBase):
             records=conn.execute("SELECT message_id FROM freelance_manual_inputs WHERE order_id=? ORDER BY message_id",(direct.order_id,)).fetchall()
         self.assertEqual([r[0] for r in records],[301,302])
 
+    def test_two_short_inputs_merge_into_ready_order(self):
+        target, _ = manual.store(310, self.url)
+        placeholder, _ = manual.store(311, "Excel")
+        self.assertEqual(manual.store(312, self.text + " " + self.url, supplement=placeholder), (target, False))
+        self.assertIn("API", database.freelance_get(target)["snippet"])
+        self.assertTrue(manual.pending())
+        self.assertIsNone(manual.listing("https://docs.example.org/shared/reference"))
+
     def test_from_telegram_to_completed_deal(self):
-        import bot
+        from unittest.mock import patch
+        with patch.dict("os.environ", {"BOT_TOKEN": "123456:TEST"}):
+            import bot
         from freelance import leads, journal as jr
         from tests.test_leads_bot import make_message, make_call, run, CHAT
         msg=make_message(self.text)
