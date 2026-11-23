@@ -1943,14 +1943,12 @@ MANUAL_PROMPT = "Пришли текст, подпись или пересылк
 MANUAL_WAIT = "freelance_manual_wait"
 
 
-@dp.callback_query(F.data == "fl_add")
 async def cb_manual_start(call: CallbackQuery):
     await call.answer()
     await asyncio.to_thread(kv_set, MANUAL_WAIT, "new")
     await call.message.answer(MANUAL_PROMPT)
 
 
-@dp.message(Command("cancel"))
 async def cmd_manual_cancel(message: Message):
     await asyncio.to_thread(kv_set, MANUAL_WAIT, "")
     await message.answer("Ручной ввод завершён.")
@@ -1972,7 +1970,6 @@ async def _store_manual(message, text, wait):
         await message.answer(f"Заказ в журнале: /lead_{oid}. Оценка доступна в карточке после обработки очереди.")
 
 
-@dp.message(Command("add"))
 async def cmd_manual_add(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2:
@@ -1994,9 +1991,15 @@ async def _manual_input(message: Message):
     return {"manual_wait": wait or ""} if wait or message.forward_origin else False
 
 
-@dp.message(_manual_input)
 async def msg_manual_input(message: Message, manual_wait: str):
     await _store_manual(message, message.text or message.caption, manual_wait)
+
+
+# Личный журнал и состояние диалога доступны только в чате владельца.
+dp.callback_query.register(cb_manual_start, F.data == "fl_add", F.message.chat.id == MY_CHAT_ID)
+dp.message.register(cmd_manual_cancel, Command("cancel"), F.chat.id == MY_CHAT_ID)
+dp.message.register(cmd_manual_add, Command("add"), F.chat.id == MY_CHAT_ID)
+dp.message.register(msg_manual_input, F.chat.id == MY_CHAT_ID, _manual_input)
 
 
 # ---------- Точка входа ----------
