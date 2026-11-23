@@ -50,3 +50,44 @@ class ManualTests(CycleTestBase):
         oid,_ = manual.store(205,self.text+" https://example.org/tasks/765/?utm_source=test")
         self.assertEqual(manual.store(206,"https://example.org/tasks/765"),(oid,False))
         self.assertIsNone(manual.listing("https://example.org:invalid/path"))
+
+    def test_replayed_supplement_redirects_to_existing_order_and_keeps_notes(self):
+        direct = make_order(sources.FL_ID_OFFSET + 1313)
+        direct.site, direct.url = "flru", self.url
+        pipeline._journal_new(direct,"queued",full=True)
+        oid,short = manual.store(301,"Excel")
+        self.assertTrue(short)
+        self.assertEqual(manual.store(302,self.text+" "+self.url,supplement=oid),(direct.order_id,False))
+        self.assertEqual(manual.store(302,self.text+" "+self.url,supplement=oid),(direct.order_id,False))
+        self.assertIn("API",manual.latest_note(direct.order_id))
+        with database._connect() as conn:
+            records=conn.execute("SELECT message_id FROM freelance_manual_inputs WHERE order_id=? ORDER BY message_id",(direct.order_id,)).fetchall()
+        self.assertEqual([r[0] for r in records],[301,302])
+
+    def test_from_telegram_to_completed_deal(self):
+        import bot
+        from freelance import leads, journal as jr
+        from tests.test_leads_bot import make_message, make_call, run, CHAT
+        msg=make_message(self.text)
+        msg.message_id=304
+        msg.caption=None
+        msg.entities=msg.caption_entities=[]
+        msg.forward_origin=None
+        run(bot.msg_manual_input(msg,"new"))
+        oid=sources.MANUAL_ID_OFFSET+304
+        with patch.object(pipeline.ai_scorer,"score_order",return_value=ai_result(9)):
+            cycle=pipeline._prepare_cycle(True)
+        pipeline.save_sent(cycle.to_send[0],23)
+        call=make_call(f"fl_draft:{oid}")
+        with patch.object(bot,"MY_CHAT_ID",CHAT):
+            run(bot.cb_fl_draft(call))
+        self.assertEqual(call.message.answer.await_count,2)
+        leads.set_stage(oid,jr.LEAD_APPLIED)
+        database.freelance_lead_remind(oid,"2026-11-01 00:00:00")
+        database.init_db()
+        self.assertIn(oid,[r["order_id"] for r in database.freelance_reminders_due("2026-11-23 12:00:00")])
+        leads.set_stage(oid,jr.LEAD_AGREED)
+        database.freelance_set_deal_price(oid,9000)
+        leads.set_stage(oid,jr.LEAD_DONE)
+        database.freelance_set_actuals(oid,3,1000)
+        self.assertEqual(database.freelance_get(oid)["lead"],jr.LEAD_DONE)

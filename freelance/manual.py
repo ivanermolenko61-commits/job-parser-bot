@@ -75,6 +75,13 @@ def complete_from_feed(oid, order):
                       ai_scorer.mask_contacts(order.price_text or ""),jr.Q_WAIT,oid,jr.Q_NO_TEXT))
 
 
+def latest_note(oid):
+    with _connect() as conn:
+        row = conn.execute("SELECT note FROM freelance_manual_inputs WHERE order_id=? AND note!='' "
+                           "ORDER BY message_id DESC LIMIT 1", (oid,)).fetchone()
+        return row[0] if row else ""
+
+
 def from_row(row):
     return FreelanceOrder(row["order_id"], row["site"], row["title"], row["snippet"] or "",
                          row["price_text"] or "", 0, [], None, row["url"] or "")
@@ -86,13 +93,24 @@ def store(message_id, text, urls=(), supplement=None):
     links = [listing(u) for u in [*LINK.findall(text), *urls] if isinstance(u, str)]
     identity = next((link for link in links if link and link[0] in {s for s, _ in PATTERNS.values()}), None) or next((link for link in links if link), None)
     clean = ai_scorer.mask_contacts(LINK.sub("", text)).strip()[:ai_scorer.BODY_LIMIT]
+    note = clean
     oid = sources.MANUAL_ID_OFFSET + message_id
     with intake_lock, _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        receipt = conn.execute("SELECT o.order_id,o.queue_reason FROM freelance_manual_inputs i "
+                               "JOIN freelance_orders o ON o.order_id=i.order_id WHERE i.message_id=?", (message_id,)).fetchone()
+        if receipt:
+            return receipt[0], receipt[1] == jr.Q_NO_TEXT
+
+        def saved(target, short):
+            conn.execute("INSERT INTO freelance_manual_inputs(message_id,order_id,note) VALUES (?,?,?)",
+                         (message_id, target, note))
+            return target, short
+
         old = conn.execute("SELECT * FROM freelance_orders WHERE order_id=? AND origin='manual'",
                            (supplement or oid,)).fetchone()
         if old and (not supplement or old["queue_reason"] != jr.Q_NO_TEXT):
-            return old["order_id"], old["queue_reason"] == jr.Q_NO_TEXT
+            return saved(old["order_id"], old["queue_reason"] == jr.Q_NO_TEXT)
         if old:
             oid = old["order_id"]
             clean = "\n".join(filter(None,(old["snippet"],clean)))[:ai_scorer.BODY_LIMIT]
@@ -117,8 +135,9 @@ def store(message_id, text, urls=(), supplement=None):
             if old:
                 conn.execute("UPDATE freelance_orders SET tech='duplicate',dup_of=?,queue_reason=NULL WHERE order_id=?",
                              (duplicate, oid))
+                conn.execute("UPDATE freelance_manual_inputs SET order_id=? WHERE order_id=?", (duplicate, oid))
             target = conn.execute("SELECT queue_reason FROM freelance_orders WHERE order_id=?", (duplicate,)).fetchone()
-            return duplicate, bool(target and target[0] == jr.Q_NO_TEXT)
+            return saved(duplicate, bool(target and target[0] == jr.Q_NO_TEXT))
         short = len(clean) < 45
         conn.execute("""INSERT INTO freelance_orders
             (order_id,origin,site,manual_key,title,title_key,snippet,content_hash,url,tech,queue_reason,delivery,status,pub_unreliable)
@@ -127,4 +146,4 @@ def store(message_id, text, urls=(), supplement=None):
             title_key=excluded.title_key,snippet=excluded.snippet,content_hash=excluded.content_hash,
             url=excluded.url,queue_reason=excluded.queue_reason""",
             (oid,site,key,title,jr.title_key(site,title),clean,jr.content_hash(title,clean),url,jr.Q_NO_TEXT if short else jr.Q_WAIT))
-        return oid, short
+        return saved(oid, short)

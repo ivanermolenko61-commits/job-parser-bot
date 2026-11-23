@@ -1153,6 +1153,9 @@ def _lead_card_data(order_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
         return None
     events = freelance_lead_events(order_id, lv.EVENT_LIMIT)
     text = lv.lead_card_text(lead, events, freelance_last_deal_price(order_id))
+    note = manual_orders.latest_note(order_id)
+    if note:
+        text += "\nПоследний ручной ввод: " + html.escape(note[:200])
     return text, _kb(lv.lead_card_buttons(lead, events, undo_available=freelance_lead_can_undo(order_id)))
 
 

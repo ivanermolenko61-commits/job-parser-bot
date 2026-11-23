@@ -346,6 +346,7 @@ def cleanup_old(days: int = 5) -> int:
              f'-{FREELANCE_MARKET_DAYS} days', f'-{FREELANCE_DEAL_DAYS} days'),
         )
         # события удалённых заказов не остаются; события активных лидов живут, пока жив заказ
+        conn.execute("DELETE FROM freelance_manual_inputs WHERE order_id NOT IN (SELECT order_id FROM freelance_orders)")
         conn.execute("DELETE FROM freelance_lead_events "
                      "WHERE order_id NOT IN (SELECT order_id FROM freelance_orders)")
         conn.execute("DELETE FROM freelance_funnel_daily WHERE day < date('now', ?)",
@@ -417,6 +418,9 @@ def _init_freelance(conn) -> None:
         if col not in cols:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_key ON freelance_orders(manual_key) WHERE manual_key IS NOT NULL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS freelance_manual_inputs (
+        message_id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, note TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_inputs_order ON freelance_manual_inputs(order_id)")
     _backfill_journal(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_title_key ON freelance_orders(title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_tech ON freelance_orders(tech)")
