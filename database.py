@@ -354,6 +354,8 @@ def cleanup_old(days: int = 5) -> int:
                      "WHERE order_id NOT IN (SELECT order_id FROM freelance_orders)")
         conn.execute("DELETE FROM freelance_funnel_daily WHERE day < date('now', ?)",
                      (f'-{FREELANCE_KEEP_DAYS * 2} days',))
+        conn.execute("DELETE FROM freelance_delivery_attempts WHERE created_at < datetime('now', ?)",
+                     (f'-{FREELANCE_KEEP_DAYS} days',))
         conn.commit()
         return deleted
 
@@ -405,11 +407,18 @@ def _init_freelance(conn) -> None:
                              ((listing_key(url), order_id) for url, order_id in batch))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS freelance_retired (
-            order_id INTEGER PRIMARY KEY, listing_key TEXT, seen_at TEXT, delivered_at TEXT
+            order_id INTEGER PRIMARY KEY, listing_key TEXT
         )
     """)
+    # Храним только отпечаток и ID: удаление полной записи не делает старый заказ новым.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_retired_key ON freelance_retired(listing_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_listing_key ON freelance_orders(listing_key)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_delivery_attempts (
+            token TEXT PRIMARY KEY, order_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+            message_id INTEGER, confirmed_at TEXT, card_deleted_at TEXT
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS yandex_paid_ledger (
             token TEXT PRIMARY KEY, pilot_start TEXT NOT NULL, day TEXT NOT NULL,
@@ -422,8 +431,8 @@ def _init_freelance(conn) -> None:
         CREATE TRIGGER IF NOT EXISTS freelance_remember_retired
         AFTER DELETE ON freelance_orders
         BEGIN
-            INSERT OR IGNORE INTO freelance_retired VALUES
-                (OLD.order_id, OLD.listing_key, OLD.seen_at, OLD.delivered_at);
+            INSERT OR IGNORE INTO freelance_retired(order_id, listing_key) VALUES
+                (OLD.order_id, CASE WHEN OLD.tech NOT IN ('filtered','duplicate') THEN OLD.listing_key END);
         END
     """)
     if "attempts" not in cols:
@@ -842,8 +851,15 @@ def freelance_mark_filtered(order_id: int, reason: str) -> bool:
         tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
 
 
-def freelance_mark_card_deleted(order_id: int) -> bool:
+def freelance_mark_card_deleted(order_id: int, duplicate_message_id: int | None = None) -> bool:
     """Карточка удалена из чата по сроку. Ни технический статус, ни этап сделки не меняются."""
+    if duplicate_message_id is not None:
+        with _connect() as conn:
+            cur = conn.execute(
+                "UPDATE freelance_delivery_attempts SET card_deleted_at=? WHERE order_id=? AND message_id=?",
+                (_now_sql(), order_id, duplicate_message_id),
+            )
+            return bool(cur.rowcount)
     return _update_states(order_id, card_deleted_at=_now_sql())
 
 
@@ -1454,20 +1470,25 @@ def freelance_set_message(order_id: int, message_id: int) -> None:
 
 def freelance_expired_messages(ttl_hours: int, limit: int = 200) -> list[dict]:
     """Карточки старше ttl_hours - под удаление из чата. Карточки активных лидов (сохранён,
-    откликнулся, обсуждаем, договорились) остаются; сам лид удаление карточки не закрывает."""
+    откликнулся, обсуждаем, договорились) остаются; повторная карточка удаляется отдельно."""
     marks = ",".join("?" * len(jr.LEAD_ACTIVE))
     with _connect() as conn:
         rows = conn.execute(
             f"""
-            SELECT order_id, message_id
+            SELECT order_id, message_id, 0 AS duplicate_card, sent_at AS sent
             FROM freelance_orders
             WHERE delivery = 'card' AND message_id IS NOT NULL AND card_deleted_at IS NULL
               AND COALESCE(lead, '') NOT IN ({marks})
               AND sent_at < datetime('now', ?)
-            ORDER BY sent_at
+            UNION ALL
+            SELECT a.order_id, a.message_id, 1, a.confirmed_at
+            FROM freelance_delivery_attempts a LEFT JOIN freelance_orders o ON o.order_id=a.order_id
+            WHERE a.message_id IS NOT NULL AND a.card_deleted_at IS NULL AND o.message_id IS NOT a.message_id
+              AND a.confirmed_at < datetime('now', ?)
+            ORDER BY sent
             LIMIT ?
             """,
-            (*jr.LEAD_ACTIVE, f"-{ttl_hours} hours", limit),
+            (*jr.LEAD_ACTIVE, f"-{ttl_hours} hours", f"-{ttl_hours} hours", limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1580,6 +1601,9 @@ def freelance_claim_delivery(order_id: int) -> dict | None:
         )
         row = cur.fetchone()
         cur.close()
+        if row is not None:
+            conn.execute("INSERT INTO freelance_delivery_attempts(token,order_id,created_at) VALUES (?,?,?)",
+                         (token, order_id, now))
         return dict(row) if row is not None else None
 
 
@@ -1611,15 +1635,26 @@ def freelance_finish_delivery(order_id: int, token: str, message_id: int | None,
                 "UPDATE freelance_orders SET delivery_token=NULL, delivery_retry_at=datetime(?, ?) "
                 "WHERE order_id=? AND delivery_token=?", (now, f"+{delay} seconds", order_id, token),
             )
-        else:
-            cur = conn.execute(
-                """UPDATE freelance_orders SET delivery='card',
-                       status=CASE WHEN lead IN ('applied','discussing','agreed','done') THEN 'taken'
-                       WHEN lead='lost' THEN 'dismissed' ELSE 'sent' END,
-                       message_id=?, sent_at=?, delivered_at=?, delivery_token=NULL, delivery_retry_at=NULL
-                   WHERE order_id=? AND delivery_token=?""", (message_id, now, now, order_id, token),
-            )
-        return bool(cur.rowcount)
+            return bool(cur.rowcount)
+        # Даже просроченная попытка могла закончиться успехом. Первое подтверждение
+        # остаётся основной карточкой, остальные ID доступны для очистки.
+        attempt = conn.execute(
+            """UPDATE freelance_delivery_attempts
+               SET message_id=?, confirmed_at=COALESCE(confirmed_at,?)
+               WHERE order_id=? AND token=? AND (message_id IS NULL OR message_id=?)""",
+            (message_id, now, order_id, token, message_id),
+        )
+        if not attempt.rowcount:
+            return False
+        conn.execute(
+            """UPDATE freelance_orders SET delivery='card', tech='assessed',
+                   status=CASE WHEN lead IN ('applied','discussing','agreed','done') THEN 'taken'
+                   WHEN lead='lost' THEN 'dismissed' ELSE 'sent' END,
+                   message_id=?, sent_at=?, delivered_at=?, delivery_token=NULL, delivery_retry_at=NULL,
+                   stale_at=NULL, stale_reason=NULL
+               WHERE order_id=? AND message_id IS NULL""", (message_id, now, now, order_id),
+        )
+        return True
 
 
 def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None = None,

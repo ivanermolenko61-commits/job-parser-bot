@@ -523,7 +523,7 @@ async def _confirm_live_card(oid: int, token: str, message_id: int) -> None:
         logging.exception("[FREELANCE] Telegram подтвердил карточку %s, запись повторится", oid)
         return
     if not saved:
-        logging.error("[FREELANCE] Telegram подтвердил карточку %s, аренда доставки уже сменилась", oid)
+        logging.error("[FREELANCE] Telegram подтвердил карточку %s, попытка не найдена в журнале", oid)
     _live_delivery_acks.pop(oid, None)
 
 
@@ -1442,7 +1442,10 @@ async def cleanup_freelance_messages():
                 logging.exception(f"[FREELANCE] не удалось удалить сообщение {row['message_id']}")
                 continue  # статус не меняем: повторим в следующий час
             # карточка удалена по сроку: лид и техническая обработка заказа не меняются
-            await asyncio.to_thread(freelance_mark_card_deleted, row["order_id"])
+            if row["duplicate_card"]:
+                await asyncio.to_thread(freelance_mark_card_deleted, row["order_id"], row["message_id"])
+            else:
+                await asyncio.to_thread(freelance_mark_card_deleted, row["order_id"])
             await asyncio.sleep(0.1)
         if rows:
             logging.info(f"[FREELANCE] очистка: найдено {len(rows)}, удалено {deleted}")

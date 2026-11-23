@@ -64,6 +64,37 @@ class LiveFreelanceTest(CycleTestBase):
         self.assertIsNone(database.freelance_claim_delivery(10))
         self.assertEqual(database.freelance_live_daily_metrics()["under_five"], 1)
 
+    def test_late_confirmation_after_another_claim_keeps_both_message_ids(self):
+        self.intake(self.order(10))
+        self.assertTrue(self.assess(10))
+        first = database.freelance_claim_delivery(10)
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET delivery_retry_at=datetime('now','-1 second') WHERE order_id=10")
+        second = database.freelance_claim_delivery(10)
+        self.assertTrue(database.freelance_finish_delivery(10, second["delivery_token"], 200))
+        self.assertTrue(database.freelance_finish_delivery(10, first["delivery_token"], 100))
+        self.assertEqual(database.freelance_get(10)["message_id"], 200)
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_delivery_attempts SET confirmed_at=datetime('now','-25 hours')")
+        expired = database.freelance_expired_messages(24)
+        self.assertEqual([(r["message_id"], r["duplicate_card"]) for r in expired], [(100, 1)])
+        self.assertTrue(database.freelance_mark_card_deleted(10, 100))
+        self.assertEqual(database.freelance_expired_messages(24), [])
+        self.assertIsNone(database.freelance_get(10)["card_deleted_at"])
+
+    def test_late_confirmation_after_expiry_registers_the_card(self):
+        self.intake(self.order(10))
+        self.assertTrue(self.assess(10))
+        claimed = database.freelance_claim_delivery(10)
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET delivery_retry_at=datetime('now','-1 second'), "
+                         "published_at=datetime('now','-61 minutes') WHERE order_id=10")
+        self.assertEqual(database.freelance_expire_live(), 1)
+        self.assertTrue(database.freelance_finish_delivery(10, claimed["delivery_token"], 100))
+        self.assertEqual(database.freelance_get(10)["message_id"], 100)
+        self.assertEqual(database.freelance_get(10)["delivery"], jr.D_CARD)
+        self.assertIsNone(database.freelance_claim_delivery(10))
+
     def test_unreliable_alias_cannot_revive_old_direct_listing(self):
         alias = self.order(11, None)
         alias.url = "https://freelance.ru/task/view/12?tracking=1"
