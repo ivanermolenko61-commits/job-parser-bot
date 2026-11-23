@@ -9,6 +9,7 @@
 import csv
 import html
 import io
+import math
 import sqlite3
 import statistics
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from freelance import journal as jr
 _COLUMNS = (
     "order_id, site, origin, title, price_text, budget, url, published_at, seen_at, assessed_at, "
     "delivered_at, tech, queue_reason, reject_reason, verdict, dup_of, delivery, card_deleted_at, "
-    "stale_reason, desc_changed, lead, lead_reason, fit, category, hours, snippet, "
+    "stale_reason, desc_changed, lead, lead_reason, fit, category, hours, snippet, deal_price, "
     "COALESCE(pub_unreliable, 0) AS pub_unreliable"
 )
 
@@ -56,7 +57,19 @@ def load_rows(days: int = 14) -> list[dict]:
             f"SELECT {_COLUMNS} FROM freelance_orders WHERE seen_at >= datetime('now', ?) ORDER BY seen_at",
             (f"-{int(days)} days",),
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = {r["order_id"]: dict(r) for r in rows}
+        cohort = "SELECT order_id FROM freelance_orders WHERE seen_at >= datetime('now', ?)"
+        cutoff = (f"-{int(days)} days",)
+        for oid, stage in conn.execute(
+            f"SELECT DISTINCT order_id, to_lead FROM freelance_lead_events WHERE kind='stage' "
+            f"AND undone=0 AND order_id IN ({cohort})", cutoff
+        ):
+            result[oid].setdefault("stages", set()).add(stage)
+        for oid, hours, expenses in conn.execute(
+            f"SELECT order_id, hours, expenses FROM freelance_actuals WHERE order_id IN ({cohort})", cutoff
+        ):
+            result[oid].update(actual_hours=hours, expenses=expenses)
+        return list(result.values())
 
 
 def load_excluded(days: int = 14) -> dict[str, int]:
@@ -99,11 +112,17 @@ def source_label(row: dict) -> str:
 def funnel(rows: list[dict]) -> dict[str, dict]:
     """Воронка по источникам: {источник: счётчики}. discovered - строки журнала (без вакансионных досок)."""
     result: dict[str, dict] = {}
+    seen = set()
     for r in rows:
+        oid = r.get("order_id")
+        if oid is not None and oid in seen:
+            continue
+        seen.add(oid)
         c = result.setdefault(source_label(r), {
             "discovered": 0, "filtered": 0, "duplicate": 0, "queued": 0, "stale": 0, "legacy": 0,
             "assessed": 0, "good": 0, "low_fit": 0, "card": 0, "digest": 0, "delivery_pending": 0,
-            "delivery_unknown": 0, "leads": 0})
+            "delivery_unknown": 0, "leads": 0, "unique_good": 0, "applied": 0, "discussing": 0,
+            "agreed": 0, "done": 0, "lost_reasons": {}, "net": 0.0, "work_hours": 0.0, "priced": 0})
         c["discovered"] += 1
         tech = r.get("tech") if r.get("tech") in jr.TECH_STATES else jr.LEGACY
         c[tech] += 1 if tech != jr.ASSESSED else 0
@@ -122,8 +141,25 @@ def funnel(rows: list[dict]) -> dict[str, dict]:
             c["delivery_pending"] += 1
         elif delivery == jr.D_UNKNOWN:
             c["delivery_unknown"] += 1
-        if r.get("lead"):
-            c["leads"] += 1
+        if tech == jr.DUPLICATE or r.get("dup_of") is not None:
+            continue
+        c["unique_good"] += int(r.get("verdict") == jr.V_OK)
+        stages = set(r.get("stages", ())) | {r.get("lead")}
+        c["leads"] += int(bool(stages.intersection((*jr.LEAD_ACTIVE, jr.LEAD_DONE))))
+        for stage in (jr.LEAD_APPLIED, jr.LEAD_DISCUSSING, jr.LEAD_AGREED, jr.LEAD_DONE):
+            c[stage] += int(stage in stages)
+        if r.get("lead") == jr.LEAD_LOST:
+            reason = r.get("lead_reason") or "без причины"
+            c["lost_reasons"][reason] = c["lost_reasons"].get(reason, 0) + 1
+        if r.get("lead") == jr.LEAD_DONE:
+            try:
+                price, hours, expenses = (float(r[k]) for k in ("deal_price", "actual_hours", "expenses"))
+            except (KeyError, ValueError, TypeError, OverflowError):
+                continue
+            if all(map(math.isfinite, (price, hours, expenses))) and price > 0 and hours > 0 and expenses >= 0:
+                c["net"] += price - expenses
+                c["work_hours"] += hours
+                c["priced"] += 1
     return result
 
 
@@ -211,6 +247,13 @@ def format_funnel(rows: list[dict], excluded: dict[str, int] | None = None, days
             f"дубли {c['duplicate']}, устарели {c['stale']}, ждут оценки {c['queued']} → оценено {c['assessed']} "
             f"(подходят {c['good']}, ниже порога {c['low_fit']}) → карточкой {c['card']}, сводкой {c['digest']}, "
             f"ждут доставки {c['delivery_pending']}")
+        lines.append(f"  уникальных подходящих {c['unique_good']}, откликов {c['applied']}, "
+                     f"ответов {c['discussing']}, договорённостей {c['agreed']}, завершено {c['done']}")
+        if c["lost_reasons"]:
+            reasons = ", ".join(f"{html.escape(reason)} ×{n}" for reason, n in sorted(c["lost_reasons"].items()))
+            lines.append(f"  причины отказов: {reasons}")
+        rate = f"{c['net'] / c['work_hours']:.0f} ₽/ч ({c['priced']} сделок)" if c["priced"] else "нет заполненных сделок"
+        lines.append(f"  фактическая отдача: {rate}")
         lines.append(f"  задержка источника {_fmt_stats(d.get('source'))}; очередь AI {_fmt_stats(d.get('ai_queue'))}; "
                      f"доставка {_fmt_stats(d.get('delivery'))}")
     return "\n".join(lines)

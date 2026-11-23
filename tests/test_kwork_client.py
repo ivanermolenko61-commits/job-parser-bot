@@ -109,6 +109,13 @@ class FetchTest(unittest.TestCase):
             got = kwork_client.fetch_kwork_orders(pages=3)
         self.assertEqual([o.order_id - KWORK_ID_OFFSET for o in got], [1])
 
+        self.assertEqual(got.failed_page, 2)
+        from freelance import pipeline
+        with mock.patch.object(pipeline.sources, "is_enabled", return_value=True), mock.patch.object(pipeline.monitor, "record") as record:
+            self.assertIs(pipeline._fetch_source("kwork", lambda: got, "Kwork"), got)
+        self.assertEqual(record.call_args.args[:2], ("kwork", 1))
+        self.assertIn("страница 2", str(record.call_args.args[2]))
+
     def test_page_of_filtered_projects_does_not_stop_paging(self):
         # на странице 2 есть проекты, но все неактивные: обход идёт дальше, на странице 3 есть заказ
         archived = kwork_client.parse_page_counted(page(want(pid=7, status="archive"), want(pid=8, status="archive")))

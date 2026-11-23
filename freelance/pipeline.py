@@ -757,7 +757,12 @@ def _fetch_source(name: str, fetch, label: str) -> list[FreelanceOrder]:
         logging.exception(f"[FREELANCE] ошибка получения заказов: {label}")
         monitor.record(name, 0, e, label=label)
         return []
-    monitor.record(name, len(orders), label=label)
+    failed_page = getattr(orders, "failed_page", None)
+    if failed_page is None:
+        monitor.record(name, len(orders), label=label)
+    else:
+        error = RuntimeError(f"Частичный обход, недоступна страница {failed_page}")
+        monitor.record(name, len(orders), error, label=label)
     return orders
 
 

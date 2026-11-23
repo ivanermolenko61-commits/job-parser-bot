@@ -119,6 +119,13 @@ def _fetch_page(page: int) -> tuple[list[FreelanceOrder], int]:
     return parse_page_counted(resp.text)
 
 
+class KworkOrders(list):
+    """Собранные заказы и номер первой недоступной страницы."""
+    def __init__(self, orders, failed_page=None):
+        super().__init__(orders)
+        self.failed_page = failed_page
+
+
 def fetch_kwork_orders(pages: int = KWORK_PAGES) -> list[FreelanceOrder]:
     """Свежие заказы Kwork (первые страницы категории). Сбой первой страницы - исключение;
     сбой следующих не теряет уже собранное (скан просто короче)."""
@@ -129,16 +136,16 @@ def fetch_kwork_orders(pages: int = KWORK_PAGES) -> list[FreelanceOrder]:
         try:
             found, raw_count = _fetch_page(page)
         except (requests.RequestException, RuntimeError) as e:
-            if not orders:
+            if page == 1:
                 raise
             logging.warning(f"[KWORK] страница {page} не получена ({type(e).__name__}), "
                             f"собранные {len(orders)} заказов сохраняем")
-            break
+            return KworkOrders(orders.values(), failed_page=page)
         if raw_count == 0 and page > 1:
             break   # проекты кончились; страница из одних неактивных/неразобранных - не конец
         for o in found:
             orders[o.order_id] = o
-    return list(orders.values())
+    return KworkOrders(orders.values())
 
 
 if __name__ == "__main__":
