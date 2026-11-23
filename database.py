@@ -327,7 +327,7 @@ def cleanup_old(days: int = 5) -> int:
             UPDATE freelance_orders SET ai_json = ''
             WHERE seen_at < datetime('now', ?)
               AND COALESCE(budget, 0) > 0 AND COALESCE(deal_price, 0) <= 0
-              AND ai_json != ''
+              AND ai_json != '' AND COALESCE(delivery,'') != 'pending'
             """,
             (f'-{FREELANCE_KEEP_DAYS} days',),
         )
@@ -338,6 +338,7 @@ def cleanup_old(days: int = 5) -> int:
             f"""
             DELETE FROM freelance_orders
             WHERE seen_at < datetime('now', ?)
+              AND COALESCE(tech,'') != 'queued' AND NOT (COALESCE(tech,'') = 'assessed' AND COALESCE(delivery,'') = 'pending')
               AND COALESCE(lead, '') NOT IN ({active})
               AND NOT (COALESCE(budget, 0) > 0 AND COALESCE(fit, 0) >= ? AND seen_at >= datetime('now', ?))
               AND NOT (COALESCE(deal_price, 0) > 0 AND seen_at >= datetime('now', ?))

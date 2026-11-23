@@ -9,8 +9,8 @@
   • неоценённые и неотправленные заказы лежат в БД со статусом pending и счётчиком
     attempts, каждый цикл дозапрашиваются по id (getProjects);
   • без оценки AI заказ в чат не уходит: ждёт в pending, пока AI не ответит
-    (о простое AI приходит health-оповещение); «без AI» - только если ключей нет;
-  • ожидающий старше FREELANCE_QUEUE_MAX_HOURS получает состояние stale с причиной (не исчезает молча);
+    (о простое AI приходит health-оповещение);
+  • принятые заказы остаются в очереди до обработки и доставки;
   • успешно отправленные заказы дополнительно держатся в памяти (_sent_ids), чтобы
     сбой записи в БД не привёл к дублю.
 """
@@ -42,7 +42,6 @@ from database import (
     freelance_known,
     freelance_mark_desc_changed,
     freelance_mark_filtered,
-    freelance_mark_stale,
     freelance_assessment_get,
     freelance_claim_assessment_notice,
     freelance_pending,
@@ -80,7 +79,7 @@ DEDUP_DAYS = 3
 MAX_AI_PER_CYCLE = 120
 AI_WORKERS = 4
 # Общий дедлайн на AI-оценку (сек от старта prepare_cycle); неоценённые откладываются
-AI_DEADLINE_SEC = 600
+AI_DEADLINE_SEC = 45
 # Сколько pending-заказов дозапрашиваем за цикл (пачки по 100 id - лимит getProjects).
 # Поток ~150 кандидатов в сутки, за 6 ч свежести pending обычно < 50
 PENDING_FETCH_LIMIT = 300
@@ -90,7 +89,7 @@ PENDING_BATCH = 100
 # Верхняя оценка длительности prepare_cycle (для wait_for в боте)
 PREPARE_TIMEOUT_SEC = 1800
 # Если столько циклов подряд нет id выше last_id - перепроверяем границу (≈ 1 ч)
-STALE_CYCLES_LIMIT = 12
+STALE_CYCLES_LIMIT = 60
 PARTIAL_ALERT_CYCLES = 3   # столько циклов подряд скан обрывается, не продвигая курсор, - тревога
 # При первом запуске/застое отступаем от границы на столько id (~50 id/час * 24 ч с запасом)
 BOOTSTRAP_LOOKBACK = 1500
@@ -99,8 +98,7 @@ BOOTSTRAP_LOOKBACK = 1500
 FIRST_RUN_LOOKBACK = 50
 # Резерв дневной квоты AI для заказов поважнее (группы filters.priority): группа 3
 # оценивается, пока осталось больше половины квоты, группа 2 - больше 20%, группа 1 - всегда.
-# Отложенный заказ ждёт в pending; квота сбрасывается в 03:00 МСК, а свежесть - 6 ч,
-# поэтому после сброса оценятся только недавние отложенные, остальные истекут.
+# Отложенные заказы ждут следующей доступной квоты в SQLite.
 RESERVE_SHARE = {2: 0.2, 3: 0.5}
 # Быстрый триаж (ai_scorer.triage_order): off - выключен; shadow - считается и сравнивается с полной
 # оценкой в логе, заказы не отсеивает; on - заказы с быстрой оценкой <= TRIAGE_REJECT_MAX не оцениваются
@@ -390,57 +388,20 @@ def _parse_seen(value) -> datetime | None:
         return _parse_dt(value) if value else None
 
 
-def _age_ref(published: datetime | None, seen_at, unreliable: bool) -> datetime | None:
-    """От чего считать возраст заказа. Дата публикации ненадёжна (alot.pro отдаёт для Kwork время
-    своего сбора) - считаем от первого обнаружения."""
-    if unreliable:
-        return _parse_seen(seen_at) or published
-    return published
-
-
-def _expire_pending(row: dict) -> None:
-    """Заказ не дождался оценки/доставки до предела очереди: состояние «устарел» с причиной."""
-    reason = jr.S_DELIVERY_EXPIRED if row.get("tech") == jr.ASSESSED else jr.S_QUEUE_EXPIRED
-    freelance_mark_stale(row["order_id"], reason)
-
-
 def _load_pending(threshold: datetime, sent_now: set[int],
                   feed_orders: list[FreelanceOrder] | None = None,
                   fetch_alot: bool = True,
                   have: dict[int, FreelanceOrder] | None = None, only_manual: bool = False) -> dict[int, ScoredOrder]:
-    """Ожидающие заказы из БД (ждут оценки или доставки): просроченные помечает устаревшими (с причиной),
-    остальные собирает в очередь.
-
-    Заказ берётся из памяти цикла (have: свежий скан и ленты), иначе alot-заказы дозапрашиваются по id
-    (fetch_alot=False - не трогать alot: выключен или лежит), а выпавшие из ленты FL.ru/Kwork
-    восстанавливаются из сохранённых полных заказов (_feed_store_*)."""
-    # Все ожидающие (новые первыми): просроченные помечаем устаревшими, иначе при долгом простое AI
-    # старые строки за пределами лимита висели бы в очереди
-    # Какие источники сейчас обрабатываются. Заказы остальных (выключены; alot лежит) в live не
-    # попадают и не занимают лимиты выборки: иначе их очередь вытеснила бы заказы включённых
-    # источников, которые истекли бы без оценки при свободной квоте AI. Просроченные закрываем всегда
+    """Восстанавливает очередь включённых источников из ленты и сохранённых данных."""
     have = have or {}
     active = {n: sources.is_enabled(n) and (n != sources.ALOT or fetch_alot) for n in sources.ALL_SOURCES}
     inactive = [n for n in sources.ALL_SOURCES if not active[n]]
     live: dict[int, dict] = {}
 
-    def _expired(row: dict) -> bool:
-        if row.get("origin") == "manual" and not row.get("published_at"):
-            return False
-        ref = _age_ref(_parse_dt(row["published_at"]), row.get("seen_at"), bool(row.get("pub_unreliable")))
-        return ref is not None and ref < threshold
-
-    if inactive and not only_manual:
-        for row in freelance_pending(PENDING_SCAN_LIMIT, sources.id_ranges(inactive)):
-            if row["order_id"] not in sent_now and _expired(row):
-                _expire_pending(row)
     ranges = [(sources.MANUAL_ID_OFFSET, 1 << 62)] if only_manual else sources.id_ranges(inactive)
     for row in freelance_pending(PENDING_SCAN_LIMIT, ranges, exclude_ranges=not only_manual):
         oid = row["order_id"]
         if oid in sent_now:
-            continue
-        if _expired(row):
-            _expire_pending(row)
             continue
         if len(live) < PENDING_FETCH_LIMIT:
             live[oid] = row
@@ -471,16 +432,22 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             feed_by_id[oid] = o
     fetched += [o for oid, o in feed_by_id.items() if oid in live]
     fetched += [manual.from_row(row) for row in live.values() if row.get("origin") == "manual"]
+    # После исчезновения объявления восстанавливаем сохранённый для оценки текст.
+    available = {order.order_id for order in fetched}
+    restored = set()
+    for oid, row in live.items():
+        if oid in available or not (row.get("snippet") or row.get("ai_json")):
+            continue
+        order = manual.from_row(row)
+        order.published_at = _parse_dt(row.get("published_at"))
+        fetched.append(order)
+        restored.add(oid)
     result: dict[int, ScoredOrder] = {}
     for order in fetched:
         if order.order_id not in live or order.order_id in result:
             continue
         row = live[order.order_id]
-        ref = _age_ref(order.published_at, row.get("seen_at"), bool(row.get("pub_unreliable")))
-        if row.get("origin") != "manual" and ref is not None and ref < threshold:
-            _expire_pending(row)
-            continue
-        why = reject_reason(order)
+        why = None if order.order_id in restored else reject_reason(order)
         if why is not None:
             freelance_mark_filtered(order.order_id, why)
             continue
@@ -776,7 +743,10 @@ def _fetch_kwork_orders() -> list[FreelanceOrder]:
 
 def _fetch_feed_orders() -> list[FreelanceOrder]:
     """Заказы прямых источников (кроме alot.pro), которые включены."""
-    return [*_fetch_fl_orders(), *_fetch_kwork_orders()]
+    with ThreadPoolExecutor(2) as pool:
+        fl = pool.submit(_fetch_fl_orders)
+        kwork = pool.submit(_fetch_kwork_orders)
+        return [*fl.result(), *kwork.result()]
 
 
 ALOT_SILENT_SEC = 3 * 3600   # столько alot.pro без новых заказов - считаем, что он «спал»
@@ -841,7 +811,6 @@ def _scan_alot() -> tuple[ScanResult, int]:
 
 
 def _prepare_cycle(only_manual: bool = False) -> CycleResult:
-    started = time.monotonic()
     res = CycleResult()
     scan, last_id = ScanResult(), 0
     alot_ok, alot_err = False, None
@@ -919,17 +888,30 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
     # AI-оценка в несколько потоков, новые первыми. Заказ без оценки (лимит, дедлайн,
     # сбой) остаётся pending и оценивается в следующих циклах, пока свежий: без
     # оценки в чат не уходит (иначе при исчерпанной квоте летит весь поток без фильтра).
-    # «Без AI» отправляется только когда AI выключен совсем (нет ключей).
     # Очередь: сначала группа приоритета 1 (см. filters.priority), внутри группы новые первыми.
     ai_on = ai_scorer.is_enabled()
     to_score = [sc for sc in candidates if sc.ai is None and ai_on]
     now_ts = datetime.now(timezone.utc)
     to_score.sort(key=lambda sc: (_queue_rank(sc, now_ts), -(sc.order.published_at or sc.first_seen or now_ts).timestamp()))
+    # Чередуем новые заявки и накопленный остаток, чтобы обрабатывать оба потока.
+    newest = sorted((sc for sc in to_score if sc.order.order_id in fresh_ids),
+                    key=lambda sc: (priority(sc.order), -(sc.order.published_at or now_ts).timestamp()))
+    waiting = [sc for sc in to_score if sc.order.order_id not in fresh_ids]
+    if newest and waiting:
+        batch = max(1, AI_WORKERS - 1)
+        merged = []
+        rounds = min(len(waiting), (len(newest) + batch - 1) // batch)
+        for index in range(rounds):
+            merged.extend(newest[index * batch:(index + 1) * batch])
+            merged.append(waiting[index])
+        to_score = merged + newest[rounds * batch:] + waiting[rounds:]
     # Квоты нет ни у кого: не дёргаем провайдеров (каждая попытка была бы «сбоем» и
     # через 3 цикла - ложным «AI не работает»), заказы ждут в pending
     res.quota_out = ai_scorer.quota_exhausted() if to_score else None
 
     triage_mode = effective_triage_mode()
+
+    started = time.monotonic()
 
     def _score(item):
         idx, sc = item
@@ -965,8 +947,9 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
         fresh_scored = False
         if sc.ai is None:
             if id(sc) not in scored:
-                # AI выключен (нет ключей): отправляем «без AI»
-                res.to_send.append(sc)
+                # Даже при отключённом провайдере отправляем только после оценки.
+                sc.queue_reason = jr.Q_NO_QUOTA
+                res.unscored.append(sc)
                 continue
             r = scored[id(sc)]
             if r is _SKIPPED or r is _RESERVED:
@@ -1619,7 +1602,7 @@ def _report_quota_out(res: CycleResult) -> None:
     monitor.notify(
         f"⏸ <b>AI-квота на сегодня кончилась</b> ({now:%H:%M} МСК)\n"
         f"Оценка продолжится ~{res.quota_out.astimezone(MSK):%H:%M} МСК. Заказы ждут оценки "
-        f"до {FREELANCE_QUEUE_MAX_HOURS} ч после публикации, сейчас в очереди: {len(res.unscored)}."
+        f"до восстановления квоты, сейчас в очереди: {len(res.unscored)}."
     )
 
 

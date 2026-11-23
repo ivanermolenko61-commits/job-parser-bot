@@ -124,6 +124,37 @@ class SaveRightAfterScoringTest(CycleTestBase):
         self.assertEqual([s.order.order_id for s in res.to_send], [104])
 
 
+class FastQueueTest(CycleTestBase):
+    def test_no_provider_keeps_order_until_assessed(self):
+        order = make_order(105)
+        database.kv_set(pipeline.LAST_ID_KEY, 100)
+        with mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan([order])), mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=False):
+            res = pipeline._prepare_cycle()
+        self.assertEqual(res.to_send, [])
+        pipeline.finish_cycle(res, [], [], [])
+        self.assertEqual(database.freelance_get(105)["queue_reason"], "no_quota")
+
+    def test_cleanup_preserves_pending_assessment_and_delivery(self):
+        for oid, ai in [(105, None), (106, ai_result(8))]:
+            pipeline.save_order(pipeline.ScoredOrder(make_order(oid), ai, str(oid)), "pending")
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET seen_at = datetime('now','-400 days')")
+        database.cleanup_old()
+        self.assertEqual(database.freelance_get(105)["tech"], "queued")
+        self.assertTrue(database.freelance_get(106)["ai_json"])
+
+    def test_new_order_and_backlog_both_get_scored(self):
+        now = datetime.now(timezone.utc)
+        old = make_order(99)
+        old.published_at = now - timedelta(hours=20)
+        sc = pipeline.ScoredOrder(old, None, "old", first_seen=old.published_at)
+        fresh = make_order(105, "Парсер цен конкурентов в таблицу")
+        database.kv_set(pipeline.LAST_ID_KEY, 100)
+        with mock.patch.object(pipeline, "fetch_new_orders", return_value=self.scan([fresh])), mock.patch.object(pipeline, "_load_pending", return_value={99: sc}), mock.patch.object(pipeline, "AI_WORKERS", 1), mock.patch.object(pipeline, "effective_triage_mode", return_value="off"), mock.patch.object(pipeline.ai_scorer, "score_order", return_value=ai_result(8)) as score:
+            pipeline._prepare_cycle()
+        self.assertEqual([call.args[0].order_id for call in score.call_args_list], [105, 99])
+
+
 class QuotaReserveTest(CycleTestBase):
     def orders(self):
         database.kv_set(pipeline.LAST_ID_KEY, 100)

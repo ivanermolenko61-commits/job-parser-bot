@@ -27,7 +27,6 @@ from dotenv import load_dotenv
 from config import (
     CHECK_INTERVAL_MINUTES,
     FREELANCE_INTERVAL_MINUTES,
-    FREELANCE_QUEUE_MAX_HOURS,
     FREELANCE_MAX_PER_CYCLE,
     FREELANCE_MESSAGE_TTL_HOURS,
     FREELANCE_MIN_FIT,
@@ -460,20 +459,6 @@ async def _set_order_status(order_id: int, status: str) -> None:
     await asyncio.to_thread(freelance_set_status, order_id, status)
 
 
-def _order_is_stale(sc) -> bool:
-    """Заказ старше предела очереди (FREELANCE_QUEUE_MAX_HOURS): пока его оценивали и ждали
-    отправки, он мог состариться. Такой в чат не уходит, а получает состояние «устарел» с причиной.
-    Заказ старше FREELANCE_FRESH_HOURS уходит с пометкой возраста в карточке."""
-    limit = timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
-    ref = sc.order.published_at
-    return bool(ref and datetime.now(timezone.utc) - ref > limit)
-
-
-def _sort_delivery_time(sc):
-    ref = sc.order.published_at or sc.first_seen
-    return ref.timestamp() if ref else 0
-
-
 async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     """Отправляет заказы цикла и сразу сохраняет каждый успешно отправленный.
 
@@ -484,16 +469,8 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     # progress заполняется по ходу: при неожиданном сбое вызывающий знает, что уже ушло
     progress = progress if progress is not None else {}
     retry = progress.setdefault("retry", [])
-    # Состарившиеся за время оценки не отправляем: уходят в pending, а следующий цикл
-    # (_load_pending) пометит их expired
-    stale = [sc for sc in res.to_send if _order_is_stale(sc)]
-    if stale:
-        logging.info(f"[FREELANCE] состарились до отправки: {len(stale)}, в чат не уходят")
-        retry.extend(stale)
-    stale_ids = {sc.order.order_id for sc in stale}
-    ranked = sorted((sc for sc in res.to_send if sc.order.order_id not in stale_ids),
-                    key=_sort_key_for_cap, reverse=True)
-    chosen = sorted(ranked[:FREELANCE_MAX_PER_CYCLE], key=_sort_delivery_time)
+    ranked = sorted(res.to_send, key=_sort_key_for_cap, reverse=True)
+    chosen = ranked[:FREELANCE_MAX_PER_CYCLE]
     extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
     sent_ok = progress.setdefault("sent", [])
@@ -501,9 +478,6 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
     flood = False
     for sc in chosen:
         if flood:
-            retry.append(sc)
-            continue
-        if _order_is_stale(sc):   # состарился, пока уходили предыдущие заказы пачки
             retry.append(sc)
             continue
         try:
@@ -526,10 +500,6 @@ async def _deliver_freelance(res, progress: dict | None = None) -> dict:
             logging.error(f"[FREELANCE] отправленный заказ не записан в БД: {sc.order.url}")
         await asyncio.sleep(0.5)
 
-    late = [sc for sc in extra if _order_is_stale(sc)]
-    if late:
-        retry.extend(late)
-        extra = [sc for sc in extra if sc not in late]
     if extra:
         extra_sorted = sorted(extra, key=_sort_key_for_cap, reverse=True)
         header = f"➕ Ещё {len(extra)} подходящих заказов (не показаны из-за лимита):"

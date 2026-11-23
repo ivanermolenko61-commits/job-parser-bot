@@ -217,12 +217,12 @@ class CycleWithSwitchesTest(CycleTestBase):
         self.assertEqual([r["order_id"] for r in rest], [sources.FL_ID_OFFSET + 5])
         self.assertEqual(len(database.freelance_pending(10)), 3)
 
-    def test_expired_of_disabled_source_still_closed(self):
+    def test_disabled_source_keeps_pending_order(self):
         import database
         old = self.pending_feed_order(sources.KWORK_ID_OFFSET + 95, "kworkru", hours_ago=8)
         sources.set_enabled(sources.KWORK, False)
         pipeline._load_pending(datetime.now(timezone.utc) - timedelta(hours=6), set(), [], fetch_alot=False)
-        self.assertEqual(database.freelance_get(old.order_id)["status"], "expired")
+        self.assertEqual(database.freelance_get(old.order_id)["status"], "pending")
 
     def test_alot_pending_does_not_take_slots_when_alot_unavailable(self):
         now = datetime.now(timezone.utc)

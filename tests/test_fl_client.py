@@ -204,11 +204,11 @@ class PendingFlTest(CycleTestBase):
         self.assertEqual(pipeline._load_pending(self.floor(), set(), []), {})
         self.assertEqual(database.freelance_get(oid)["status"], "pending")
 
-    def test_expired_is_marked_expired(self):
+    def test_waiting_for_ai_survives_age_limit(self):
         import database
         order = self.pending_order(780, hours_ago=7)
-        self.assertEqual(pipeline._load_pending(self.floor(), set(), []), {})
-        self.assertEqual(database.freelance_get(order.order_id)["status"], "expired")
+        self.assertIn(order.order_id, pipeline._load_pending(self.floor(), set(), []))
+        self.assertEqual(database.freelance_get(order.order_id)["status"], "pending")
 
     def test_store_forgets_order_when_status_changes_and_prunes_old(self):
         import database

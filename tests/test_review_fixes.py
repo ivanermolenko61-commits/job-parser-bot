@@ -193,29 +193,14 @@ class FreshnessBeforeSendTest(unittest.TestCase):
             datetime.now(timezone.utc) - timedelta(hours=age_hours), f"https://x/{oid}")
         return pipeline.ScoredOrder(order, {"fit": 8})
 
-    def test_stale_order_not_sent(self):
-        fresh, stale = self.sc(1, 1), self.sc(2, 50)   # предел очереди 48 ч (7 ч - уже «не свежий», но уходит с пометкой)
-        self.assertFalse(bot._order_is_stale(fresh))
-        self.assertTrue(bot._order_is_stale(stale))
+    def test_old_assessed_order_delivered_after_fresh_order(self):
+        fresh, old = self.sc(1, 1), self.sc(2, 50)
         send = mock.AsyncMock(return_value=10)
         progress = {}
-        res = pipeline.CycleResult(to_send=[fresh, stale])
-        with mock.patch.object(bot, "_send_order", send), \
-             mock.patch.object(bot, "save_sent", return_value=True), \
-             mock.patch("asyncio.sleep", mock.AsyncMock()):
-            asyncio.run(bot._deliver_freelance(res, progress))
-        sent_ids = [c.args[0].order.order_id for c in send.await_args_list]
-        self.assertEqual(sent_ids, [1])
-        self.assertEqual([sc.order.order_id for sc in progress["retry"]], [2])
-    def test_order_that_goes_stale_during_batch_is_not_sent(self):
-        a, b = self.sc(1, 1), self.sc(2, 1)
-        send = mock.AsyncMock(return_value=10)
-        progress = {}
-        # две проверки в начале (оба свежие), затем в цикле: первый свежий, второй состарился
-        with mock.patch.object(bot, "_order_is_stale", side_effect=[False, False, False, True]),              mock.patch.object(bot, "_send_order", send),              mock.patch.object(bot, "save_sent", return_value=True),              mock.patch("asyncio.sleep", mock.AsyncMock()):
-            asyncio.run(bot._deliver_freelance(pipeline.CycleResult(to_send=[a, b]), progress))
-        self.assertEqual([c.args[0].order.order_id for c in send.await_args_list], [1])
-        self.assertEqual([sc.order.order_id for sc in progress["retry"]], [2])
+        with mock.patch.object(bot, "_send_order", send), mock.patch.object(bot, "save_sent", return_value=True), mock.patch("asyncio.sleep", mock.AsyncMock()):
+            asyncio.run(bot._deliver_freelance(pipeline.CycleResult(to_send=[old, fresh]), progress))
+        self.assertEqual([call.args[0].order.order_id for call in send.await_args_list], [1, 2])
+        self.assertEqual(progress["retry"], [])
 
 
 class YandexUsageTest(unittest.TestCase):
