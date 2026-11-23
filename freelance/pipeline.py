@@ -951,14 +951,17 @@ def _collect_freelance_details(stats: dict) -> None:
         futures = {pool.submit(fetch_freelance_description, row["url"]): row for row in waiting}
         for future in as_completed(futures):
             row = futures[future]
-            body = future.result()
-            if not body:
-                freelance_detail_failed(row["order_id"])
-                continue
-            order = scored_from_row(row).order
-            order.body = body
-            with manual.intake_lock:
-                _intake([order], 0, set(), live=True, stats=stats)
+            try:
+                body = future.result()
+                if body:
+                    order = scored_from_row(row).order
+                    order.body = body
+                    with manual.intake_lock:
+                        _intake([order], 0, set(), live=True, stats=stats)
+                    continue
+            except Exception:
+                logging.exception("[FREELANCE] не удалось обработать описание Freelance.ru %s", row["order_id"])
+            freelance_detail_failed(row["order_id"])
 
 
 def _live_fetch_direct(source: str) -> list[FreelanceOrder]:

@@ -163,6 +163,30 @@ class BoardsIntakeTest(CycleTestBase):
                 self.assertNotIn("...", row["snippet"])
             self.assertIn("автоматизации по API", database.freelance_get(ids[0])["snippet"])
 
+    def test_unexpected_detail_error_does_not_back_off_the_source(self):
+        page = _card(1, "Телеграм-бот", "Нужен бот…")
+        page += _card(2, "Интеграция с API", "Собрать выгрузку…")
+
+        def fetch(url):
+            if url == boards.FREELANCE_URL:
+                return page
+            if url.endswith("/1"):
+                raise TypeError("неожиданный сбой парсера")
+            return _detail("Нужен скрипт для интеграции API и выгрузки в Google Таблицы")
+
+        with mock.patch.dict(pipeline._source_retry_at, clear=True), \
+                mock.patch.object(sources, "is_enabled", return_value=True), \
+                mock.patch.object(boards, "_get", side_effect=fetch), \
+                self.assertLogs(level="ERROR"):
+            result = pipeline.collect_live(sources.FREELANCE_RU)
+            self.assertNotIn(sources.FREELANCE_RU, pipeline._source_retry_at)
+
+        failed, ready = (database.freelance_get(sources.FREELANCE_RU_ID_OFFSET + i) for i in (1, 2))
+        self.assertFalse(result.error)
+        self.assertEqual(result.intake["new"], 1)
+        self.assertEqual((failed["tech"], failed["attempts"]), (jr.DETAILS_PENDING, 1))
+        self.assertEqual(ready["tech"], jr.QUEUED)
+
     def test_detail_retry_uses_publication_or_original_seen_at_for_expiry(self):
         stamp = (datetime.now(boards.MSK) - timedelta(minutes=61)).strftime("%d.%m.%Y %H:%M")
         page = _card(1, "Телеграм-бот", "Нужно сделать интеграцию...", stamp)
