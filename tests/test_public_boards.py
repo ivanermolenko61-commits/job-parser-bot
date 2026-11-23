@@ -9,6 +9,7 @@ import requests
 import database
 from freelance import journal as jr, manual, pipeline, public_boards as boards, sources
 from freelance.filters import reject_reason
+from freelance.report import format_funnel, load_rows
 from tests.test_pipeline_cycle import CycleTestBase, ai_result
 
 
@@ -136,6 +137,7 @@ class BoardsIntakeTest(CycleTestBase):
             self.assertEqual(http.call_count, 1 + boards.MAX_DETAIL)
             self.assertEqual(database.freelance_get(ids[0])["attempts"], 1)
             self.assertEqual(database.freelance_day_summary()["details_pending"], 3)
+            self.assertIn("ждут полного описания 3", format_funnel(load_rows(1)))
 
             with database._connect() as conn:
                 conn.execute("UPDATE freelance_orders SET seen_at=datetime('now','-5 minutes')")
@@ -169,7 +171,8 @@ class BoardsIntakeTest(CycleTestBase):
                 mock.patch.object(boards, "_get", side_effect=[page, "<title>Без описания</title>", page]) as http:
             pipeline.collect_live(sources.FREELANCE_RU)
             old, unknown = (sources.FREELANCE_RU_ID_OFFSET + i for i in (1, 2))
-            self.assertEqual(database.freelance_get(old)["stale_reason"], jr.S_OLD_AT_DISCOVERY)
+            self.assertEqual(database.freelance_get(old)["stale_reason"], jr.S_DETAILS_TOO_OLD)
+            self.assertEqual(database.freelance_day_summary()["details_expired"], 1)
             with database._connect() as conn:
                 conn.execute("UPDATE freelance_orders SET seen_at=datetime('now','-61 minutes') WHERE order_id=?",
                              (unknown,))
@@ -177,7 +180,7 @@ class BoardsIntakeTest(CycleTestBase):
             self.assertEqual(http.call_count, 3)
         self.assertEqual(database.freelance_expire_live(), 1)
         self.assertEqual(database.freelance_get(unknown)["stale_reason"], jr.S_DETAILS_EXPIRED)
-        self.assertEqual(database.freelance_day_summary()["details_expired"], 1)
+        self.assertEqual(database.freelance_day_summary()["details_expired"], 2)
 
     def test_full_description_arriving_after_freshness_deadline_is_not_scored(self):
         oid = sources.FREELANCE_RU_ID_OFFSET + 1

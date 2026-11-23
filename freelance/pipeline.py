@@ -643,7 +643,7 @@ def _intake(orders, last_id: int,
                 continue
         if o.needs_full_description:
             if o.published_at and o.published_at < cutoff:
-                _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
+                _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_DETAILS_TOO_OLD)
                 stats["stale"] += 1
             else:
                 _journal_new(o, jr.DETAILS_PENDING, full=False)

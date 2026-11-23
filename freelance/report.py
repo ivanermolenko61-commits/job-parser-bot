@@ -120,6 +120,7 @@ def funnel(rows: list[dict]) -> dict[str, dict]:
         seen.add(oid)
         c = result.setdefault(source_label(r), {
             "discovered": 0, "filtered": 0, "duplicate": 0, "queued": 0, "stale": 0, "legacy": 0,
+            jr.DETAILS_PENDING: 0,
             "assessed": 0, "good": 0, "low_fit": 0, "card": 0, "digest": 0, "delivery_pending": 0,
             "delivery_unknown": 0, "leads": 0, "unique_good": 0, "applied": 0, "discussing": 0,
             "agreed": 0, "done": 0, "lost_reasons": {}, "net": 0.0, "work_hours": 0.0, "priced": 0})
@@ -247,6 +248,8 @@ def format_funnel(rows: list[dict], excluded: dict[str, int] | None = None, days
             f"дубли {c['duplicate']}, устарели {c['stale']}, ждут оценки {c['queued']} → оценено {c['assessed']} "
             f"(подходят {c['good']}, ниже порога {c['low_fit']}) → карточкой {c['card']}, сводкой {c['digest']}, "
             f"ждут доставки {c['delivery_pending']}")
+        if c[jr.DETAILS_PENDING]:
+            lines.append(f"  ждут полного описания {c[jr.DETAILS_PENDING]}")
         lines.append(f"  уникальных подходящих {c['unique_good']}, откликов {c['applied']}, "
                      f"ответов {c['discussing']}, договорённостей {c['agreed']}, завершено {c['done']}")
         if c["lost_reasons"]:

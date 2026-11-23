@@ -1764,7 +1764,7 @@ def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
         for tech, verdict, delivery, stale_reason, n in conn.execute(
                 "SELECT tech, verdict, delivery, stale_reason, COUNT(*) FROM freelance_orders "
                 "WHERE seen_at >= datetime('now', ?) GROUP BY tech, verdict, delivery, stale_reason", (since,)):
-            if tech == jr.STALE and stale_reason == jr.S_DETAILS_EXPIRED:
+            if tech == jr.STALE and stale_reason in (jr.S_DETAILS_TOO_OLD, jr.S_DETAILS_EXPIRED):
                 c["details_expired"] += n
             c["total"] += n
             c[tech if tech in c else "legacy"] += n

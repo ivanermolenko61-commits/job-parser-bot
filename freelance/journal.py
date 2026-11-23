@@ -36,6 +36,7 @@ D_NONE, D_PENDING, D_CARD, D_DIGEST, D_UNKNOWN = "none", "pending", "card", "dig
 
 # причины устаревания (stale_reason)
 S_OLD_AT_DISCOVERY = "old_at_discovery"   # к моменту обнаружения старше предела очереди
+S_DETAILS_TOO_OLD = "details_old_at_discovery"  # превью старше предела при обнаружении
 S_DETAILS_EXPIRED = "details_expired"     # полное описание не загрузилось до предела
 S_QUEUE_EXPIRED = "queue_expired"         # не дождался оценки до предела
 S_DELIVERY_EXPIRED = "delivery_expired"   # оценён, но не доставлен до предела
