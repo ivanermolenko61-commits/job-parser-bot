@@ -412,7 +412,7 @@ def _init_freelance(conn) -> None:
         ("stale_at", "TEXT"), ("stale_reason", "TEXT"), ("desc_changed", "INTEGER DEFAULT 0"),
         ("lead", "TEXT"), ("lead_reason", "TEXT"), ("lead_at", "TEXT"),
         # Ф08: следующее действие, напоминание (UTC), отправленное напоминание, автоподборка необработанных
-        ("next_action", "TEXT"), ("remind_at", "TEXT"), ("reminded_at", "TEXT"), ("offered_at", "TEXT"),
+        ("next_action", "TEXT"), ("remind_at", "TEXT"), ("reminded_at", "TEXT"), ("offered_at", "TEXT"), ("offer_claimed_at", "TEXT"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} {ddl}")
@@ -1077,17 +1077,16 @@ def freelance_unprocessed(days: int = 3, limit: int = 30) -> list[dict]:
 
 
 def freelance_claim_offers(limit: int = 10, days: int = 3, now: str | None = None) -> tuple[str, list[dict]]:
-    """Подборка необработанных: заказы, ещё не бывшие в автоподборке, помечаются offered_at в той же транзакции -
-    каждый заказ попадает в подборку один раз. Возвращает (метка занятия, строки); при сбое отправки
-    freelance_release_offers(метка, id) возвращает их."""
+    """Резервировать строки на десять минут. После сбоя просроченный резерв можно занять снова."""
     now = now or _now_sql()
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = [dict(r) for r in conn.execute(
             f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE {_UNPROCESSED} AND offered_at IS NULL "
-            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", limit)).fetchall()]
+            "AND (offer_claimed_at IS NULL OR offer_claimed_at <= datetime(?, '-10 minutes')) "
+            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", now, limit)).fetchall()]
         for r in rows:
-            conn.execute("UPDATE freelance_orders SET offered_at = ? WHERE order_id = ?", (now, r["order_id"]))
+            conn.execute("UPDATE freelance_orders SET offer_claimed_at = ? WHERE order_id = ?", (now, r["order_id"]))
         return now, rows
 
 
@@ -1098,9 +1097,20 @@ def freelance_release_offers(claimed_at: str, order_ids: list[int]) -> int:
     marks = ",".join("?" * len(order_ids))
     with _connect() as conn:
         cur = conn.execute(
-            f"UPDATE freelance_orders SET offered_at = NULL WHERE offered_at = ? AND order_id IN ({marks})",
+            f"UPDATE freelance_orders SET offer_claimed_at = NULL WHERE offer_claimed_at = ? AND order_id IN ({marks})",
             (claimed_at, *order_ids))
         return cur.rowcount
+
+
+def freelance_confirm_offers(claimed_at: str, order_ids: list[int], day: str) -> None:
+    """Зафиксировать доставку и день подборки одной транзакцией после ответа Telegram."""
+    with _connect() as conn:
+        conn.executemany(
+            "UPDATE freelance_orders SET offered_at = ?, offer_claimed_at = NULL "
+            "WHERE order_id = ? AND offer_claimed_at = ?",
+            [(claimed_at, oid, claimed_at) for oid in order_ids],
+        )
+        conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('freelance_offer_day', ?)", (day,))
 
 
 def freelance_reminders_due(now: str | None = None, limit: int = 20) -> list[dict]:

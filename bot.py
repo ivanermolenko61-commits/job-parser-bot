@@ -39,6 +39,7 @@ from database import (
     freelance_deal_rows,
     freelance_expired_messages,
     freelance_claim_offers,
+    freelance_confirm_offers,
     freelance_get,
     freelance_last_deal_price,
     freelance_lead_events,
@@ -1429,7 +1430,7 @@ async def send_lead_offers():
             if rows:
                 await bot.send_message(chat_id=MY_CHAT_ID, text=lv.offers_text(rows), parse_mode="HTML",
                                        disable_web_page_preview=True)
-            await asyncio.to_thread(kv_set, OFFER_DAY_KEY, today)
+                await asyncio.to_thread(freelance_confirm_offers, claimed, [r["order_id"] for r in rows], today)
         except Exception:
             logging.exception("[FREELANCE] send_lead_offers")
             if claimed and rows:   # не ушло: заказы вернуть в подборку, день не отмечаем (повтор в следующий раз)
@@ -1963,8 +1964,8 @@ async def main():
     scheduler.add_job(
         send_lead_offers,
         "cron",
-        hour=OFFER_HOUR_MSK,
-        minute=0,
+        hour=f"{OFFER_HOUR_MSK}-23",
+        minute="*/10",
         timezone=MSK,
         misfire_grace_time=1800,  # после рестарта - catch_up_lead_offers
         coalesce=True,

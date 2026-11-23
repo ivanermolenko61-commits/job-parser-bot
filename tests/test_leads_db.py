@@ -303,6 +303,18 @@ class OffersAndInboxTest(CycleTestBase):
         self.assertEqual(database.freelance_release_offers(claimed, [3, 2]), 2)   # сбой отправки возвращает право
         self.assertEqual([r["order_id"] for r in database.freelance_claim_offers()[1]], [3, 2])
 
+    def test_abandoned_offer_claim_expires_but_confirmed_delivery_survives(self):
+        self.seed(1)
+        database.freelance_claim_offers(now="2026-11-23 10:00:00")
+        database.init_db()
+        self.assertFalse(database.freelance_claim_offers(now="2026-11-23 10:09:59")[1])
+        claim, rows = database.freelance_claim_offers(now="2026-11-23 10:10:00")
+        self.assertEqual([r["order_id"] for r in rows], [1])
+        database.freelance_confirm_offers(claim, [1], "2026-11-23")
+        database.init_db()
+        self.assertFalse(database.freelance_claim_offers(now="2026-11-24 10:00:00")[1])
+        self.assertEqual(database.kv_get("freelance_offer_day"), "2026-11-23")
+
     def test_active_and_closed_lists(self):
         for oid in (1, 2, 3):
             self.seed(oid)
