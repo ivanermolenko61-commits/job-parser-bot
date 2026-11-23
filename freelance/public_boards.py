@@ -21,6 +21,7 @@ WEBLANCER_PATH = re.compile(r"/freelance/[^/]+/[^/]+-(\d{1,9})/?")
 DAY = re.compile(r"\d{2}\.\d{2}\.\d{4}")
 MINUTE = re.compile(r"\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}")
 BUDGET = re.compile(r"(?:[$€]\s*[\d ]+|[\d ]+\s*[$€₽])")
+PUBLISHED = "[itemprop='datePublished'], [data-published-at], .published-at, .date-published"
 MAX_DETAIL = 4
 MAX_HTML = 1_500_000
 
@@ -93,7 +94,7 @@ def parse_freelance_page(page: str) -> list[FreelanceOrder]:
             _text(card.select_one(".task-card__desc")), _text(card.select_one(".task-card__budget .bold")), 0,
             [], _timestamp(timestamp), url,
         ))
-    if not orders and "Открытые задания" not in soup.get_text(" ", strip=True):
+    if not orders and not re.search(r"нет открытых заданий|заданий не найдено", _text(soup), re.I):
         raise ValueError("не найдена разметка списка Freelance.ru")
     return orders
 
@@ -120,16 +121,16 @@ def fetch_freelance_ru() -> list[FreelanceOrder]:
         needs_detail = (order.body.endswith(("...", "…")) and reject_reason(order) is None
                         and (order.published_at is None or now - order.published_at <= timedelta(hours=1)))
         if needs_detail:
-            if order.order_id in known or remaining <= 0:
+            if order.order_id in known:
                 continue
-            remaining -= 1
-            try:
-                body = _freelance_description(_get(order.url))
-            except (requests.RequestException, RuntimeError, ValueError):
-                # Предпросмотр остаётся полезен; нехватка деталей будет видна в оценке.
-                body = ""
-            if body:
-                order.body = body
+            if remaining:
+                remaining -= 1
+                try:
+                    body = _freelance_description(_get(order.url))
+                except (requests.RequestException, RuntimeError, ValueError):
+                    body = ""
+                if body:
+                    order.body = body
         ready.append(order)
     return ready
 
@@ -143,7 +144,7 @@ def _weblancer_card(anchor):
         if len(links - {None}) > 1:
             return None
         text = _text(card)
-        if len(text) > len(_text(anchor)) + 25 and (DAY.search(text) or card.select_one("time[datetime]")):
+        if len(text) > len(_text(anchor)) + 25 and (card.name == "article" or card.select_one(PUBLISHED)):
             return card
     return None
 
@@ -166,18 +167,17 @@ def parse_weblancer_page(page: str, now: datetime | None = None) -> list[Freelan
                                 f"{status.get('data-status', '')} {_text(status)}", re.I):
             continue
         text = _text(card)
-        date_tag = card.select_one("time[datetime]")
-        stamp = _timestamp(date_tag["datetime"]) if date_tag else None
-        minute, day = MINUTE.search(text), DAY.search(text)
-        if stamp is None and minute:
-            stamp = _timestamp(minute[0])
-        if stamp is None and day and _too_old_day(day[0], now):
+        date_tag = card.select_one(PUBLISHED)
+        raw_date = (date_tag.get("datetime") or date_tag.get("content") or date_tag.get("data-published-at")
+                    or _text(date_tag)) if date_tag else ""
+        stamp = _timestamp(raw_date)
+        if DAY.fullmatch(raw_date) and _too_old_day(raw_date, now):
             continue
         body = max((_text(tag) for tag in card.select("p")), key=len, default="")
         if not body:
-            body = text.removeprefix(_text(anchor)).strip()
-            if day:
-                body = body.split(day[0], 1)[0].strip()
+            if date_tag:
+                date_tag.extract()
+            body = _text(card).removeprefix(_text(anchor)).strip()
         if len(body) < 20:
             continue
         budget = BUDGET.search(text[:len(_text(anchor)) + 45])
