@@ -82,11 +82,17 @@ def _env_flag(name: str, default: str = "1") -> bool:
 ALOT_ENABLED = _env_flag("ALOT_ENABLED")
 FL_RSS_ENABLED = _env_flag("FL_RSS_ENABLED")      # RSS FL.ru
 KWORK_ENABLED = _env_flag("KWORK_ENABLED")        # список проектов Kwork
+FREELANCE_RU_ENABLED = _env_flag("FREELANCE_RU_ENABLED")
+WEBLANCER_ENABLED = _env_flag("WEBLANCER_ENABLED", "0")
 FL_RSS_URL = os.getenv("FL_RSS_URL", "https://www.fl.ru/rss/all.xml")
 KWORK_URL = os.getenv("KWORK_URL", "https://kwork.ru/projects")
 KWORK_PAGES = 4     # страниц по 12 проектов за цикл (категория «Разработка и IT»)
 # Минимальная AI-оценка (0-10), с которой заказ отправляется
 FREELANCE_MIN_FIT = 5
+# Жёсткий предел для срочной доставки и оценки.
+FREELANCE_LIVE_MINUTES = 60
+FREELANCE_STAGE_SECONDS = 5
+FREELANCE_HTML_SECONDS = 120
 # Заказ старше стольких часов от публикации не «свежий»: в карточке пометка «опубликован N ч
 # назад, проверьте актуальность» (API alot.pro не отдаёт статус заказа, поэтому актуальность
 # проверяется перед откликом)

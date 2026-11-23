@@ -1,33 +1,28 @@
-"""Источники фриланс-заказов и их включение/выключение.
-
-Три независимых источника: alot.pro (агрегатор), RSS FL.ru и список проектов Kwork.
-alot.pro сам агрегирует FL.ru и Kwork, поэтому, пока он работает, прямые источники
-дублируют заказы и тратят квоту AI. Включать и выключать источники можно из бота
-(💼 Фриланс → 🔌 Источники); выбор хранится в БД (kv) и переживает перезапуск.
-Переменные окружения ALOT_ENABLED / FL_RSS_ENABLED / KWORK_ENABLED = 0 выключают
-источник насовсем (из бота он тогда не включается).
-"""
+"""Независимые источники. Выбор в меню сохраняется в БД; флаг среды = 0 имеет приоритет."""
 import logging
 
-from config import ALOT_ENABLED, FL_RSS_ENABLED, KWORK_ENABLED
+from config import ALOT_ENABLED, FL_RSS_ENABLED, FREELANCE_RU_ENABLED, KWORK_ENABLED, WEBLANCER_ENABLED
 from database import kv_get, kv_set
 
 # order_id заказов FL.ru и Kwork = смещение + id на самой бирже: не пересекаются с id alot.pro
 # (~1.7·10⁷) и друг с другом в общей таблице freelance_orders
 FL_ID_OFFSET = 10 ** 10
 KWORK_ID_OFFSET = 2 * 10 ** 10
+FREELANCE_RU_ID_OFFSET = 3 * 10 ** 10
+WEBLANCER_ID_OFFSET = 4 * 10 ** 10
 MANUAL_ID_OFFSET = 1 << 40
 FEED_ID_MIN = FL_ID_OFFSET
 
-ALOT, FLRU, KWORK = "alot", "flru", "kwork"
-ALL_SOURCES = (ALOT, FLRU, KWORK)
-TITLES = {ALOT: "alot.pro", FLRU: "FL.ru", KWORK: "Kwork"}
-_ENV_ON = {ALOT: ALOT_ENABLED, FLRU: FL_RSS_ENABLED, KWORK: KWORK_ENABLED}
+ALOT, FLRU, KWORK, FREELANCE_RU, WEBLANCER = "alot", "flru", "kwork", "freelanceru", "weblancer"
+ALL_SOURCES = (ALOT, FLRU, KWORK, FREELANCE_RU, WEBLANCER)
+TITLES = {ALOT: "alot.pro", FLRU: "FL.ru", KWORK: "Kwork", FREELANCE_RU: "Freelance.ru", WEBLANCER: "Weblancer"}
+_ENV_ON = {ALOT: ALOT_ENABLED, FLRU: FL_RSS_ENABLED, KWORK: KWORK_ENABLED,
+           FREELANCE_RU: FREELANCE_RU_ENABLED, WEBLANCER: WEBLANCER_ENABLED}
 _OFF_KEY = "freelance_sources_off"
 
 
 def is_feed_id(order_id: int) -> bool:
-    """Заказ пришёл напрямую с FL.ru/Kwork (а не из alot.pro) - его нельзя дозапросить по id."""
+    """Заказ прямого источника нельзя дозапросить в alot.pro по этому ID."""
     return FEED_ID_MIN <= order_id < MANUAL_ID_OFFSET
 
 
@@ -35,15 +30,14 @@ def source_of(order_id: int) -> str:
     """Источник заказа по его order_id (диапазоны смещений)."""
     if order_id >= MANUAL_ID_OFFSET:
         return "manual"
-    if order_id >= KWORK_ID_OFFSET:
-        return KWORK
-    if order_id >= FL_ID_OFFSET:
-        return FLRU
+    for source, (low, high) in _RANGES.items():
+        if low <= order_id < high:
+            return source
     return ALOT
 
 
-_INF = 1 << 62
-_RANGES = {ALOT: (0, FL_ID_OFFSET), FLRU: (FL_ID_OFFSET, KWORK_ID_OFFSET), KWORK: (KWORK_ID_OFFSET, MANUAL_ID_OFFSET)}
+_RANGES = {ALOT: (0, FL_ID_OFFSET), FLRU: (FL_ID_OFFSET, KWORK_ID_OFFSET), KWORK: (KWORK_ID_OFFSET, FREELANCE_RU_ID_OFFSET),
+           FREELANCE_RU: (FREELANCE_RU_ID_OFFSET, WEBLANCER_ID_OFFSET), WEBLANCER: (WEBLANCER_ID_OFFSET, MANUAL_ID_OFFSET)}
 
 
 def id_ranges(names) -> list[tuple[int, int]]:

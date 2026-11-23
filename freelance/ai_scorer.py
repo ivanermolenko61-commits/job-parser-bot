@@ -10,6 +10,7 @@ cerebras, mistral, openrouter - общий OpenAI-совместимый кли�
 Если никто не ответил, score_order() возвращает None, и бот повторит оценку в
 следующем цикле (заказ ждёт оценки, пока свежий; без оценки в чат не уходит).
 """
+import asyncio
 import email.utils
 import json
 import logging
@@ -24,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
-from freelance import profile, yandex_budget
+from freelance import paid_budget, profile, yandex_budget
 
 load_dotenv()
 
@@ -195,6 +196,12 @@ MIN_DAILY_PAUSE_SEC = 3600
 MAX_PROVIDER_PAUSE_SEC = 6 * 3600
 PROVIDER_MAX_TOKENS = 2500
 ORDER_DEADLINE_SEC = float(os.getenv("AI_ORDER_DEADLINE_SEC", "120"))  # новых моделей/провайдеров после этого не начинаем
+LIVE_DEADLINE_SEC = 60
+LIVE_POST_SEC = 25
+LIVE_MAX_POSTS = 2
+LIVE_SLOT_WAIT_SEC = 2
+_live_transport_loop: asyncio.AbstractEventLoop | None = None
+_live_transport_lock = threading.Lock()
 PAYMENT_REQUIRED = 402               # признак платного вызова: провайдер выключаем до рестарта
 
 OPENROUTER_FREE_ROUTER = "openrouter/free"
@@ -420,7 +427,7 @@ def _chain_active(chain=None) -> list[str]:
         else:
             p = PROVIDERS.get(name)
             ok = bool(p and p.key)
-            if ok and name == "yandex" and yandex_budget.expired():
+            if ok and name == "yandex" and yandex_budget.expired() and not paid_budget.active():
                 ok = False
         if ok:
             active.append(name)
@@ -456,7 +463,8 @@ def status() -> dict:
         for name, p in PROVIDERS.items():
             _expire_key_error(p, now)
             providers[name] = {
-                "enabled": bool(p.key) and name in CHAIN,
+                "enabled": bool(p.key) and name in CHAIN
+                           and (name != "yandex" or not yandex_budget.expired() or paid_budget.active()),
                 "has_key": bool(p.key),
                 "models": [m for m in p.models if m not in p.disabled],
                 "paused": {m: int(t - now) for m, t in p.paused.items()
@@ -496,6 +504,8 @@ def status() -> dict:
     if "yandex" in providers and providers["yandex"]["has_key"]:
         providers["yandex"]["budget"] = yandex_budget.summary(
             max_tokens=PROVIDER_MAX_TOKENS, models=providers["yandex"]["models"])
+        if paid_budget.start_date() is not None:
+            providers["yandex"]["paid"] = paid_budget.summary()
     return result
 
 
@@ -529,7 +539,13 @@ def _failure_state(now: datetime | None = None) -> tuple[list[str], list[datetim
     blocked_count = 0
     gone_count = 0                     # не ответят до вмешательства человека - не квота и не сбой
     active = _chain_active()
-    yandex_note = _yandex_budget_note() if "yandex" in active else ""
+    if "yandex" not in active:
+        yandex_note = ""
+    elif paid_budget.active(now):
+        pilot = paid_budget.summary(now)
+        yandex_note = YANDEX_DAY_SPENT if pilot["active"] and pilot["reason"] else pilot["reason"]
+    else:
+        yandex_note = _yandex_budget_note()
     with _lock:
         for name in active:
             if name == "gemini":
@@ -559,7 +575,7 @@ def _failure_state(now: datetime | None = None) -> tuple[list[str], list[datetim
                     # сутки бюджета - по МСК: сброс в 00:00 МСК; весь бюджет/сбой учёта - не квота
                     resumes.append(yandex_midnight)
                     blocked_count += 1
-                elif yandex_note.startswith("весь бюджет"):
+                elif yandex_note.startswith("весь бюджет") or paid_budget.active(now):
                     gone_count += 1
                 continue
             live = [m for m in p.models if m not in p.disabled]
@@ -797,24 +813,88 @@ def parse_ai_json(text: str, text_len: int | None = None) -> dict | None:
     }
 
 
-def score_order(order) -> dict | None:
+@dataclass
+class _LiveWindow:
+    deadline: float
+    attempts: int = 0
+    free_busy: bool = False
+
+    def time_left(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def allows_post(self) -> bool:
+        return self.attempts < LIVE_MAX_POSTS and self.time_left() > 0
+
+    def post(self, url: str, *, headers: dict, json: dict):
+        import aiohttp
+        import requests
+
+        timeout = min(LIVE_POST_SEC, self.time_left())
+        if not self.allows_post() or timeout <= 0:
+            raise TimeoutError("дедлайн AI")
+        self.attempts += 1
+
+        async def request():
+            # Общий таймаут включает соединение и чтение ответа. Перенаправления запрещены.
+            async with asyncio.timeout(timeout):
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                    async with session.post(url, headers=headers, json=json, allow_redirects=False) as remote:
+                        result = requests.Response()
+                        result.status_code = remote.status
+                        result.headers.update(remote.headers)
+                        result.encoding = "utf-8"
+                        chunks = bytearray()
+                        async for chunk in remote.content.iter_chunked(16384):
+                            chunks.extend(chunk)
+                            if len(chunks) > 1_048_576:
+                                raise ValueError("слишком большой ответ AI")
+                        result._content = bytes(chunks)
+                        return result
+
+        future = asyncio.run_coroutine_threadsafe(request(), _transport_loop())
+        try:
+            return future.result(timeout=timeout)
+        finally:
+            if not future.done():
+                future.cancel()
+
+
+def _transport_loop() -> asyncio.AbstractEventLoop:
+    global _live_transport_loop
+    with _live_transport_lock:
+        if _live_transport_loop is None:
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="freelance-ai-http", daemon=True).start()
+            _live_transport_loop = loop
+        return _live_transport_loop
+
+
+def score_order(order, *, live: bool = False, allow_paid: bool = True) -> dict | None:
     """Оценка заказа: провайдеры по порядку CHAIN (AI_PROVIDERS); провайдер без ключа
     пропускается, при лимите/сбое заказ сразу уходит следующему. Возвращает dict оценки
     (с ключом "model") или None: AI недоступен или никто не дал разбираемый ответ."""
-    deadline = time.monotonic() + ORDER_DEADLINE_SEC
-    for name in _chain_active():
-        if time.monotonic() >= deadline:
-            logging.warning(f"[AI] дедлайн {ORDER_DEADLINE_SEC:g} с на заказ вышел, дальше не пробуем")
+    seconds = LIVE_DEADLINE_SEC if live else ORDER_DEADLINE_SEC
+    deadline = time.monotonic() + seconds
+    window = _LiveWindow(deadline) if live else None
+    chain = _chain_active()
+    if live:
+        yandex = allow_paid and "yandex" in chain and paid_budget.active()
+        chain = [name for name in chain if name != "yandex"] + (["yandex"] if yandex else [])
+    for name in chain:
+        if time.monotonic() >= deadline or (window and not window.allows_post()):
             break
+        if name == "yandex" and window and window.free_busy and not window.attempts:
+            break  # свободный бесплатный слот появится раньше повторной оценки
         try:
             if name == "gemini":
-                result = _ask_gemini_chain(order, deadline)
+                result = _ask_gemini_chain(order, deadline, window=window) if window else _ask_gemini_chain(order, deadline)
             else:
-                result = _ask_provider(PROVIDERS[name], order, deadline)
+                p = PROVIDERS[name]
+                result = _ask_provider(p, order, deadline, window=window) if window else _ask_provider(p, order, deadline)
         except Exception:
             logging.exception(f"[AI] {name}: неожиданный сбой, берём следующего")
             continue
-        if result is not None:
+        if result is not None and (not window or window.time_left() > 0):
             # достаточность данных считает код по реальной длине текста заказа (оценка модели её не знает)
             result["sufficiency"], result["confidence"] = assess_sufficiency(
                 result.get("clarity") or "", result.get("unknowns") or [], len(order.body or ""))
@@ -855,9 +935,10 @@ def experience_block(text: str) -> str:
 def _user_prompt(order) -> str:
     # сначала маскируем весь текст, потом режем: контакт на границе обрезки не просочится
     body = mask_contacts(order.body or "")[:BODY_LIMIT]
-    topic = (order.title or "") + " " + body
+    title = mask_contacts(order.title or "")[:300]
+    topic = title + " " + body
     return (
-        f"Название: {mask_contacts(order.title)}\n"
+        f"Название: {title}\n"
         # бюджет модели не передаётся: fit и часы не должны зависеть от него (экономику считает код)
         f"{experience_block(topic)}\n"
         f"Описание:\n{body}"
@@ -913,15 +994,18 @@ def _build_body(model: str, order) -> dict:
     }
 
 
-def _throttle() -> None:
+def _throttle(max_wait: float | None = None) -> bool:
     """Общий интервал между запросами к Gemini (все модели делят один клиентский темп)."""
     global _next_at
     with _lock:
         now = time.monotonic()
         start = max(now, _next_at)
+        if max_wait is not None and start - now > max_wait:
+            return False
         _next_at = start + GEMINI_MIN_INTERVAL_SEC
     if start > now:
         time.sleep(start - now)
+    return True
 
 
 def _quota_pause(resp) -> tuple[int, bool]:
@@ -976,17 +1060,18 @@ def _body_info(resp) -> tuple[str, str]:
     return ctype or "?", text
 
 
-def _ask_gemini_chain(order, deadline: float | None = None) -> dict | None:
+def _ask_gemini_chain(order, deadline: float | None = None, *, window: _LiveWindow | None = None) -> dict | None:
     with _lock:
         if time.monotonic() < _config_blocked_until:
             return None  # недавно ключ был отклонён: не долбим
     for model in GEMINI_MODELS:
-        if deadline is not None and time.monotonic() >= deadline:
+        if ((deadline is not None and time.monotonic() >= deadline)
+                or (window is not None and not window.allows_post())):
             return None
         with _lock:
             if model in _disabled or time.monotonic() < _paused_until.get(model, 0.0):
                 continue
-        outcome = _ask_gemini_model(model, order)
+        outcome = _ask_gemini_model(model, order, window=window) if window else _ask_gemini_model(model, order)
         if isinstance(outcome, dict):
             return outcome
         if outcome == "config":
@@ -994,20 +1079,22 @@ def _ask_gemini_chain(order, deadline: float | None = None) -> dict | None:
     return None
 
 
-def _ask_gemini_model(model: str, order):
+def _ask_gemini_model(model: str, order, *, window: _LiveWindow | None = None):
     """Один запрос к одной модели. dict - успех; "next" - пробуем следующую;
     "config" - ошибка ключа (цепочку Gemini прерываем)."""
     import requests
     global _config_error, _config_blocked_until, _region_error
     try:
-        _throttle()
-        resp = requests.post(
-            GEMINI_URL.format(model),
-            headers={"x-goog-api-key": GEMINI_KEY},
-            json=_build_body(model, order),
-            # gemma «думает» до ~50 с (проверено живым запросом), ей нужен больший таймаут
-            timeout=GEMMA_TIMEOUT_SEC if _is_gemma(model) else REQUEST_TIMEOUT_SEC,
-        )
+        url, headers, body = GEMINI_URL.format(model), {"x-goog-api-key": GEMINI_KEY}, _build_body(model, order)
+        if window:
+            if not _throttle(min(LIVE_SLOT_WAIT_SEC, window.time_left())) or not window.allows_post():
+                window.free_busy = True
+                return "config"
+            resp = window.post(url, headers=headers, json=body)
+        else:
+            _throttle()
+            resp = requests.post(url, headers=headers, json=body,
+                                 timeout=GEMMA_TIMEOUT_SEC if _is_gemma(model) else REQUEST_TIMEOUT_SEC)
     except Exception as e:
         logging.warning(f"[AI] {model}: сбой запроса: {type(e).__name__}")
         _set_error(f"{model}: {type(e).__name__}", "gemini")
@@ -1178,19 +1265,21 @@ _count_load_lock = threading.Lock()   # загрузка счётчиков из
 _count_save_lock = threading.Lock()   # пара «снимок + запись» в kv: последняя запись - самая свежая
 
 
-def _load_count(p: _Provider) -> None:
+def _load_count(p: _Provider, *, live: bool = False) -> None:
     """Один раз за процесс подтягивает дневной счётчик провайдера из kv (ключ
     ai_count_<имя> = "YYYY-MM-DD:N"), чтобы рестарт не обнулял бесплатную квоту.
     Остальные потоки ждут загрузку (иначе заняли бы слот до неё и потеряли сохранённое N).
     Ошибка чтения БД - работаем в памяти, но чтение повторится при следующем запросе, а запись в kv
     до успешного чтения пропускается (иначе малый счётчик затёр бы сохранённый расход).
     Чужое значение в kv - как пустое."""
-    with _count_load_lock:
+    if not _count_load_lock.acquire(timeout=1 if live else -1):
+        return
+    try:
         if p.count_loaded:
             return
         try:
             from database import kv_get
-            raw = kv_get(f"ai_count_{p.name}")
+            raw = kv_get(f"ai_count_{p.name}", timeout=1) if live else kv_get(f"ai_count_{p.name}")
         except Exception as e:
             logging.warning(f"[AI] {p.name}: счётчик за сутки не прочитан из БД: {type(e).__name__}")
             return
@@ -1202,35 +1291,54 @@ def _load_count(p: _Provider) -> None:
             if valid and day == _today(p) and p.day in ("", day):
                 p.day, p.count = day, int(num) + p.count
             p.count_loaded = True
+    finally:
+        _count_load_lock.release()
 
 
-def _save_count(p: _Provider) -> None:
+def _save_count(p: _Provider, *, live: bool = False) -> bool:
     """Записывает дневной счётчик провайдера в kv. Снимок и запись - под _count_save_lock,
     чтобы старый снимок не перезаписал новый; сам _lock во время записи не держим."""
-    with _count_save_lock:
+    if not _count_save_lock.acquire(timeout=1 if live else -1):
+        return False
+    try:
         with _lock:
             if not p.count_loaded:
-                return   # сохранённый расход не прочитан: запись затёрла бы его меньшим числом
+                return False   # сохранённый расход не прочитан: запись затёрла бы его меньшим числом
             value = f"{p.day}:{p.count}"
         try:
             from database import kv_set
-            kv_set(f"ai_count_{p.name}", value)
+            if live:
+                kv_set(f"ai_count_{p.name}", value, timeout=1)
+            else:
+                kv_set(f"ai_count_{p.name}", value)
+            return True
         except Exception as e:
             logging.warning(f"[AI] {p.name}: счётчик за сутки не записан в БД: {type(e).__name__}")
+            return False
+    finally:
+        _count_save_lock.release()
 
 
-def _give_back_slot(p: _Provider) -> None:
+def _give_back_slot(p: _Provider, *, live: bool = False) -> None:
     """Запрос не дал ответа от провайдера (сеть, 5xx, не-JSON): слот дневного лимита возвращаем."""
     with _lock:
         p.count = max(0, p.count - 1)
-    _save_count(p)
+    if live:
+        _save_count(p, live=True)
+    else:
+        _save_count(p)
 
 
-def _reserve_slot(p: _Provider) -> float | None:
+def _reserve_slot(p: _Provider, max_wait: float = PROVIDER_MAX_WAIT_SEC, *, live: bool = False) -> float | None:
     """Занимает слот запроса у провайдера: дневной потолок и свой интервал между запросами.
     Возвращает, сколько секунд ждать до запроса, или None - провайдер сейчас не годится
     (потолок за сутки или очередь длиннее PROVIDER_MAX_WAIT_SEC: заказ уйдёт дальше)."""
-    _load_count(p)
+    if live:
+        _load_count(p, live=True)
+        if not p.count_loaded:
+            return None
+    else:
+        _load_count(p)
     with _lock:
         now = time.monotonic()
         if p.dead or now < p.blocked_until:
@@ -1246,11 +1354,17 @@ def _reserve_slot(p: _Provider) -> float | None:
                                 f"пропускаем до {_reset_time(p)}")
             return None
         start = max(now, p.next_at)
-        if start - now > PROVIDER_MAX_WAIT_SEC:
+        if start - now > max_wait:
             logging.debug(f"[AI] {p.name}: очередь запросов длиннее {PROVIDER_MAX_WAIT_SEC:g} с")
             return None
         p.count += 1
         p.next_at = start + p.min_interval
+    if live:
+        if not _save_count(p, live=True):
+            with _lock:
+                p.count = max(0, p.count - 1)
+            return None
+        return max(0.0, start - time.monotonic())
     _save_count(p)
     return start - now
 
@@ -1364,12 +1478,21 @@ def _refresh_openrouter_prices(p: _Provider) -> None:
             _or_next_check = now + OPENROUTER_RETRY_SEC
 
 
-def _provider_models(p: _Provider) -> list[str]:
+def refresh_live_catalog() -> None:
+    p = PROVIDERS.get("openrouter")
+    if p and p.key and "openrouter" in CHAIN:
+        _refresh_openrouter_prices(p)
+
+
+def _provider_models(p: _Provider, *, live: bool = False) -> list[str]:
+    if p.name == "yandex" and live:
+        return [m for m in p.models if m == paid_budget.MODEL]
     if p.name != "openrouter":
         return list(p.models)
-    _refresh_openrouter_prices(p)
-    with _or_lock:
-        paid = set(_or_paid)
+    if not live:
+        _refresh_openrouter_prices(p)
+    # Снимок заменяется целиком при фоновом обновлении.
+    paid = _or_paid
     return [m for m in p.models if m not in paid and _is_free_openrouter_model(m)]
 
 
@@ -1429,14 +1552,16 @@ def _usable(p: _Provider, model: str) -> str | None:
     return None
 
 
-def _ask_provider(p: _Provider, order, deadline: float | None = None) -> dict | None:
+def _ask_provider(p: _Provider, order, deadline: float | None = None, *, window: _LiveWindow | None = None) -> dict | None:
     """Модели провайдера по очереди; None - никто не ответил (заказ идёт дальше)."""
     with _lock:
         _expire_key_error(p, time.monotonic())
         if p.dead or time.monotonic() < p.blocked_until:
             return None
-    for model in _provider_models(p):
-        if deadline is not None and time.monotonic() >= deadline:
+    models = _provider_models(p, live=True) if window else _provider_models(p)
+    for model in models:
+        if ((deadline is not None and time.monotonic() >= deadline)
+                or (window is not None and not window.allows_post())):
             return None
         with _lock:
             state = _usable(p, model)
@@ -1444,7 +1569,7 @@ def _ask_provider(p: _Provider, order, deadline: float | None = None) -> dict | 
             return None
         if state == "next":
             continue
-        outcome = _ask_provider_model(p, model, order)
+        outcome = _ask_provider_model(p, model, order, window=window) if window else _ask_provider_model(p, model, order)
         if isinstance(outcome, dict):
             return outcome
         if outcome == "stop":
@@ -1552,7 +1677,7 @@ def _log_yandex_cost(model: str, usage, spent: float) -> None:
     logging.info(f"[AI] yandex:{model}: {tokens}, {spent:.2f} ₽{day}")
 
 
-def _ask_provider_model(p: _Provider, model: str, order):
+def _ask_provider_model(p: _Provider, model: str, order, *, window: _LiveWindow | None = None):
     """Один заказ - одна модель. dict - успех; "next" - следующая модель;
     "stop" - провайдер для этого заказа не годится (ключ, 402, потолок, очередь)."""
     import requests
@@ -1562,8 +1687,16 @@ def _ask_provider_model(p: _Provider, model: str, order):
         use_reasoning = _wants_reasoning(p, model)
     resp = None
     for attempt in (1, 2, 3):
-        wait = _reserve_slot(p)   # внутри под _lock проверяет dead/blocked_until
+        if window and not window.allows_post():
+            return "stop"
+        wait = (_reserve_slot(p, min(LIVE_SLOT_WAIT_SEC, window.time_left()), live=True)
+                if window else _reserve_slot(p))
         if wait is None:
+            if window and p.name != "yandex":
+                with _lock:
+                    if (_usable(p, model) is None and p.count_loaded and p.count < p.max_per_day
+                            and p.next_at > time.monotonic()):
+                        window.free_busy = True
             return "stop"
         if wait > 0:
             time.sleep(wait)
@@ -1573,29 +1706,46 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 if state:
                     p.count = max(0, p.count - 1)  # запрос не ушёл - слот возвращаем
             if state:
-                _save_count(p)
+                if window:
+                    _save_count(p, live=True)
+                else:
+                    _save_count(p)
                 return state
-        reserved = None
+        body = _provider_body(_provider_model_id(p, model), order, use_json,
+                              p.name == "openrouter", use_reasoning)
+        if window and not window.allows_post():
+            _give_back_slot(p, live=True)
+            return "stop"
+        reserved, paid_token = None, None
         if p.name == "yandex":
-            # платный: перед запросом резервируем его худшую цену в бюджете гранта
-            reserved = yandex_budget.reserve(model, PROVIDER_MAX_TOKENS)
-            if reserved is None:
-                _give_back_slot(p)
-                _log_yandex_budget_stop(p)
+            if window:
+                paid_token = paid_budget.reserve(model, body)
+            else:
+                reserved = yandex_budget.reserve(model, PROVIDER_MAX_TOKENS)
+            if reserved is None and paid_token is None:
+                if window:
+                    _give_back_slot(p, live=True)
+                else:
+                    _give_back_slot(p)
+                if not window:
+                    _log_yandex_budget_stop(p)
                 return "stop"
+        if window and not window.allows_post():
+            if paid_token:
+                paid_budget.finish(paid_token, definitely_not_sent=True)
+            _give_back_slot(p, live=True)
+            return "stop"
         sent_at = time.monotonic()
         try:
-            resp = requests.post(
-                f"{p.base_url}/chat/completions",
-                headers=_provider_headers(p),
-                json=_provider_body(_provider_model_id(p, model), order, use_json,
-                                    p.name == "openrouter", use_reasoning),
-                timeout=PROVIDER_TIMEOUT_SEC,
-            )
+            url, headers = f"{p.base_url}/chat/completions", _provider_headers(p)
+            if window:
+                resp = window.post(url, headers=headers, json=body)
+            else:
+                resp = requests.post(url, headers=headers, json=body, timeout=PROVIDER_TIMEOUT_SEC)
         except Exception as e:
             logging.warning(f"[AI] {label}: сбой запроса: {type(e).__name__}")
             _set_error(f"{label}: {type(e).__name__}", p)
-            if not isinstance(e, requests.Timeout):
+            if not window and not isinstance(e, requests.Timeout):
                 _give_back_slot(p)   # запрос не дошёл - слот не тратим (при таймауте провайдер мог засчитать)
             if reserved is not None:
                 if _maybe_sent(e):
@@ -1604,6 +1754,9 @@ def _ask_provider_model(p: _Provider, model: str, order):
                 else:
                     yandex_budget.release(reserved)
             return "next"
+        if paid_token is not None:
+            # Ошибка или отсутствие корректного usage оставляет резерв: сервер мог выполнить запрос.
+            paid_budget.finish(paid_token, _usage_of(resp) if resp.status_code == 200 else None)
         if reserved is not None:
             if resp.status_code == 200:
                 usage = _usage_of(resp)
@@ -1679,7 +1832,7 @@ def _ask_provider_model(p: _Provider, model: str, order):
     if code != 200:
         logging.warning(f"[AI] {label}: HTTP {code}: {str(resp.text or '')[:150]!r}")
         _set_error(f"{label}: HTTP {code}", p)
-        if code >= 500:
+        if code >= 500 and not window:
             _give_back_slot(p)   # сбой на стороне провайдера - слот не тратим
         return "next"
 
@@ -1689,7 +1842,8 @@ def _ask_provider_model(p: _Provider, model: str, order):
         ctype, snippet = _body_info(resp)
         logging.warning(f"[AI] {label}: ответ не JSON: {type(e).__name__} ({ctype}): {snippet[:200]!r}")
         _set_error(f"{label}: ответ не JSON ({ctype}): «{snippet[:80]}»", p)
-        _give_back_slot(p)       # настоящего ответа не было - слот не тратим
+        if not window:
+            _give_back_slot(p)
         html_page = "text/html" in ctype.lower()
         if html_page or not snippet:
             # HTML - скорее всего страница блокировки/прокси: пауза всего провайдера;
@@ -1729,6 +1883,9 @@ def _ask_provider_model(p: _Provider, model: str, order):
     if parsed is None:
         logging.warning(f"[AI] {label}: ответ не JSON: {text[:150]!r}")
         _set_error(f"{label}: ответ не JSON", p)
+        if window:
+            with _lock:
+                p.paused[model] = max(p.paused.get(model, 0.0), time.monotonic() + 60)
         return "next"
     parsed["model"] = label
     _mark_ok(label, gemini=False, provider=p)
@@ -1921,6 +2078,11 @@ def probe() -> list[dict]:
         r = {"provider": name, "configured": name in active, "ok": False,
              "model": "", "seconds": 0.0, "fit": None, "error": ""}
         results.append(r)
+        if name == "yandex" and yandex_budget.expired():
+            reason = ("резерв Yandex не расходуется на диагностический запрос" if paid_budget.active()
+                      else "срок гранта вышел, платный пилот выключен")
+            r.update(configured=False, error=reason)
+            continue
         if not r["configured"]:
             if name != "yandex":
                 r["error"] = "нет ключа"

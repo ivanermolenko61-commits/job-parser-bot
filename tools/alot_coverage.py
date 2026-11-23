@@ -30,7 +30,7 @@ def window_covered(orders, threshold) -> bool:
     дате API не даёт, поэтому это эвристика, а не доказательство: нужно не меньше EDGE_ORDERS
     заказов, и все наименьшие по id старше порога. Одного старого заказа недостаточно."""
     edge = sorted(orders, key=lambda o: o.order_id)[:EDGE_ORDERS]
-    return len(edge) >= EDGE_ORDERS and all(o.published_at <= threshold for o in edge)
+    return len(edge) >= EDGE_ORDERS and all(o.published_at and o.published_at <= threshold for o in edge)
 
 
 def collect(hours: float):
@@ -62,7 +62,7 @@ def collect(hours: float):
         if covered and back >= covered_at + SAFETY_MARGIN_IDS:
             break  # край старше порога и ещё SAFETY_MARGIN_IDS id ниже него просмотрены
         back = min(covered_at + SAFETY_MARGIN_IDS if covered else back * 2, MAX_BACK_IDS)
-    orders = [o for o in seen.values() if o.published_at >= threshold]
+    orders = [o for o in seen.values() if o.published_at and o.published_at >= threshold]
     return sorted(orders, key=lambda o: o.order_id), top, covered, partial
 
 
@@ -74,8 +74,11 @@ def print_freshness(orders, now=None) -> None:
         return
     last: dict[str, datetime] = {}
     for o in orders:
-        if o.site not in last or o.published_at > last[o.site]:
+        if o.published_at and (o.site not in last or o.published_at > last[o.site]):
             last[o.site] = o.published_at
+    if not last:
+        print("Свежесть: даты публикации неизвестны")
+        return
     newest = max(last.values())
     print(f"Свежесть: самый новый заказ в выдаче alot.pro старше на {(now - newest).total_seconds() / 3600:.1f} ч "
           f"({newest.astimezone():%d.%m %H:%M}); по сайтам, часов назад:")
@@ -119,7 +122,7 @@ def main() -> None:
     chosen = [o for o in orders if o.site == args.site and needle in (o.title or "").lower()]
     print(f"\nСайт {args.site}{f', в названии «{args.grep}»' if needle else ''}: {len(chosen)}")
     for o in chosen:
-        t = o.published_at.astimezone().strftime("%d.%m %H:%M")
+        t = o.published_at.astimezone().strftime("%d.%m %H:%M") if o.published_at else "дата неизвестна"
         why = reasons[o.order_id] or "прошёл"
         title = ai_scorer.mask_contacts(o.title or "")[:70]
         print(f"  {o.order_id} {t} | {why:<22} | {','.join(o.categories) or '-'} | {title}")

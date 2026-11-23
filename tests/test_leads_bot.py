@@ -264,6 +264,8 @@ class BackgroundJobsTest(BotBase):
             b.send_message.assert_not_awaited()
 
     def test_offers_sent_once_and_released_on_failure(self):
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET published_at=datetime('now','-4 minutes') WHERE order_id=1")
         with mock.patch.object(bot, "bot") as b, mock.patch.object(bot, "MY_CHAT_ID", CHAT), \
                 mock.patch.object(bot, "_freelance_subscribed", mock.AsyncMock(return_value=True)):
             b.send_message = mock.AsyncMock(side_effect=RuntimeError("net"))

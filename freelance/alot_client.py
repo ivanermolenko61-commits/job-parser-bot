@@ -34,7 +34,7 @@ HEADERS = {
 # Красивые имена бирж
 SITE_NAMES = {
     "youdoru": "YouDo", "kworkru": "Kwork", "flru": "FL.ru",
-    "freelanceru": "Freelance.ru", "workzillaru": "Workzilla",
+    "freelanceru": "Freelance.ru", "weblancer": "Weblancer", "workzillaru": "Workzilla",
     "taskpayru": "TaskPay", "advegocom": "Advego", "etxtru": "eTXT",
     "turbotextru": "TurboText", "vkcom": "VK", "lclancerru": "LClancer",
     "hhru": "hh.ru", "trudvsemru": "Работа в России", "remotejobru": "RemoteJob",
@@ -135,7 +135,7 @@ def _parse_item(item: dict) -> FreelanceOrder | None:
     try:
         order_id = int(item["internalId"])
         ts = int(item.get("date") or 0) / 1000
-        published = datetime.fromtimestamp(ts, tz=timezone.utc)
+        published = datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
         try:
             price_value = float(item.get("internalPrice") or 0)
         except (TypeError, ValueError):
@@ -251,6 +251,6 @@ if __name__ == "__main__":
     passed.sort(key=lambda o: o.order_id, reverse=True)
     print(f"Прошли префильтр: {len(passed)}")
     for o in passed[:20]:
-        t = o.published_at.astimezone().strftime("%d.%m %H:%M")
+        t = o.published_at.astimezone().strftime("%d.%m %H:%M") if o.published_at else "дата неизвестна"
         print(f"{o.order_id} [{site_name(o.site)}] {t} | {o.price_text or '-'} | "
               f"{','.join(o.categories)} | {o.title[:70]}")

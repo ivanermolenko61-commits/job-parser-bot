@@ -67,6 +67,12 @@ STRENGTH_WORDS = [
 _INCLUDE_RE = _compile(INCLUDE_WORDS)
 _SITE_RE = _compile(SITE_WORDS)
 _STRENGTH_RE = _compile(STRENGTH_WORDS)
+_PRIORITY_RE = _compile([word for word in STRENGTH_WORDS
+                        if word not in {"wildberries", "вайлдберриз", "ozon", "озон", "маркетплейс"}])
+_MARKETPLACE_VISUAL_RE = re.compile(r"инфографик|(?:карточк|товарн\w*\s+карт).{0,90}"
+                                    r"(?:маркетплейс|wildberries|вайлдберриз|\bwb\b|ozon|озон)", re.I)
+_VISUAL_AUTOMATION_RE = _compile(["автоматизац", "автоматизир", "генератор", "массовая генерац",
+                                 "генерация карточек по api", "интеграц", "api", "скрипт", "парсер"])
 
 # Явно не наше (проверяется по title)
 EXCLUDE_WORDS = [
@@ -168,6 +174,9 @@ def reject_reason(order) -> str | None:
     title = order.title or ""
     if is_service_offer(title):
         return "service_offer"
+    head = f"{title}\n{(order.body or '')[:600]}"
+    if _MARKETPLACE_VISUAL_RE.search(title) and not _VISUAL_AUTOMATION_RE.search(head):
+        return "marketplace_graphics"
     # «Вёрстка по готовому дизайну» - заказ на разработку: дизайн тут дан, а не заказывается
     stop_text = _DESIGN_GIVEN_RE.sub(" ", title)
     hits = [m.group(0).lower() for m in _EXCLUDE_RE.finditer(stop_text)]
@@ -176,7 +185,6 @@ def reject_reason(order) -> str | None:
         return f"stop_word:{hard[0]}"
     if hits and not _soft_stop_overridden(title, order.body):
         return f"stop_word:{hits[0]}"
-    head = f"{title}\n{(order.body or '')[:600]}"
     if _SITE_RE.search(title) and not (_STRENGTH_RE.search(head) or _result_signal(title, order.body)):
         return "site_only"
     if DEV_CATEGORIES.intersection(order.categories):
@@ -204,9 +212,9 @@ def priority(order) -> int:
     3 - прошёл префильтр иначе (например, категория WEB без слов профиля)."""
     title = order.title or ""
     head = f"{title}\n{(order.body or '')[:600]}"
-    if _STRENGTH_RE.search(title) or _RESULT_TITLE_RE.search(title):
+    if _PRIORITY_RE.search(title) or _RESULT_TITLE_RE.search(title):
         return 1
-    if _STRENGTH_RE.search(head) or _RESULT_BODY_RE.search((order.body or "")[:600]) \
+    if _PRIORITY_RE.search(head) or _RESULT_BODY_RE.search((order.body or "")[:600]) \
             or PROFILE_CATEGORIES.intersection(order.categories):
         return 2
     return 3

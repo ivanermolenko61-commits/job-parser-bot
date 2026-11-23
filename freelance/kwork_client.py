@@ -15,7 +15,7 @@ import requests
 
 from config import KWORK_PAGES, KWORK_URL
 from freelance.alot_client import FreelanceOrder, _clean_body
-from freelance.sources import KWORK_ID_OFFSET, MANUAL_ID_OFFSET
+from freelance.sources import FREELANCE_RU_ID_OFFSET, KWORK_ID_OFFSET
 
 KWORK_SITE = "kworkru"
 DEV_CATEGORY = 11            # «Разработка и IT»
@@ -45,7 +45,7 @@ def kwork_url(project_id: int) -> str:
 
 
 def is_kwork_id(order_id: int) -> bool:
-    return KWORK_ID_OFFSET <= order_id < MANUAL_ID_OFFSET
+    return KWORK_ID_OFFSET <= order_id < FREELANCE_RU_ID_OFFSET
 
 
 def _dev_codes(category: str) -> list[str]:

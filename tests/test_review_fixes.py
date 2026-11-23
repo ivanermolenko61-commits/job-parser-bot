@@ -186,21 +186,24 @@ class SummaryTest(DbTestCase):
         self.assertEqual(self.run_summary(bot.send_freelance_daily_summary, 21).await_count, 0)
 
 
-class FreshnessBeforeSendTest(unittest.TestCase):
+class FreshnessBeforeSendTest(DbTestCase):
     def sc(self, oid, age_hours):
         order = alot_client.FreelanceOrder(
             oid, "kwork", "Заказ", "текст", "1000 ₽", 1000.0, [],
             datetime.now(timezone.utc) - timedelta(hours=age_hours), f"https://x/{oid}")
         return pipeline.ScoredOrder(order, {"fit": 8})
 
-    def test_old_assessed_order_delivered_after_fresh_order(self):
-        fresh, old = self.sc(1, 1), self.sc(2, 50)
+    def test_old_assessed_order_is_not_delivered(self):
+        fresh, old = self.sc(1, 0.1), self.sc(2, 5)
+        for sc in (fresh, old):
+            sc.order.site = "flru"
+            pipeline.save_order(sc, "pending")
         send = mock.AsyncMock(return_value=10)
-        progress = {}
-        with mock.patch.object(bot, "_send_order", send), mock.patch.object(bot, "save_sent", return_value=True), mock.patch("asyncio.sleep", mock.AsyncMock()):
-            asyncio.run(bot._deliver_freelance(pipeline.CycleResult(to_send=[old, fresh]), progress))
-        self.assertEqual([call.args[0].order.order_id for call in send.await_args_list], [1, 2])
-        self.assertEqual(progress["retry"], [])
+        with mock.patch.object(bot, "_send_order", send):
+            asyncio.run(bot._deliver_freelance(force=True))
+        self.assertEqual([call.args[0].order.order_id for call in send.await_args_list], [1])
+        self.assertEqual(database.freelance_get(1)["message_id"], 10)
+        self.assertIsNone(database.freelance_get(2)["message_id"])
 
 
 class YandexUsageTest(unittest.TestCase):

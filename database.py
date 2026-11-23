@@ -14,11 +14,13 @@ import os
 import re
 import sqlite3
 import statistics
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from config import (
-    DB_PATH, DUPLICATE_WINDOW_DAYS, FREELANCE_JOURNAL_DAYS, FREELANCE_MIN_FIT, SENT_HISTORY_DAYS,
+    DB_PATH, DUPLICATE_WINDOW_DAYS, FREELANCE_JOURNAL_DAYS, FREELANCE_LIVE_MINUTES, FREELANCE_MIN_FIT,
+    SENT_HISTORY_DAYS,
 )
 from freelance import journal as jr
 from parsers.filters import dedup_key
@@ -39,14 +41,14 @@ MONTHS_RU = {
 
 
 @contextmanager
-def _connect():
+def _connect(timeout: float = 30):
     """Открывает соединение с базой и гарантированно закрывает его.
 
     Обычный `with sqlite3.connect(...)` только коммитит транзакцию,
     но НЕ закрывает соединение — поэтому оборачиваем сами.
     """
     # timeout: джобы вакансий и фриланса пишут параллельно — ждём, а не падаем
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -391,6 +393,39 @@ def _init_freelance(conn) -> None:
     """)
     # Миграция: новые колонки добавляем в существующую БД без потери данных
     cols = {r[1] for r in conn.execute("PRAGMA table_info(freelance_orders)")}
+    for col in ("listing_key", "delivery_token", "delivery_retry_at", "analysis_retry_at"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE freelance_orders ADD COLUMN {col} TEXT")
+    if "listing_key" not in cols:
+        from freelance.manual import listing_key
+
+        rows = conn.execute("SELECT url, order_id FROM freelance_orders WHERE url IS NOT NULL")
+        for batch in iter(lambda: rows.fetchmany(500), []):
+            conn.executemany("UPDATE freelance_orders SET listing_key=? WHERE order_id=?",
+                             ((listing_key(url), order_id) for url, order_id in batch))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS freelance_retired (
+            order_id INTEGER PRIMARY KEY, listing_key TEXT, seen_at TEXT, delivered_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_retired_key ON freelance_retired(listing_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_listing_key ON freelance_orders(listing_key)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS yandex_paid_ledger (
+            token TEXT PRIMARY KEY, pilot_start TEXT NOT NULL, day TEXT NOT NULL,
+            micros INTEGER NOT NULL CHECK(micros >= 0),
+            state TEXT NOT NULL CHECK(state IN ('reserved','settled','released','overrun'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_yandex_paid_day ON yandex_paid_ledger(day)")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS freelance_remember_retired
+        AFTER DELETE ON freelance_orders
+        BEGIN
+            INSERT OR IGNORE INTO freelance_retired VALUES
+                (OLD.order_id, OLD.listing_key, OLD.seen_at, OLD.delivered_at);
+        END
+    """)
     if "attempts" not in cols:
         conn.execute("ALTER TABLE freelance_orders ADD COLUMN attempts INTEGER DEFAULT 0")
     if "message_id" not in cols:
@@ -521,14 +556,14 @@ def _backfill_journal(conn) -> None:
     )
 
 
-def kv_get(key: str, default: str | None = None) -> str | None:
-    with _connect() as conn:
+def kv_get(key: str, default: str | None = None, *, timeout: float = 30) -> str | None:
+    with _connect(timeout=timeout) as conn:
         row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
 
-def kv_set(key: str, value) -> None:
-    with _connect() as conn:
+def kv_set(key: str, value, *, timeout: float = 30) -> None:
+    with _connect(timeout=timeout) as conn:
         conn.execute(
             "INSERT INTO kv (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -662,6 +697,7 @@ def freelance_save(
     dup_of: int | None = None,
     delivery: str | None = None,
     stale_reason: str | None = None,
+    listing_key: str | None = None,
 ) -> None:
     """Запоминает заказ (upsert) и ведёт три независимых измерения (freelance/journal.py).
 
@@ -737,6 +773,31 @@ def freelance_save(
             f"ON CONFLICT(order_id) DO UPDATE SET {updates}",
             (order_id, *(values[c] for c in _SAVE_COLUMNS)),
         )
+        if listing_key:
+            conn.execute("UPDATE freelance_orders SET listing_key = ? WHERE order_id = ? AND listing_key IS NULL",
+                         (listing_key, order_id))
+
+
+def freelance_previous_listing(order_id: int, listing_key: str | None) -> int | None:
+    """Устойчивый поиск исходного объявления, в том числе после чистки журнала."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT order_id FROM freelance_retired WHERE order_id=? "
+            "UNION ALL SELECT order_id FROM freelance_orders WHERE listing_key=? AND order_id!=? "
+            "AND tech NOT IN ('filtered','duplicate') "
+            "UNION ALL SELECT order_id FROM freelance_retired WHERE listing_key=? LIMIT 1",
+            (order_id, listing_key, order_id, listing_key),
+        ).fetchone()
+        return row[0] if row else None
+
+
+def freelance_confirm_publication(order_id: int, published_at: str, listing_key: str | None) -> None:
+    with _connect(timeout=2) as conn:
+        conn.execute("""UPDATE freelance_orders SET published_at=?, pub_unreliable=0,
+                          listing_key=COALESCE(listing_key,?)
+                        WHERE order_id=? AND origin IS NOT 'manual'
+                          AND (published_at IS NULL OR pub_unreliable=1)""",
+                     (published_at, listing_key, order_id))
 
 
 def _update_states(order_id: int, _guard=None, **fields) -> bool:
@@ -1082,15 +1143,19 @@ def freelance_unprocessed(days: int = 3, limit: int = 30) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def freelance_claim_offers(limit: int = 10, days: int = 3, now: str | None = None) -> tuple[str, list[dict]]:
+def freelance_claim_offers(limit: int = 10, days: int = 3, now: str | None = None, *,
+                           fresh_only: bool = False) -> tuple[str, list[dict]]:
     """Резервировать строки на десять минут. После сбоя просроченный резерв можно занять снова."""
     now = now or _now_sql()
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        freshness = f" AND {_LIVE_FRESH}" if fresh_only else ""
+        fresh_params = (now, now) if fresh_only else ()
         rows = [dict(r) for r in conn.execute(
-            f"SELECT {_LEAD_COLS} FROM freelance_orders WHERE {_UNPROCESSED} AND offered_at IS NULL "
+            f"SELECT {_LEAD_COLS}, published_at, pub_unreliable, seen_at, origin FROM freelance_orders "
+            f"WHERE {_UNPROCESSED} AND offered_at IS NULL {freshness} "
             "AND (offer_claimed_at IS NULL OR offer_claimed_at <= datetime(?, '-10 minutes')) "
-            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", now, limit)).fetchall()]
+            "ORDER BY fit DESC, delivered_at DESC LIMIT ?", (f"-{days} days", *fresh_params, now, limit)).fetchall()]
         for r in rows:
             conn.execute("UPDATE freelance_orders SET offer_claimed_at = ? WHERE order_id = ?", (now, r["order_id"]))
         return now, rows
@@ -1407,6 +1472,156 @@ def freelance_expired_messages(ttl_hours: int, limit: int = 200) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+_LIVE_PUBLICATION = "CASE WHEN COALESCE(pub_unreliable, 0)=0 THEN julianday(published_at) END"
+_LIVE_START = f"COALESCE({_LIVE_PUBLICATION}, julianday(seen_at))"
+_LIVE_FRESH = (f"({_LIVE_START} >= julianday(?, '-{FREELANCE_LIVE_MINUTES} minutes') "
+               f"AND {_LIVE_START} <= julianday(?, '+1 minute'))")
+_LIVE_QUEUE = "tech='queued' AND COALESCE(queue_reason, '') != 'no_text'"
+_LIVE_READY = "tech='assessed' AND delivery='pending' AND verdict='ok' AND COALESCE(ai_json,'') != ''"
+
+
+def freelance_commit_scan(cursor_key: str, last_id: int, day: str, excluded: dict[str, int]) -> None:
+    """Сдвигает курсор и дневные счётчики одним коммитом после успешного приёма."""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM kv WHERE key=?", (cursor_key,)).fetchone()
+        if row and str(row[0]).isdigit() and int(row[0]) >= last_id:
+            return
+        conn.execute("INSERT INTO kv(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (cursor_key, str(last_id)))
+        _count_excluded(conn, day, excluded)
+
+
+def freelance_expire_live() -> int:
+    """Убирает просроченное из обеих очередей, сохраняя оценку и историю."""
+    now = _now_sql()
+    with _connect() as conn:
+        cur = conn.execute(
+            f"""UPDATE freelance_orders SET status='expired', tech='stale', delivery='none',
+                           stale_reason=CASE WHEN tech='assessed' THEN ? ELSE ? END,
+                           stale_at=?, queue_reason=NULL, delivery_token=NULL, delivery_retry_at=NULL
+                WHERE (tech='queued' OR (tech='assessed' AND delivery='pending'))
+                  AND COALESCE(origin, '') != 'manual'
+                  AND (delivery_token IS NULL OR delivery_retry_at <= ?)
+                  AND NOT COALESCE({_LIVE_FRESH}, 0)""",
+            (jr.S_DELIVERY_EXPIRED, jr.S_QUEUE_EXPIRED, now, now, now, now),
+        )
+        return cur.rowcount
+
+
+def freelance_live_rows(stage: str, limit: int, *, only_manual: bool = False,
+                        disabled_ranges: tuple = (), busy_ids: tuple = ()) -> list[dict]:
+    """Каждая очередь ограничивается после фильтра возраста и отключённых источников."""
+    now = _now_sql()
+    if stage == "score":
+        where = _LIVE_QUEUE + " AND (analysis_retry_at IS NULL OR analysis_retry_at <= ?)"
+    elif stage == "deliver":
+        where = _LIVE_READY + " AND (delivery_retry_at IS NULL OR delivery_retry_at <= ?)"
+    else:
+        raise ValueError(f"Неизвестная стадия: {stage}")
+    where += f" AND (origin='manual' OR {_LIVE_FRESH})"
+    params = [now, now, now]
+    if only_manual:
+        where += " AND origin='manual'"
+    for low, high in disabled_ranges:
+        where += " AND NOT (order_id >= ? AND order_id < ?)"
+        params.extend((low, high))
+    if busy_ids:
+        where += f" AND order_id NOT IN ({','.join('?' for _ in busy_ids)})"
+        params.extend(busy_ids)
+    with _connect(timeout=2) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM freelance_orders WHERE {where} "
+            f"ORDER BY {_LIVE_START} DESC, julianday(seen_at) DESC, order_id DESC LIMIT ?",
+            (*params, limit),
+        )
+        return [dict(r) for r in rows]
+
+
+def freelance_live_score_result(row: dict, *, fit: int | None, ai_json: str = "", model: str = "",
+                                category: str | None = None, hours: float | None = None,
+                                retry_reason: str = jr.Q_ERROR) -> bool:
+    """Записывает результат только для версии текста, переданной на оценку."""
+    oid, version = row["order_id"], row.get("content_hash")
+    now = _now_sql()
+    with _connect(timeout=2) as conn:
+        guard = "WHERE order_id=? AND tech='queued' AND content_hash IS ?"
+        if fit is None:
+            cur = conn.execute(
+                "UPDATE freelance_orders SET queue_reason=?, attempts=COALESCE(attempts,0)+?, "
+                "analysis_retry_at=datetime(?, '+2 minutes') " + guard,
+                (retry_reason, int(retry_reason == jr.Q_ERROR), now, oid, version),
+            )
+        else:
+            suitable = fit >= FREELANCE_MIN_FIT
+            cur = conn.execute(
+                "UPDATE freelance_orders SET fit=?, ai_json=?, category=?, hours=?, tech='assessed', "
+                "assessed_at=COALESCE(assessed_at,?), queue_reason=NULL, analysis_retry_at=NULL, "
+                "attempts=0, status=?, verdict=?, delivery=? " + guard,
+                (fit, ai_json, category, hours, now, "pending" if suitable else "rejected",
+                 jr.V_OK if suitable else jr.V_LOW, jr.D_PENDING if suitable else jr.D_NONE, oid, version),
+            )
+            if cur.rowcount and version:
+                conn.execute("""INSERT OR IGNORE INTO freelance_assessments
+                                (order_id, content_hash, fit, model, ai_json, assessed_at)
+                                VALUES (?,?,?,?,?,?)""", (oid, version, fit, model, ai_json, now))
+        return bool(cur.rowcount)
+
+
+def freelance_claim_delivery(order_id: int) -> dict | None:
+    """Один владелец попытки. После падения процесса аренда истекает через минуту."""
+    token, now = uuid.uuid4().hex, _now_sql()
+    with _connect(timeout=2) as conn:
+        cur = conn.execute(
+            f"""UPDATE freelance_orders SET delivery_token=?, delivery_retry_at=datetime(?, '+60 seconds')
+                WHERE order_id=? AND {_LIVE_READY} AND (origin='manual' OR {_LIVE_FRESH})
+                  AND (delivery_retry_at IS NULL OR delivery_retry_at <= ?) RETURNING *""",
+            (token, now, order_id, now, now, now),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row is not None else None
+
+
+def freelance_live_daily_metrics() -> dict:
+    """События за скользящие 24 часа. Лаг публикации считаем по подтверждённым датам."""
+    with _connect(timeout=2) as conn:
+        scored = conn.execute("SELECT COUNT(*) FROM freelance_orders "
+                              "WHERE assessed_at >= datetime('now','-24 hours')").fetchone()[0]
+        cards = conn.execute(f"""SELECT (julianday(seen_at)-{_LIVE_PUBLICATION})*86400 AS discovery,
+                           (julianday(assessed_at)-julianday(seen_at))*86400 AS analysis,
+                           (julianday(delivered_at)-julianday(assessed_at))*86400 AS delivery,
+                           (julianday(delivered_at)-{_LIVE_PUBLICATION})*86400 AS total
+                    FROM freelance_orders WHERE delivery='card' AND origin IS NOT 'manual'
+                      AND delivered_at >= datetime('now','-24 hours')""").fetchall()
+    medians = {}
+    for stage in ('discovery', 'analysis', 'delivery', 'total'):
+        samples = [max(0, row[stage]) for row in cards if row[stage] is not None and row[stage] >= -1]
+        medians[stage] = round(statistics.median(samples)) if samples else None
+    confirmed = [row['total'] for row in cards if row['total'] is not None]
+    return {'scored': scored, 'cards': len(cards), 'known': len(confirmed),
+            'under_five': sum(-1 <= sec <= 300 for sec in confirmed), 'medians': medians}
+
+
+def freelance_finish_delivery(order_id: int, token: str, message_id: int | None, delay: int = 15) -> bool:
+    now = _now_sql()
+    with _connect(timeout=2) as conn:
+        if message_id is None:
+            cur = conn.execute(
+                "UPDATE freelance_orders SET delivery_token=NULL, delivery_retry_at=datetime(?, ?) "
+                "WHERE order_id=? AND delivery_token=?", (now, f"+{delay} seconds", order_id, token),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE freelance_orders SET delivery='card',
+                       status=CASE WHEN lead IN ('applied','discussing','agreed','done') THEN 'taken'
+                       WHEN lead='lost' THEN 'dismissed' ELSE 'sent' END,
+                       message_id=?, sent_at=?, delivered_at=?, delivery_token=NULL, delivery_retry_at=NULL
+                   WHERE order_id=? AND delivery_token=?""", (message_id, now, now, order_id, token),
+            )
+        return bool(cur.rowcount)
+
+
 def freelance_pending(limit: int = 100, id_ranges: list[tuple[int, int]] | None = None,
                       exclude_ranges: bool = False) -> list[dict]:
     """Ожидающие заказы (не оценены - tech=queued, либо оценены и ждут доставки), новые первыми
@@ -1518,13 +1733,15 @@ def freelance_count_excluded(day: str, counts: dict[str, int]) -> None:
     """Счётчики заказов, отсеянных по площадке (вакансионные доски): строк журнала для них нет,
     но воронка должна знать, сколько их было. counts: {site: n}."""
     with _connect() as conn:
-        for site, n in counts.items():
-            if n > 0:
-                conn.execute(
-                    "INSERT INTO freelance_funnel_daily (day, site, reason, n) VALUES (?, ?, 'excluded_site', ?) "
-                    "ON CONFLICT(day, site, reason) DO UPDATE SET n = n + excluded.n",
-                    (day, site, int(n)),
-                )
+        _count_excluded(conn, day, counts)
+
+
+def _count_excluded(conn, day: str, counts: dict[str, int]) -> None:
+    conn.executemany(
+        "INSERT INTO freelance_funnel_daily (day, site, reason, n) VALUES (?, ?, 'excluded_site', ?) "
+        "ON CONFLICT(day, site, reason) DO UPDATE SET n = n + excluded.n",
+        ((day, site, int(n)) for site, n in counts.items() if n > 0),
+    )
 
 
 if __name__ == "__main__":

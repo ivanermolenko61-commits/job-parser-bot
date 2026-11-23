@@ -17,8 +17,9 @@ REAL_FEED = pipeline._fetch_feed_orders   # до подмены в CycleTestBase
 
 
 class SourcesStateTest(CycleTestBase):
-    def test_all_enabled_by_default(self):
-        self.assertTrue(all(sources.is_enabled(n) for n in sources.ALL_SOURCES))
+    def test_weblancer_requires_explicit_enable(self):
+        self.assertTrue(all(sources.is_enabled(n) for n in sources.ALL_SOURCES if n != sources.WEBLANCER))
+        self.assertFalse(sources.is_enabled(sources.WEBLANCER))
 
     def test_toggle_persists_in_db(self):
         self.assertTrue(sources.set_enabled(sources.FLRU, False))
@@ -304,7 +305,8 @@ class BotSourcesUiTest(CycleTestBase):
         sources.set_enabled(sources.KWORK, False)
         rows = self.bot._sources_kb().inline_keyboard
         got = {r[0].callback_data: r[0].text for r in rows}
-        self.assertEqual(set(got), {"fl_src_t:alot", "fl_src_t:flru", "fl_src_t:kwork"})
+        self.assertEqual(set(got), {"fl_src_t:alot", "fl_src_t:flru", "fl_src_t:kwork",
+                                    "fl_src_t:freelanceru", "fl_src_noop"})
         self.assertIn("🟢 alot.pro", got["fl_src_t:alot"])
         self.assertIn("⚪ Kwork", got["fl_src_t:kwork"])
 

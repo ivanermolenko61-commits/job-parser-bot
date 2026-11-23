@@ -1,4 +1,5 @@
 """Ручные заказы: извлечение публичной ссылки и устойчивое хранение ввода."""
+import hashlib
 import re
 import threading
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -14,6 +15,7 @@ PATTERNS = {
     "kwork.ru": ("kworkru", r"/projects/(\d+)(?:/|$)"),
     "youdo.com": ("youdoru", r"/(?:t|tasks?/)(\d+)(?:/|$)"),
     "freelance.ru": ("freelanceru", r"/(?:projects?|tasks?)/[^?#]*?(\d+)(?:\.html|/|$)"),
+    "weblancer.net": ("weblancer", r"/freelance/[^/]+/[^/]+-(\d+)/?$"),
     "t.me": ("telegram", r"/([a-zA-Z0-9_]+/\d+)/?$"),
 }
 
@@ -44,7 +46,15 @@ def listing(url):
     direct = None
     if site in ("flru", "kworkru") and len(key) <= 9:
         direct = (sources.FL_ID_OFFSET if site == "flru" else sources.KWORK_ID_OFFSET) + int(key)
+    elif site in (sources.FREELANCE_RU, sources.WEBLANCER) and len(key) <= 9:
+        direct = (sources.FREELANCE_RU_ID_OFFSET if site == sources.FREELANCE_RU
+                  else sources.WEBLANCER_ID_OFFSET) + int(key)
     return site, f"{site}:{key}", "https://" + host + parts.path, direct
+
+
+def listing_key(url: str | None) -> str | None:
+    identity = listing(url or "")
+    return hashlib.sha256(identity[1].encode()).hexdigest() if identity else None
 
 
 def pending():

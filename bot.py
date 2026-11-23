@@ -27,9 +27,10 @@ from dotenv import load_dotenv
 from config import (
     CHECK_INTERVAL_MINUTES,
     FREELANCE_INTERVAL_MINUTES,
-    FREELANCE_MAX_PER_CYCLE,
+    FREELANCE_HTML_SECONDS,
     FREELANCE_MESSAGE_TTL_HOURS,
     FREELANCE_MIN_FIT,
+    FREELANCE_STAGE_SECONDS,
     MAX_VACANCY_AGE_DAYS,
 )
 from database import (
@@ -38,8 +39,12 @@ from database import (
     freelance_deal_rows,
     freelance_expired_messages,
     freelance_claim_offers,
+    freelance_claim_delivery,
+    freelance_live_daily_metrics,
     freelance_confirm_offers,
     freelance_get,
+    freelance_expire_live,
+    freelance_finish_delivery,
     freelance_last_deal_price,
     freelance_lead_events,
     freelance_lead_can_undo,
@@ -72,20 +77,23 @@ from freelance import manual as manual_orders
 from freelance import leads
 from freelance.alot_client import site_name
 from freelance.pipeline import (
+    AI_WORKERS,
     LAST_ID_KEY,
     MSK,
-    PREPARE_TIMEOUT_SEC,
     TRIAGE_SHADOW_MAX_PER_DAY,
     approve_triage,
     triage_audit_sample,
     triage_report,
-    finish_cycle,
+    collect_live,
     format_order,
     format_order_plain,
     mark_sent_status,
-    prepare_cycle,
+    live_fresh,
+    live_rows,
+    reassess_live,
     record_triage_label,
-    save_sent,
+    report_live_ai,
+    score_live,
     scored_from_row,
 )
 import memwatch
@@ -136,7 +144,7 @@ DEFAULT_LIST_LIMIT = 300
 MAX_LIST_LIMIT = 500
 MSG_CHAR_LIMIT = 3500
 # Источники health-монитора, относящиеся к фрилансу (в /status вакансий не показываем)
-FREELANCE_HEALTH_SOURCES = {"alot", "alot_feed", "flru", "kwork", "gemini", "memory"}  # memory - не парсер вакансий
+FREELANCE_HEALTH_SOURCES = {*sources.ALL_SOURCES, "alot_feed", "gemini", "memory"}
 
 # Срок хранения вакансий в БД (дней)
 CLEANUP_DAYS = 5
@@ -404,13 +412,7 @@ def _order_kb(order_id: int, url: str | None, taken: bool = False,
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _sort_key_for_cap(sc) -> tuple:
-    # Без AI считаем «средним» (5), чтобы не вытеснять оценённые. При равной оценке - свежее первым
-    # по времени публикации: order_id разных источников (alot.pro, FL.ru, Kwork) несравнимы
-    return (sc.fit if sc.fit is not None else 5, (sc.order.published_at or sc.first_seen).timestamp() if sc.order.published_at or sc.first_seen else 0)
-
-
-async def _send_order(sc):
+async def _send_order(sc, still_fresh: Callable[[], bool]):
     """Отправляет один заказ, при отказе Telegram пробует упрощённые варианты.
 
     Возвращает message_id. TelegramBadRequest на всех вариантах пробрасывается
@@ -427,6 +429,8 @@ async def _send_order(sc):
     variants.append((format_order_plain(sc), None, _kb(lv.order_card_buttons(o.order_id, None))))
     last_exc: Exception | None = None
     for text, parse_mode, markup in variants:
+        if not still_fresh():
+            return None
         try:
             msg = await bot.send_message(
                 chat_id=MY_CHAT_ID, text=text, parse_mode=parse_mode,
@@ -459,172 +463,139 @@ async def _set_order_status(order_id: int, status: str) -> None:
     await asyncio.to_thread(freelance_set_status, order_id, status)
 
 
-async def _deliver_freelance(res, progress: dict | None = None) -> dict:
-    """Отправляет заказы цикла и сразу сохраняет каждый успешно отправленный.
+_live_ai_tasks: dict[int, asyncio.Task] = {}
+_live_ai_pump_lock = asyncio.Lock()
+_live_delivery_lock = asyncio.Lock()
+_live_delivery_acks: dict[int, tuple[str, int]] = {}
+_live_health_lock = asyncio.Lock()
+_live_flood_until = 0.0
 
-    Ни один заказ не теряется: ошибка форматирования или отказ Telegram приводят к
-    запасному формату (обычный текст), а если и он не прошёл, как и сетевой сбой
-    или лимиты Telegram, - к retry (статус pending, повтор в следующем цикле).
-    """
-    # progress заполняется по ходу: при неожиданном сбое вызывающий знает, что уже ушло
-    progress = progress if progress is not None else {}
-    retry = progress.setdefault("retry", [])
-    ranked = sorted(res.to_send, key=_sort_key_for_cap, reverse=True)
-    chosen = ranked[:FREELANCE_MAX_PER_CYCLE]
-    extra = ranked[FREELANCE_MAX_PER_CYCLE:]
 
-    sent_ok = progress.setdefault("sent", [])
-    skipped = progress.setdefault("skipped", [])
-    flood = False
-    for sc in chosen:
-        if flood:
-            retry.append(sc)
-            continue
-        try:
-            message_id = await _send_order(sc)
-        except TelegramRetryAfter as e:
-            logging.warning(f"[FREELANCE] flood control, ждём {e.retry_after} с")
-            await asyncio.sleep(min(e.retry_after, 30))
-            retry.append(sc)
-            flood = True
-            continue
-        except Exception:
-            logging.exception(f"[FREELANCE] Не удалось отправить {sc.order.url}")
-            retry.append(sc)
-            continue
-        sent_ok.append(sc)
-        # запись с повторами; при неудаче заказ остаётся в памяти (_sent_ids) и
-        # дописывается в finish_cycle, поэтому дубля не будет
-        saved = await asyncio.to_thread(save_sent, sc, message_id)
-        if not saved:
-            logging.error(f"[FREELANCE] отправленный заказ не записан в БД: {sc.order.url}")
-        await asyncio.sleep(0.5)
-
-    if extra:
-        extra_sorted = sorted(extra, key=_sort_key_for_cap, reverse=True)
-        header = f"➕ Ещё {len(extra)} подходящих заказов (не показаны из-за лимита):"
-        items = []
-        for sc in extra_sorted:
-            fit = f"{sc.fit}/10 " if sc.fit is not None else ""
-            items.append((sc, (
-                f'• {fit}<a href="{html.escape(sc.order.url or "")}">'
-                f"{html.escape((sc.order.title or '')[:80])}</a>"
-            )))
-        # Все заказы сводки, порезанные на сообщения по лимиту; обработанными
-        # отмечаем только реально показанные
-        groups, cur, cur_len = [], [], len(header)
-        for sc, line in items:
-            if cur and cur_len + len(line) + 1 > MSG_CHAR_LIMIT:
-                groups.append(cur)
-                cur, cur_len = [], 0
-            cur.append((sc, line))
-            cur_len += len(line) + 1
-        if cur:
-            groups.append(cur)
-        failed_from = None
-        for gi, group in enumerate(groups):
-            text = "\n".join(([header] if gi == 0 else []) + [line for _, line in group])
-            try:
-                await bot.send_message(
-                    chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                skipped.extend(sc for sc, _ in group)
-            except Exception:
-                logging.exception("[FREELANCE] Не удалось отправить сводку")
-                failed_from = gi
-                break
-        if failed_from is not None:
-            # непоказанные заказы не теряем: pending, повтор в следующем цикле
-            for group in groups[failed_from:]:
-                retry.extend(sc for sc, _ in group)
-    return {"sent": sent_ok, "skipped": skipped, "retry": retry}
+async def _collect_freelance(source: str, manual: bool = False):
+    if manual or await _freelance_subscribed():
+        return await asyncio.to_thread(collect_live, source)
+    return None
 
 
 async def check_freelance(manual: bool = False) -> dict | None:
-    """Проверка фриланс-заказов. None — пропущена (пауза или уже идёт)."""
-    result = None
-    try:
-        result = await _check_freelance_impl(manual)
-        return result
-    finally:
-        if result is not None:  # цикл реально выполнялся
-            try:
-                await asyncio.to_thread(memwatch.trim)
-                memwatch.log_mem("фриланс")
-            except Exception:
-                logging.exception("[MEM] trim после фриланса не удался")
-
-
-async def _send_reassess_notes(res) -> None:
-    """Повторные уведомления: описание доставленного заказа изменилось и оценка заметно изменилась. Право на
-    уведомление занято в БД до отправки (одно на версию текста), поэтому сбой отправки дубля не даёт."""
-    for text in getattr(res, "reassess_notes", None) or []:
-        try:
-            await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
-                                   disable_web_page_preview=True)
-        except Exception:
-            logging.exception("[FREELANCE] не удалось отправить уведомление об обновлённой оценке")
-
-
-async def _check_freelance_impl(manual: bool = False) -> dict | None:
-    only_manual = not manual and not await _freelance_subscribed()
-    if only_manual and not await asyncio.to_thread(manual_orders.pending):
-        logging.info("[FREELANCE] пауза, пропуск")
-        return None
-    # Минутный таймер не запускает второй обход во время работы первого.
+    """Ручная проверка запускает сбор, затем подбирает оценку и доставку очереди."""
     if _freelance_lock.locked():
-        logging.info("[FREELANCE] проверка уже идёт, пропуск")
         return None
-
     async with _freelance_lock:
-        try:
-            res = await asyncio.wait_for(
-                asyncio.to_thread(prepare_cycle, True) if only_manual else asyncio.to_thread(prepare_cycle), timeout=PREPARE_TIMEOUT_SEC
-            )
-        except Exception:
-            logging.exception("[FREELANCE] ошибка проверки")
-            return {"error": "сбой проверки", "sent": 0, "extra": 0}
+        results = await asyncio.gather(*(_collect_freelance(n, manual) for n in sources.ALL_SOURCES))
+        await _pump_freelance_ai(force=manual)
+        await _deliver_freelance(force=manual)
+        passes = [r for r in results if r is not None and not r.busy]
+        return {"scanned": sum(r.raw_count for r in passes),
+                "new": sum(r.intake.get("new", 0) for r in passes),
+                "errors": [r.error for r in passes if r.error]}
 
-        for alert in monitor.pop_alerts():
+
+async def _score_freelance_row(row: dict, force: bool) -> None:
+    oid = row["order_id"]
+    try:
+        res = await asyncio.to_thread(score_live, row)
+        if force and res.ai_ok:
+            asyncio.create_task(_deliver_freelance(force=True))
+        async with _live_health_lock:
+            await asyncio.to_thread(report_live_ai, res)
+    except Exception:
+        logging.exception("[FREELANCE] не удалось обработать заказ %s", oid)
+    finally:
+        _live_ai_tasks.pop(oid, None)
+
+
+async def _pump_freelance_ai(force: bool = False) -> None:
+    async with _live_ai_pump_lock:
+        slots = AI_WORKERS - len(_live_ai_tasks)
+        if slots <= 0:
+            return
+        only_manual = not force and not await _freelance_subscribed()
+        rows = await asyncio.to_thread(live_rows, "score", slots, only_manual, tuple(_live_ai_tasks))
+        for row in rows:
+            _live_ai_tasks[row["order_id"]] = asyncio.create_task(_score_freelance_row(row, force))
+
+
+async def _confirm_live_card(oid: int, token: str, message_id: int) -> None:
+    try:
+        saved = await asyncio.to_thread(freelance_finish_delivery, oid, token, message_id)
+    except Exception:
+        logging.exception("[FREELANCE] Telegram подтвердил карточку %s, запись повторится", oid)
+        return
+    if not saved:
+        logging.error("[FREELANCE] Telegram подтвердил карточку %s, аренда доставки уже сменилась", oid)
+    _live_delivery_acks.pop(oid, None)
+
+
+async def _deliver_freelance(force: bool = False) -> None:
+    global _live_flood_until
+    if _live_delivery_lock.locked():
+        return
+    async with _live_delivery_lock:
+        for oid, (token, message_id) in tuple(_live_delivery_acks.items()):
+            await _confirm_live_card(oid, token, message_id)
+        if asyncio.get_running_loop().time() < _live_flood_until:
+            return
+        only_manual = not force and not await _freelance_subscribed()
+        rows = await asyncio.to_thread(live_rows, "deliver", 8, only_manual, tuple(_live_delivery_acks))
+        for row in rows:
+            oid = row["order_id"]
+            row = await asyncio.to_thread(freelance_claim_delivery, oid)
+            if row is None:
+                continue
+            token = row["delivery_token"]
+            sc = scored_from_row(row)
+            if sc.fit is None or sc.fit < FREELANCE_MIN_FIT or (sc.ai or {}).get("triage"):
+                await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
+                continue
+            origin = sources.source_of(oid)
+            allowed = origin == "manual" or await asyncio.to_thread(sources.is_enabled, origin)
+            if not allowed:
+                await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
+                continue
             try:
-                await bot.send_message(chat_id=MY_CHAT_ID, text=alert, parse_mode="HTML")
+                async with asyncio.timeout(25):
+                    message_id = await _send_order(sc, lambda: live_fresh(row, allow_manual=True))
+            except TelegramRetryAfter as e:
+                delay = max(1, int(e.retry_after))
+                _live_flood_until = asyncio.get_running_loop().time() + delay
+                await asyncio.to_thread(freelance_finish_delivery, oid, token, None, delay)
+                return
             except Exception:
-                logging.exception("[BOT] Не удалось отправить health-оповещение")
+                logging.exception("[FREELANCE] Не удалось отправить заказ %s", oid)
+                await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
+                continue
+            if message_id is not None:
+                _live_delivery_acks[oid] = (token, message_id)
+                await _confirm_live_card(oid, token, message_id)
+            else:
+                await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
 
-        if res.error:
-            return {"error": res.error, "sent": 0, "extra": 0}
 
-        progress: dict = {}
+async def _maintain_freelance() -> None:
+    await asyncio.to_thread(freelance_expire_live)
+    for alert in monitor.pop_alerts():
         try:
-            d = await _deliver_freelance(res, progress)
+            async with asyncio.timeout(10):
+                await bot.send_message(chat_id=MY_CHAT_ID, text=alert, parse_mode="HTML")
         except Exception:
-            # неожиданный сбой: все неотправленные уходят в pending, а не теряются
-            logging.exception("[FREELANCE] _deliver_freelance упал")
-            handled = {sc.order.order_id for key in ("sent", "skipped", "retry")
-                       for sc in progress.get(key, [])}
-            d = {
-                "sent": progress.get("sent", []),
-                "skipped": progress.get("skipped", []),
-                "retry": progress.get("retry", []) + [
-                    sc for sc in res.to_send if sc.order.order_id not in handled],
-            }
-        try:
-            await asyncio.to_thread(
-                finish_cycle, res, d["sent"], d["skipped"], d["retry"]
-            )
-        except Exception:
-            logging.exception("[FREELANCE] finish_cycle упал")
-            return {"error": "не удалось сохранить итог цикла", "sent": len(d["sent"]), "extra": 0}
-        await _send_reassess_notes(res)
-        return {"error": "", "sent": len(d["sent"]), "extra": len(d["skipped"]),
-                "failed": len(d["retry"]), "scanned": res.raw_count}
+            logging.exception("[BOT] Не удалось отправить health-оповещение")
+    if await _freelance_subscribed() and not _live_ai_tasks:
+        res = await asyncio.to_thread(reassess_live)
+        for message in res.reassess_notes:
+            await bot.send_message(chat_id=MY_CHAT_ID, text=message, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+    await asyncio.to_thread(memwatch.trim)
+
+
+async def _refresh_freelance_ai_catalog() -> None:
+    await asyncio.to_thread(ai_scorer.refresh_live_catalog)
 
 
 def _ai_state_text(st: dict) -> str:
     """Строка статуса AI: активная Gemini-модель, запасные, провайдеры, грант Яндекса, последняя оценка."""
     if not st["enabled"]:
-        return "выключен (нет ключей), заказы идут без оценки"
+        return "выключен (нет ключей), карточки ждут полной оценки"
     def fmt_sec(sec: int) -> str:
         return f"{sec // 3600} ч {sec % 3600 // 60} мин" if sec >= 3600 else f"{sec} с"
 
@@ -658,16 +629,17 @@ def _ai_state_text(st: dict) -> str:
                     line += f"; на паузе: {paused}"
                 if p["disabled"]:
                     line += f"; недоступны: {html.escape(', '.join(p['disabled']))}"
-            budget = p.get("budget")
-            if budget:
-                until = datetime.fromisoformat(budget["until"]).strftime("%d.%m")
-                if budget["expired"]:
-                    line += f"; грант: срок вышел {until}, выключен"
-                elif budget.get("unknown"):
-                    line += "; грант: учёт трат не прочитан из БД, Яндекс выключен"
+            if name == "yandex":
+                paid = p.get("paid")
+                if paid and paid.get("known"):
+                    line += (f" · учтено за день {paid['day_rub']:.2f}/15 ₽, за месяц {paid['month_rub']:.2f}/500 ₽, "
+                             f"за пилот {paid['total_rub']:.2f}/100 ₽ (в резерве {paid['held_rub']:.2f} ₽)")
+                    if paid.get("reason"):
+                        line += f" · {html.escape(paid['reason'])}"
+                    elif not paid.get("active"):
+                        line += " · пилот вне срока"
                 else:
-                    line += (f"; грант: сегодня {budget['today']:.0f}/{budget['allowance']:.0f} ₽, "
-                             f"всего {budget['total']:.0f}/{budget['budget']:.0f} ₽, до {until}")
+                    line += " · платный пилот выключен" if not paid else " · учёт недоступен"
         lines.append(line)
     text = "\n  • ".join([""] + lines) if lines else "нет активных провайдеров"
     last = st["last_ok"]
@@ -688,7 +660,8 @@ def _freelance_status_text() -> str:
     """Собирает статус (синхронно, с чтением БД) — вызывать через to_thread."""
     st = freelance_stats()
     last_id = kv_get(LAST_ID_KEY, "—")
-    last_raw = kv_get("freelance_last_raw", "—")
+    last_raw = sum(int(kv_get(f"freelance_raw_{n}", "0") or 0)
+                   for n in sources.ALL_SOURCES if sources.is_enabled(n))
     last_ok = kv_get("freelance_last_ok")
     if last_ok:
         try:
@@ -700,8 +673,8 @@ def _freelance_status_text() -> str:
         "📊 <b>Фриланс: статус</b>\n",
         f"Подписка: {'включена' if _freelance_subscribed_sync() else 'на паузе'}",
         f"last_id: <code>{last_id}</code>",
-        f"Заказов в последнем скане: {last_raw}",
-        f"Прошли префильтр за сутки: {st['seen_24h']}",
+        f"Заказов просмотрено в последних обходах: {last_raw}",
+        f"Увидено в журнале за сутки: {st['seen_24h']}",
         f"Отправлено за сутки: {st['sent_24h']}",
         f"Последняя успешная проверка: {last_ok or 'ещё не было'}",
         f"🤖 AI: {ai_state}",
@@ -769,14 +742,10 @@ async def cb_fl_check(call: CallbackQuery):
         r = await check_freelance(manual=True)
         if r is None:
             text = "⏳ Проверка уже идёт."
-        elif r["error"]:
-            text = f"⚠️ Ошибка проверки: {html.escape(r['error'])}"
         else:
-            text = f"✅ Готово. Новых заказов: {r['sent']}"
-            if r["extra"]:
-                text += f" (+{r['extra']} в сводке)"
-            if r.get("failed"):
-                text += f", не отправлено: {r['failed']} (повтор в следующий раз)"
+            text = f"✅ Сбор завершён. В очередь оценки добавлено: {r['new']}. Подходящие заказы придут после оценки."
+            if r["errors"]:
+                text += "\n⚠️ " + html.escape(", ".join(r["errors"]))
     except Exception:
         logging.exception("[FREELANCE] fl_check")
         text = "⚠️ Проверка завершилась ошибкой, подробности в логе."
@@ -1426,11 +1395,18 @@ async def send_lead_offers():
             today = datetime.now(MSK).date().isoformat()
             if await asyncio.to_thread(kv_get, OFFER_DAY_KEY) == today:
                 return
-            claimed, rows = await asyncio.to_thread(freelance_claim_offers, OFFER_LIMIT)
-            if rows:
-                await bot.send_message(chat_id=MY_CHAT_ID, text=lv.offers_text(rows), parse_mode="HTML",
+            claimed, rows = await asyncio.to_thread(freelance_claim_offers, OFFER_LIMIT, fresh_only=True)
+            fresh = [r for r in rows if live_fresh(r)]
+            if fresh:
+                for r in fresh:
+                    if r["pub_unreliable"] or not r["published_at"]:
+                        r["title"] += " · возраст неизвестен"
+                await bot.send_message(chat_id=MY_CHAT_ID, text=lv.offers_text(fresh), parse_mode="HTML",
                                        disable_web_page_preview=True)
-                await asyncio.to_thread(freelance_confirm_offers, claimed, [r["order_id"] for r in rows], today)
+                await asyncio.to_thread(freelance_confirm_offers, claimed, [r["order_id"] for r in fresh], today)
+            if len(fresh) != len(rows):
+                await asyncio.to_thread(freelance_release_offers, claimed,
+                                        [r["order_id"] for r in rows if r not in fresh])
         except Exception:
             logging.exception("[FREELANCE] send_lead_offers")
             if claimed and rows:   # не ушло: заказы вернуть в подборку, день не отмечаем (повтор в следующий раз)
@@ -1513,29 +1489,31 @@ async def _send_freelance_daily_summary_locked():
         today = datetime.now(MSK).date().isoformat()
         if await asyncio.to_thread(kv_get, SUMMARY_DAY_KEY) == today:
             return  # за сегодня уже отправляли
-        d = await asyncio.to_thread(freelance_day_summary)
+        d = await asyncio.to_thread(freelance_day_summary, near_miss=0)
         passed = d["total"] - d["filtered"]
         text = (
             "📋 <b>Фриланс за сутки</b>\n"
             f"Увидено заказов: {d['total'] + d['excluded']} (вакансионные доски: {d['excluded']}, "
             f"отсеяно правилами: {d['filtered']}, дубли: {d['duplicate']})\n"
             f"Прошли фильтр и дедуп: {passed - d['duplicate']}\n"
-            f"Оценено: {d['assessed']} (подходят {d['good']}, отклонены AI {d['low_fit']})\n"
-            f"Показано вам: карточек {d['card']}, в сводке «ещё N» {d['digest']}, "
+            f"Из увиденных оценено: {d['assessed']} (подходят {d['good']}, отклонены AI {d['low_fit']})\n"
+            f"Из увиденных доставлено: карточек {d['card']}, в сводке «ещё N» {d['digest']}, "
             f"ждут доставки {d['delivery_pending']}\n"
             f"Ждут оценки AI: {d['queued']}, устарели: {d['stale']}"
         )
+        live = await asyncio.to_thread(freelance_live_daily_metrics)
+        text += (f"\nЗа 24 ч оценок {live['scored']}, автоматических карточек {live['cards']}. "
+                 f"До 5 мин: {live['under_five']}/{live['known']} с датой публикации. "
+                 f"Без подтверждённой даты: {live['cards'] - live['known']}.")
+        medians = live['medians']
+        stages = (("поиск", "discovery"), ("ожидание и оценка", "analysis"),
+                  ("доставка", "delivery"), ("всего от публикации", "total"))
+        lag = [f"{label} {medians[key]} с" for label, key in stages if medians[key] is not None]
+        if lag:
+            text += "\nМедиана для доставленных: " + ", ".join(lag)
         usage = _ai_usage_line(await asyncio.to_thread(ai_scorer.status))
         if usage:
-            text += "\n" + usage
-        if d["near_miss"]:
-            lines = []
-            for m in d["near_miss"]:
-                title = html.escape((m["title"] or "")[:70])
-                if m["url"]:
-                    title = f'<a href="{html.escape(m["url"])}">{title}</a>'
-                lines.append(f'• {m["fit"]}/10 {title}')
-            text += "\n\nБлижайшие из отсеянных:\n" + "\n".join(lines)
+            text += "\n" + usage.replace("AI за сутки:", "Запросы AI с последнего сброса:", 1)
         await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
                                disable_web_page_preview=True)
         await asyncio.to_thread(kv_set, SUMMARY_DAY_KEY, today)
@@ -1568,9 +1546,8 @@ async def cb_fl_status(call: CallbackQuery):
 
 SOURCES_HELP = (
     "🔌 <b>Источники заказов</b>\n"
-    "alot.pro собирает заказы с разных бирж (в том числе FL.ru и Kwork). Пока он работает, "
-    "прямые FL.ru и Kwork дублируют его заказы и тратят квоту AI - их можно выключить. "
-    "Если alot.pro молчит, оставьте включёнными FL.ru и Kwork.\n"
+    "alot.pro собирает заказы с разных бирж. Прямые источники могут находить их раньше. "
+    "Повторы отсекаются до оценки AI.\n"
     "Нажмите на источник, чтобы переключить."
 )
 
@@ -1998,11 +1975,16 @@ async def main():
         "interval",
         minutes=CHECK_INTERVAL_MINUTES,
     )
-    scheduler.add_job(
-        check_freelance,
-        "interval",
-        minutes=FREELANCE_INTERVAL_MINUTES,
-    )
+    for source in sources.ALL_SOURCES:
+        interval = (FREELANCE_INTERVAL_MINUTES * 60 if source in (sources.ALOT, sources.FLRU)
+                    else FREELANCE_HTML_SECONDS)
+        scheduler.add_job(_collect_freelance, "interval", seconds=interval, args=(source,),
+                          next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1)
+    for stage in (_pump_freelance_ai, _deliver_freelance):
+        scheduler.add_job(stage, "interval", seconds=FREELANCE_STAGE_SECONDS, coalesce=True, max_instances=1)
+    scheduler.add_job(_maintain_freelance, "interval", seconds=30, coalesce=True, max_instances=1)
+    scheduler.add_job(_refresh_freelance_ai_catalog, "interval", minutes=5,
+                      next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1)
     scheduler.add_job(
         cleanup_freelance_messages,
         "interval",
