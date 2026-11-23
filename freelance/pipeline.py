@@ -620,6 +620,7 @@ def _intake(orders, last_id: int,
             _journal_new(o, jr.FILTERED, full=False, reject_reason=why)
             stats["filtered"] += 1
             continue
+        # Проверка возраста относится только к первичному приёму.
         if not jr.pub_unreliable(o.site, origin) and o.published_at < threshold:
             _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
             stats["stale"] += 1
@@ -712,15 +713,23 @@ def _report_feed_freshness(scan, now: datetime | None = None, threshold: float =
                    recovered_text="снова свежая", reason=reason)
 
 
+_source_retry_at: dict[str, float] = {}
+SOURCE_RETRY_SECONDS = 300
+
+
 def _fetch_source(name: str, fetch, label: str) -> list[FreelanceOrder]:
     """Заказы одного прямого источника (FL.ru, Kwork). Выключенный источник не опрашивается и
     сломанным не считается. Сбой не роняет цикл: пишется в health, возвращается []."""
     if not sources.is_enabled(name):
         monitor.reset_streak(name)
+        _source_retry_at.pop(name, None)
+        return []
+    if time.monotonic() < _source_retry_at.get(name, 0):
         return []
     try:
         orders = fetch()
     except Exception as e:
+        _source_retry_at[name] = time.monotonic() + SOURCE_RETRY_SECONDS
         logging.exception(f"[FREELANCE] ошибка получения заказов: {label}")
         monitor.record(name, 0, e, label=label)
         return []
@@ -728,6 +737,7 @@ def _fetch_source(name: str, fetch, label: str) -> list[FreelanceOrder]:
     if failed_page is None:
         monitor.record(name, len(orders), label=label)
     else:
+        _source_retry_at[name] = time.monotonic() + SOURCE_RETRY_SECONDS
         error = RuntimeError(f"Частичный обход, недоступна страница {failed_page}")
         monitor.record(name, len(orders), error, label=label)
     return orders
@@ -948,7 +958,7 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
         if sc.ai is None:
             if id(sc) not in scored:
                 # Даже при отключённом провайдере отправляем только после оценки.
-                sc.queue_reason = jr.Q_NO_QUOTA
+                sc.queue_reason = jr.Q_NO_PROVIDER
                 res.unscored.append(sc)
                 continue
             r = scored[id(sc)]

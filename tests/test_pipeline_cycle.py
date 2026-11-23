@@ -132,7 +132,20 @@ class FastQueueTest(CycleTestBase):
             res = pipeline._prepare_cycle()
         self.assertEqual(res.to_send, [])
         pipeline.finish_cycle(res, [], [], [])
-        self.assertEqual(database.freelance_get(105)["queue_reason"], "no_quota")
+        self.assertEqual(database.freelance_get(105)["queue_reason"], "no_provider")
+
+    def test_source_failure_pauses_only_that_source(self):
+        fetch = mock.Mock(side_effect=[RuntimeError("feed unavailable"), []])
+        with mock.patch.object(pipeline, "_source_retry_at", {}), mock.patch.object(pipeline.sources, "is_enabled", return_value=True), mock.patch.object(pipeline.time, "monotonic", return_value=1000) as clock:
+            pipeline._fetch_source("flru", fetch, "FL")
+            pipeline._fetch_source("flru", fetch, "FL")
+            self.assertEqual(fetch.call_count, 1)
+            other = mock.Mock(return_value=[])
+            pipeline._fetch_source("kwork", other, "Kwork")
+            other.assert_called_once()
+            clock.return_value += pipeline.SOURCE_RETRY_SECONDS
+            pipeline._fetch_source("flru", fetch, "FL")
+            self.assertEqual(fetch.call_count, 2)
 
     def test_cleanup_preserves_pending_assessment_and_delivery(self):
         for oid, ai in [(105, None), (106, ai_result(8))]:

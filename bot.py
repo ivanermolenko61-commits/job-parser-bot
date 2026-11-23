@@ -572,6 +572,7 @@ async def _check_freelance_impl(manual: bool = False) -> dict | None:
     if only_manual and not await asyncio.to_thread(manual_orders.pending):
         logging.info("[FREELANCE] пауза, пропуск")
         return None
+    # Минутный таймер не запускает второй обход во время работы первого.
     if _freelance_lock.locked():
         logging.info("[FREELANCE] проверка уже идёт, пропуск")
         return None

@@ -22,6 +22,7 @@ FILTERED, DUPLICATE, QUEUED, ASSESSED, STALE, LEGACY = (
 TECH_STATES = (FILTERED, DUPLICATE, QUEUED, ASSESSED, STALE, LEGACY)
 
 # queue_reason (для tech=queued)
+Q_NO_PROVIDER = "no_provider"
 Q_WAIT, Q_NO_QUOTA, Q_ERROR, Q_RESERVED, Q_NO_TEXT = (
     "ai_wait", "no_quota", "ai_error", "reserved", "no_text")
 
