@@ -420,6 +420,11 @@ def _init_freelance(conn) -> None:
         )
     """)
     conn.execute("""
+        INSERT OR IGNORE INTO freelance_delivery_attempts(token,order_id,created_at)
+        SELECT delivery_token, order_id, COALESCE(datetime(delivery_retry_at,'-60 seconds'),datetime('now'))
+        FROM freelance_orders WHERE delivery_token IS NOT NULL
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS yandex_paid_ledger (
             token TEXT PRIMARY KEY, pilot_start TEXT NOT NULL, day TEXT NOT NULL,
             micros INTEGER NOT NULL CHECK(micros >= 0),
@@ -427,14 +432,21 @@ def _init_freelance(conn) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_yandex_paid_day ON yandex_paid_ledger(day)")
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS freelance_remember_retired
+    retired_trigger = """
+        CREATE TRIGGER freelance_remember_retired
         AFTER DELETE ON freelance_orders
         BEGIN
             INSERT OR IGNORE INTO freelance_retired(order_id, listing_key) VALUES
                 (OLD.order_id, CASE WHEN OLD.tech NOT IN ('filtered','duplicate') THEN OLD.listing_key END);
         END
-    """)
+    """.strip()
+    current_trigger = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='freelance_remember_retired'"
+    ).fetchone()
+    if current_trigger is None or current_trigger[0] != retired_trigger:
+        if current_trigger is not None:
+            conn.execute("DROP TRIGGER freelance_remember_retired")
+        conn.execute(retired_trigger)
     if "attempts" not in cols:
         conn.execute("ALTER TABLE freelance_orders ADD COLUMN attempts INTEGER DEFAULT 0")
     if "message_id" not in cols:

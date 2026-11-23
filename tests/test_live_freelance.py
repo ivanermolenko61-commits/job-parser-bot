@@ -95,6 +95,30 @@ class LiveFreelanceTest(CycleTestBase):
         self.assertEqual(database.freelance_get(10)["delivery"], jr.D_CARD)
         self.assertIsNone(database.freelance_claim_delivery(10))
 
+    def test_reinit_recovers_a_claim_created_before_the_attempt_journal(self):
+        self.intake(self.order(10))
+        self.assertTrue(self.assess(10))
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET delivery_token='legacy', "
+                         "delivery_retry_at=datetime('now','+1 minute') WHERE order_id=10")
+        database.init_db()
+        self.assertTrue(database.freelance_finish_delivery(10, "legacy", 100))
+        self.assertEqual(database.freelance_get(10)["message_id"], 100)
+
+    def test_reinit_replaces_old_tombstone_trigger_without_losing_ids(self):
+        self.intake(self.order(10))
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET tech='filtered', listing_key='fingerprint' WHERE order_id=10")
+            conn.execute("DROP TRIGGER freelance_remember_retired")
+            conn.execute("""CREATE TRIGGER freelance_remember_retired AFTER DELETE ON freelance_orders BEGIN
+                            INSERT OR IGNORE INTO freelance_retired(order_id,listing_key)
+                            VALUES (OLD.order_id,OLD.listing_key); END""")
+        database.init_db()
+        with database._connect() as conn:
+            conn.execute("DELETE FROM freelance_orders WHERE order_id=10")
+        self.assertEqual(database.freelance_previous_listing(10, None), 10)
+        self.assertIsNone(database.freelance_previous_listing(20, "fingerprint"))
+
     def test_unreliable_alias_cannot_revive_old_direct_listing(self):
         alias = self.order(11, None)
         alias.url = "https://freelance.ru/task/view/12?tracking=1"
