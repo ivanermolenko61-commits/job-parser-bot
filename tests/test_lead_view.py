@@ -74,6 +74,8 @@ class LeadButtonsTest(unittest.TestCase):
                   jr.LEAD_AGREED: ["fl_st:1:done", "fl_lost:1", "fl_rm:1"],
                   jr.LEAD_DONE: [], jr.LEAD_LOST: []}
         for stage, want in expect.items():
+            if stage is None or stage in jr.LEAD_ACTIVE:
+                want = ["fl_draft:1", *want]
             self.assertEqual(datas(lv.lead_card_buttons(row(lead=stage), [])), want, stage)
 
     def test_undo_button_only_with_undoable_event(self):
@@ -99,7 +101,7 @@ class LeadButtonsTest(unittest.TestCase):
 class OrderButtonsTest(unittest.TestCase):
     def test_new_card_has_save_apply_not_fit(self):
         rows = lv.order_card_buttons(7, "https://x/7")
-        self.assertEqual(datas(rows), ["fl_more:7", "fl_save:7", "fl_apply:7", "fl_np:7"])
+        self.assertEqual(datas(rows), ["fl_more:7", "fl_draft:7", "fl_save:7", "fl_apply:7", "fl_np:7"])
         self.assertEqual(rows[0][0].url, "https://x/7")
         self.assertIn("fl_less:7", datas(lv.order_card_buttons(7, None, detailed=True)))
 

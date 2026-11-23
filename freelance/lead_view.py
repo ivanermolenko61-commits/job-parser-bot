@@ -163,6 +163,8 @@ def lead_card_buttons(lead: dict, events: list[dict], *, undo_available: bool | 
     """Кнопки карточки лида: следующие этапы, отказ с причиной, напоминание, отмена последнего."""
     oid, stage = lead["order_id"], lead.get("lead")
     rows: list[list[Btn]] = []
+    if stage is None or stage in jr.LEAD_ACTIVE:
+        rows.append([Btn("Подготовить отклик", f"fl_draft:{oid}")])
     forward = [Btn(STAGE_BUTTON[s], f"fl_st:{oid}:{s}") for s in NEXT_STAGES.get(stage, ())]
     if forward:
         rows.append(forward)
@@ -207,6 +209,8 @@ def order_card_buttons(order_id: int, url: str | None, lead: str | None = None, 
     rows = [top]
     if not actions or lead == jr.LEAD_LOST:
         return rows
+    if lead is None or lead in jr.LEAD_ACTIVE:
+        rows.append([Btn("Подготовить отклик", f"fl_draft:{order_id}")])
     if lead is None:
         rows.append([Btn("💾 Сохранить", f"fl_save:{order_id}"), Btn("📨 Откликнулся", f"fl_apply:{order_id}"),
                      Btn("❌ Не подходит", f"fl_np:{order_id}")])

@@ -68,6 +68,7 @@ from database import (
 from freelance import ai_scorer, capacity, deal_wait, pricing, report, sources, yandex_budget
 from freelance import journal as jr
 from freelance import lead_view as lv
+from freelance.draft import draft_messages
 from freelance import leads
 from freelance.alot_client import site_name
 from freelance.pipeline import (
@@ -1196,6 +1197,22 @@ async def cmd_lead(message: Message, lead_match):
     except Exception:
         logging.exception("[FREELANCE] /lead")
         await message.answer("⚠️ Не удалось показать карточку, подробности в логе.")
+
+
+@dp.callback_query(F.data.startswith("fl_draft:"))
+async def cb_fl_draft(call: CallbackQuery):
+    if call.message is None or call.message.chat.id != MY_CHAT_ID:
+        await call.answer()
+        return
+    oid = _order_id_from(call.data)
+    row = await asyncio.to_thread(freelance_get, oid) if oid is not None else None
+    if row is None:
+        await call.answer("Заказ не найден")
+        return
+    await call.answer()
+    draft, private = draft_messages(row)
+    await call.message.answer(private, parse_mode=None)
+    await call.message.answer(draft, parse_mode=None)
 
 
 @dp.callback_query(F.data.startswith("fl_lead:"))
