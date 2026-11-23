@@ -126,6 +126,12 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(f.call_count, 3)
         self.assertEqual(sorted(o.order_id - KWORK_ID_OFFSET for o in got), [1, 9])
 
+    def test_filtered_first_page_keeps_partial_signal(self):
+        with mock.patch.object(kwork_client, "_fetch_page", side_effect=[([], 5), RuntimeError("offline")]):
+            got = kwork_client.fetch_kwork_orders(pages=2)
+        self.assertEqual(list(got), [])
+        self.assertEqual(got.failed_page, 2)
+
     def test_empty_later_page_stops(self):
         with mock.patch.object(kwork_client, "_fetch_page", side_effect=[self.orders(1), ([], 0)]) as f:
             kwork_client.fetch_kwork_orders(pages=4)

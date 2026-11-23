@@ -17,9 +17,13 @@ class DealReportTests(CycleTestBase):
         leads.set_stage(44, jr.LEAD_APPLIED)
         leads.undo(44)
         leads.set_stage(44, jr.LEAD_LOST, jr.LOST_LEGACY)
+        with database._connect() as conn:
+            conn.execute("UPDATE freelance_orders SET verdict='ok' WHERE order_id=41")
+            conn.execute("UPDATE freelance_orders SET tech='duplicate', dup_of=41, verdict='ok', lead='applied' WHERE order_id=45")
         rows = report.load_rows()
         totals, = report.funnel(rows + rows).values()
         self.assertEqual([totals[k] for k in ("leads", "applied", "discussing", "agreed", "done")], [3]*5)
         self.assertEqual(totals["lost_reasons"], {jr.LOST_LEGACY: 1})
+        self.assertEqual((totals["duplicate"], totals["unique_good"]), (1, 1))
         self.assertEqual(totals["priced"], 2)
         self.assertIn("2000 ₽/ч", report.format_funnel(rows))
