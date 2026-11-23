@@ -1493,7 +1493,7 @@ async def _send_freelance_daily_summary_locked():
         if await asyncio.to_thread(kv_get, SUMMARY_DAY_KEY) == today:
             return  # за сегодня уже отправляли
         d = await asyncio.to_thread(freelance_day_summary, near_miss=0)
-        passed = d["total"] - d["filtered"]
+        passed = d["total"] - d["filtered"] - d["details_pending"] - d["details_expired"]
         text = (
             "📋 <b>Фриланс за сутки</b>\n"
             f"Увидено заказов: {d['total'] + d['excluded']} (вакансионные доски: {d['excluded']}, "
@@ -1504,6 +1504,9 @@ async def _send_freelance_daily_summary_locked():
             f"ждут доставки {d['delivery_pending']}\n"
             f"Ждут оценки AI: {d['queued']}, устарели: {d['stale']}"
         )
+        if d['details_pending'] or d['details_expired']:
+            text += (f"\nЖдут полного описания: {d['details_pending']}, "
+                     f"истекли без полного описания: {d['details_expired']}")
         live = await asyncio.to_thread(freelance_live_daily_metrics)
         text += (f"\nЗа 24 ч оценок {live['scored']}, автоматических карточек {live['cards']}. "
                  f"До 5 мин: {live['under_five']}/{live['known']} с датой публикации. "

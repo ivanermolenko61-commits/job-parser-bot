@@ -2,7 +2,8 @@
 
 У заказа три НЕЗАВИСИМЫХ измерения - раньше они были смешаны в одном поле status:
   tech      - техническая обработка: filtered (отсечён правилом, причина в reject_reason),
-              duplicate (дубль, оригинал в dup_of), queued (ждёт оценки AI, причина в queue_reason),
+              duplicate (дубль, оригинал в dup_of), details_pending (ждёт полного описания),
+              queued (ждёт оценки AI, причина в queue_reason),
               assessed (оценён, итог в verdict), stale (устарел, причина в stale_reason),
               legacy (старая запись, причина неизвестна);
   delivery  - доставка: none, pending (оценён, ждёт отправки), card (отдельная карточка),
@@ -19,7 +20,8 @@ import re
 # tech
 FILTERED, DUPLICATE, QUEUED, ASSESSED, STALE, LEGACY = (
     "filtered", "duplicate", "queued", "assessed", "stale", "legacy")
-TECH_STATES = (FILTERED, DUPLICATE, QUEUED, ASSESSED, STALE, LEGACY)
+DETAILS_PENDING = "details_pending"
+TECH_STATES = (FILTERED, DUPLICATE, DETAILS_PENDING, QUEUED, ASSESSED, STALE, LEGACY)
 
 # queue_reason (для tech=queued)
 Q_NO_PROVIDER = "no_provider"
@@ -34,6 +36,7 @@ D_NONE, D_PENDING, D_CARD, D_DIGEST, D_UNKNOWN = "none", "pending", "card", "dig
 
 # причины устаревания (stale_reason)
 S_OLD_AT_DISCOVERY = "old_at_discovery"   # к моменту обнаружения старше предела очереди
+S_DETAILS_EXPIRED = "details_expired"     # полное описание не загрузилось до предела
 S_QUEUE_EXPIRED = "queue_expired"         # не дождался оценки до предела
 S_DELIVERY_EXPIRED = "delivery_expired"   # оценён, но не доставлен до предела
 

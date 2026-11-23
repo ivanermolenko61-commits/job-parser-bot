@@ -665,7 +665,7 @@ def freelance_dup_candidates(title_key: str, days: int, exclude_id: int | None =
 
 
 def freelance_known(order_ids: list[int]) -> dict[int, dict]:
-    """Уже виденные заказы: {order_id: {content_hash, tech, snippet, desc_changed}} (для обнаружения правки описания)."""
+    """Состояние и версия уже виденных заказов для повторного приёма."""
     found: dict[int, dict] = {}
     if not order_ids:
         return found
@@ -674,7 +674,8 @@ def freelance_known(order_ids: list[int]) -> dict[int, dict]:
             chunk = order_ids[i:i + 500]
             marks = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT order_id, content_hash, tech, snippet, COALESCE(desc_changed, 0) AS desc_changed "
+                f"SELECT order_id, content_hash, tech, snippet, seen_at, published_at, pub_unreliable, "
+                f"COALESCE(desc_changed, 0) AS desc_changed "
                 f"FROM freelance_orders WHERE order_id IN ({marks})", chunk).fetchall()
             found.update((r["order_id"], dict(r)) for r in rows)
     return found
@@ -1525,19 +1526,38 @@ def freelance_commit_scan(cursor_key: str, last_id: int, day: str, excluded: dic
         _count_excluded(conn, day, excluded)
 
 
+def freelance_details_due(limit: int) -> list[dict]:
+    """Свежие заказы без полного описания переживают перезапуск и уход из ленты."""
+    now = _now_sql()
+    with _connect(timeout=2) as conn:
+        rows = conn.execute(
+            f"""SELECT order_id, site, title, url, price_text, published_at, pub_unreliable, seen_at
+                FROM freelance_orders WHERE tech=? AND {_LIVE_FRESH}
+                ORDER BY COALESCE(attempts, 0), seen_at, order_id LIMIT ?""",
+            (jr.DETAILS_PENDING, now, now, limit),
+        )
+        return [dict(row) for row in rows]
+
+
+def freelance_detail_failed(order_id: int) -> None:
+    with _connect(timeout=2) as conn:
+        conn.execute("UPDATE freelance_orders SET attempts=COALESCE(attempts,0)+1 WHERE order_id=? AND tech=?",
+                     (order_id, jr.DETAILS_PENDING))
+
+
 def freelance_expire_live() -> int:
-    """Убирает просроченное из обеих очередей, сохраняя оценку и историю."""
+    """Убирает просроченное из рабочих очередей, сохраняя оценку и историю."""
     now = _now_sql()
     with _connect() as conn:
         cur = conn.execute(
             f"""UPDATE freelance_orders SET status='expired', tech='stale', delivery='none',
-                           stale_reason=CASE WHEN tech='assessed' THEN ? ELSE ? END,
+                           stale_reason=CASE tech WHEN 'assessed' THEN ? WHEN 'details_pending' THEN ? ELSE ? END,
                            stale_at=?, queue_reason=NULL, delivery_token=NULL, delivery_retry_at=NULL
-                WHERE (tech='queued' OR (tech='assessed' AND delivery='pending'))
+                WHERE (tech IN ('queued', 'details_pending') OR (tech='assessed' AND delivery='pending'))
                   AND COALESCE(origin, '') != 'manual'
                   AND (delivery_token IS NULL OR delivery_retry_at <= ?)
                   AND NOT COALESCE({_LIVE_FRESH}, 0)""",
-            (jr.S_DELIVERY_EXPIRED, jr.S_QUEUE_EXPIRED, now, now, now, now),
+            (jr.S_DELIVERY_EXPIRED, jr.S_DETAILS_EXPIRED, jr.S_QUEUE_EXPIRED, now, now, now, now),
         )
         return cur.rowcount
 
@@ -1739,10 +1759,13 @@ def freelance_day_summary(hours: int = 24, near_miss: int = 3) -> dict:
     since = f"-{int(hours)} hours"
     with _connect() as conn:
         c = {"total": 0, "filtered": 0, "duplicate": 0, "queued": 0, "assessed": 0, "stale": 0, "legacy": 0,
-             "low_fit": 0, "good": 0, "card": 0, "digest": 0, "delivery_pending": 0, "delivery_unknown": 0}
-        for tech, verdict, delivery, n in conn.execute(
-                "SELECT tech, verdict, delivery, COUNT(*) FROM freelance_orders "
-                "WHERE seen_at >= datetime('now', ?) GROUP BY tech, verdict, delivery", (since,)):
+             "low_fit": 0, "good": 0, "card": 0, "digest": 0, "delivery_pending": 0, "delivery_unknown": 0,
+             "details_pending": 0, "details_expired": 0}
+        for tech, verdict, delivery, stale_reason, n in conn.execute(
+                "SELECT tech, verdict, delivery, stale_reason, COUNT(*) FROM freelance_orders "
+                "WHERE seen_at >= datetime('now', ?) GROUP BY tech, verdict, delivery, stale_reason", (since,)):
+            if tech == jr.STALE and stale_reason == jr.S_DETAILS_EXPIRED:
+                c["details_expired"] += n
             c["total"] += n
             c[tech if tech in c else "legacy"] += n
             if tech == jr.ASSESSED:

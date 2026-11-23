@@ -1,11 +1,26 @@
+import threading
 import unittest
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import requests
+
 import database
-from freelance import manual, pipeline, public_boards as boards, sources
+from freelance import journal as jr, manual, pipeline, public_boards as boards, sources
 from freelance.filters import reject_reason
-from tests.test_pipeline_cycle import CycleTestBase
+from tests.test_pipeline_cycle import CycleTestBase, ai_result
+
+
+def _card(number, title, body, stamp=''):
+    return f'''<article class="task-card">
+        <a class="task-card__title-link" href="/task/view/{number}">{title}</a>
+        <div class="task-card__desc">{body}</div>
+        <div class="task-card__foot-item" title="{stamp}"><i class="fa fa-clock-o"></i></div></article>'''
+
+
+def _detail(body):
+    return f'<div class="tv-hero"><h1>Задание</h1><p>{body}</p><div class="tv-hero__meta"></div></div>'
 
 
 class BoardsTest(unittest.TestCase):
@@ -51,15 +66,15 @@ class BoardsTest(unittest.TestCase):
         order, = boards.parse_weblancer_page(page, datetime(2026, 11, 23, tzinfo=timezone.utc))
         self.assertIsNone(order.published_at)
 
-    def test_excess_freelance_previews_still_reach_intake(self):
-        page = "".join(f'''<article class="task-card">
-            <a class="task-card__title-link" href="/task/view/{i}">Чат-бот Telegram {i}</a>
-            <div class="task-card__desc">Интеграция с API и Google Таблицами...</div></article>'''
-                       for i in range(1, 7))
-        with mock.patch.object(boards, "_get", side_effect=[page] + [""] * boards.MAX_DETAIL) as fetch:
-            with mock.patch.object(boards, "freelance_known", return_value=set()):
-                self.assertEqual(len(boards.fetch_freelance_ru()), 6)
-        self.assertEqual(fetch.call_count, 1 + boards.MAX_DETAIL)
+    def test_graphics_automation_after_character_600_survives_prefilter(self):
+        title = "Инфографика для карточек"
+        manual_graphics = "Цвета согласовать с заказчиком. " * 30
+        automation = manual_graphics + "Нужен скрипт для автоматизации по API."
+        order, hand_drawn = boards.parse_freelance_page(
+            _card(1, title, automation) + _card(2, title, manual_graphics))
+        self.assertGreater(order.body.index("скрипт"), 600)
+        self.assertIsNone(reject_reason(order))
+        self.assertEqual(reject_reason(hand_drawn), "marketplace_graphics")
 
     def test_challenge_is_not_empty_success(self):
         for parse in (boards.parse_weblancer_page, boards.parse_freelance_page):
@@ -68,6 +83,121 @@ class BoardsTest(unittest.TestCase):
 
 
 class BoardsIntakeTest(CycleTestBase):
+    def test_six_previews_retry_after_restart_and_do_not_block_ready_delivery(self):
+        ids = [sources.FREELANCE_RU_ID_OFFSET + i for i in range(1, 7)]
+        page = _card(1, "Инфографика для карточек", "Цвета согласовать…")
+        stamp = (datetime.now(boards.MSK) - timedelta(minutes=2)).strftime("%d.%m.%Y %H:%M")
+        page += "".join(_card(i, f"Телеграм-бот {i}", "Интеграция с API...", stamp) for i in range(2, 7))
+        full = "Цвета согласовать с заказчиком. " * 30 + "Нужен скрипт для автоматизации по API."
+        entered, release, ready_to_score = threading.Event(), threading.Event(), threading.Event()
+        attempt = 1
+        intake = pipeline._intake
+
+        def notify_intake(*args, **kwargs):
+            result = intake(*args, **kwargs)
+            if result[2]:
+                ready_to_score.set()
+            return result
+
+        def fetch(url):
+            if url == boards.FREELANCE_URL:
+                return page
+            number = int(url.rsplit("/", 1)[-1])
+            if number == 1:
+                if attempt == 1:
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("время ожидания теста")
+                    raise requests.Timeout()
+                if attempt == 2:
+                    return '<title>Без описания</title>'
+                return _detail(full)
+            return _detail(f"Телеграм-бот с настройкой API. Полное описание {number}")
+
+        with mock.patch.object(sources, "is_enabled", return_value=True), \
+                mock.patch.object(pipeline, "_intake", side_effect=notify_intake), \
+                mock.patch.object(boards, "_get", side_effect=fetch) as http:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                scan = pool.submit(pipeline.collect_live, sources.FREELANCE_RU)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertIsNone(database.freelance_get(ids[0])["fit"])
+                    self.assertTrue(ready_to_score.wait(4))
+                    rows = pipeline.live_rows("score", 6)
+                    self.assertNotIn(ids[0], {row["order_id"] for row in rows})
+                    with mock.patch.object(pipeline.ai_scorer, "score_order", return_value=ai_result(8)):
+                        self.assertEqual(pipeline.score_live(rows[0]).ai_ok, 1)
+                    ready = database.freelance_claim_delivery(rows[0]["order_id"])
+                    self.assertTrue(database.freelance_finish_delivery(ready["order_id"], ready["delivery_token"], 101))
+                    self.assertFalse(scan.done())
+                finally:
+                    release.set()
+                self.assertEqual(scan.result(timeout=5).intake["new"], 3)
+            self.assertEqual(http.call_count, 1 + boards.MAX_DETAIL)
+            self.assertEqual(database.freelance_get(ids[0])["attempts"], 1)
+            self.assertEqual(database.freelance_day_summary()["details_pending"], 3)
+
+            with database._connect() as conn:
+                conn.execute("UPDATE freelance_orders SET seen_at=datetime('now','-5 minutes')")
+            seen = {oid: database.freelance_get(oid)["seen_at"] for oid in ids}
+            attempt = 2
+            http.reset_mock()
+            self.assertEqual(pipeline.collect_live(sources.FREELANCE_RU).intake["new"], 2)
+            self.assertEqual(http.call_count, 4)
+            self.assertEqual(database.freelance_get(ids[0])["tech"], jr.DETAILS_PENDING)
+            self.assertEqual(database.freelance_get(ids[0])["attempts"], 2)
+
+            database.init_db()
+            attempt = 3
+            # Проверяем восстановление из SQLite, даже если заказ ушёл из выдачи.
+            page = "Заданий не найдено"
+            http.reset_mock()
+            self.assertEqual(pipeline.collect_live(sources.FREELANCE_RU).intake["new"], 1)
+            self.assertEqual(http.call_count, 2)
+            for oid, original_seen in seen.items():
+                row = database.freelance_get(oid)
+                self.assertIn(row["tech"], (jr.QUEUED, jr.ASSESSED))
+                self.assertEqual(row["seen_at"], original_seen)
+                self.assertNotIn("...", row["snippet"])
+            self.assertIn("автоматизации по API", database.freelance_get(ids[0])["snippet"])
+
+    def test_detail_retry_uses_publication_or_original_seen_at_for_expiry(self):
+        stamp = (datetime.now(boards.MSK) - timedelta(minutes=61)).strftime("%d.%m.%Y %H:%M")
+        page = _card(1, "Телеграм-бот", "Нужно сделать интеграцию...", stamp)
+        page += _card(2, "Телеграм-бот для учёта", "Нужен бот…")
+        with mock.patch.object(sources, "is_enabled", return_value=True), \
+                mock.patch.object(boards, "_get", side_effect=[page, "<title>Без описания</title>", page]) as http:
+            pipeline.collect_live(sources.FREELANCE_RU)
+            old, unknown = (sources.FREELANCE_RU_ID_OFFSET + i for i in (1, 2))
+            self.assertEqual(database.freelance_get(old)["stale_reason"], jr.S_OLD_AT_DISCOVERY)
+            with database._connect() as conn:
+                conn.execute("UPDATE freelance_orders SET seen_at=datetime('now','-61 minutes') WHERE order_id=?",
+                             (unknown,))
+            pipeline.collect_live(sources.FREELANCE_RU)
+            self.assertEqual(http.call_count, 3)
+        self.assertEqual(database.freelance_expire_live(), 1)
+        self.assertEqual(database.freelance_get(unknown)["stale_reason"], jr.S_DETAILS_EXPIRED)
+        self.assertEqual(database.freelance_day_summary()["details_expired"], 1)
+
+    def test_full_description_arriving_after_freshness_deadline_is_not_scored(self):
+        oid = sources.FREELANCE_RU_ID_OFFSET + 1
+        page = _card(1, "Телеграм-бот для учёта", "Интеграция с API...")
+
+        def fetch(url):
+            if url == boards.FREELANCE_URL:
+                return page
+            with database._connect() as conn:
+                conn.execute("UPDATE freelance_orders SET seen_at=datetime('now','-61 minutes') WHERE order_id=?",
+                             (oid,))
+            return _detail("Разработать бота с интеграцией по API")
+
+        with mock.patch.object(sources, "is_enabled", return_value=True), \
+                mock.patch.object(boards, "_get", side_effect=fetch):
+            result = pipeline.collect_live(sources.FREELANCE_RU)
+            self.assertEqual(pipeline.live_rows("score", 10), [])
+        self.assertEqual(result.intake["stale"], 1)
+        self.assertEqual(database.freelance_get(oid)["stale_reason"], jr.S_DETAILS_EXPIRED)
+
     def test_direct_collectors_persist_both_boards(self):
         freelance = '''<article class="task-card">
             <a class="task-card__title-link" href="/task/view/47">Телеграм-бот для доставки</a>

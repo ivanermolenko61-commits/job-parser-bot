@@ -60,6 +60,7 @@ class FreelanceOrder:
     published_at: datetime | None  # UTC, если известна
     url: str
     is_suspicious: bool = False
+    needs_full_description: bool = False
 
 
 @dataclass

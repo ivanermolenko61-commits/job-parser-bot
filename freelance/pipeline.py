@@ -23,7 +23,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -42,10 +42,13 @@ from database import (
     freelance_dup_candidates,
     freelance_get,
     freelance_known,
+    freelance_details_due,
+    freelance_detail_failed,
     freelance_live_rows,
     freelance_live_score_result,
     freelance_mark_desc_changed,
     freelance_mark_filtered,
+    freelance_mark_stale,
     freelance_assessment_get,
     freelance_claim_assessment_notice,
     freelance_pending,
@@ -78,7 +81,7 @@ from freelance.alot_client import (
 )
 from freelance.fl_client import fetch_fl_orders
 from freelance.kwork_client import fetch_kwork_orders
-from freelance.public_boards import fetch_freelance_ru, fetch_weblancer
+from freelance.public_boards import MAX_DETAIL, fetch_freelance_description, fetch_freelance_ru, fetch_weblancer
 from freelance.filters import EXCLUDED_SITES, norm_dedup_key, priority, reject_reason
 from health import monitor
 
@@ -584,7 +587,8 @@ def _queue_reassess(order_id: int, new_hash: str, old_snippet: str, new_snippet:
 
 
 def _intake(orders, last_id: int,
-             sent_now: set[int], *, live: bool = False) -> tuple[dict[int, FreelanceOrder], dict, list[FreelanceOrder]]:
+             sent_now: set[int], *, live: bool = False,
+             stats: dict | None = None) -> tuple[dict[int, FreelanceOrder], dict, list[FreelanceOrder]]:
     """Приём всех увиденных заказов: каждый получает объяснимое состояние в журнале. Порядок - от старых
     к новым, чтобы оригиналом считался первый опубликованный. Возвращает ({order_id: заказ} для
     дальнейшей работы в памяти, счётчики, новые заказы к оценке). Вакансионные доски строк не получают (их тысячи в сутки),
@@ -593,11 +597,13 @@ def _intake(orders, last_id: int,
     for o in orders:
         uniq.setdefault(o.order_id, o)
     known = freelance_known(list(uniq))
-    stats: dict = {"new": 0, "filtered": 0, "duplicate": 0, "stale": 0, "updated": 0, "excluded": {}}
+    if stats is None:
+        stats = {"new": 0, "filtered": 0, "duplicate": 0, "stale": 0, "updated": 0, "excluded": {}}
     new_orders: list[FreelanceOrder] = []
     reasons: dict[str, int] = {}
     now = datetime.now(timezone.utc)
-    threshold = now - timedelta(hours=FREELANCE_QUEUE_MAX_HOURS)
+    cutoff = now - (timedelta(minutes=FREELANCE_LIVE_MINUTES) if live
+                    else timedelta(hours=FREELANCE_QUEUE_MAX_HOURS))
     for o in sorted(uniq.values(), key=lambda x: (x.published_at or now, x.order_id)):
         if o.order_id in sent_now:
             continue
@@ -608,11 +614,23 @@ def _intake(orders, last_id: int,
         listing_key = manual.listing_key(o.url) if live else None
         origin = sources.source_of(o.order_id)
         trusted = live and o.published_at and not jr.pub_unreliable(o.site, origin)
-        if o.order_id in known:
+        existing = known.get(o.order_id)
+        if existing:
             if trusted:
                 freelance_confirm_publication(o.order_id, o.published_at.isoformat(), listing_key)
-            _handle_updated(o, known[o.order_id], stats)
-            continue
+            if o.needs_full_description:
+                continue
+            if existing["tech"] != jr.DETAILS_PENDING:
+                _handle_updated(o, existing, stats)
+                continue
+            # Первый известный момент публикации сохраняется, даже если он исчез из ленты.
+            if not existing["pub_unreliable"]:
+                o.published_at = _parse_dt(existing["published_at"]) or o.published_at
+            published = o.published_at.isoformat() if o.published_at else None
+            if not live_fresh({"published_at": published, "seen_at": existing["seen_at"]}, now=now):
+                freelance_mark_stale(o.order_id, jr.S_DETAILS_EXPIRED)
+                stats["stale"] += 1
+                continue
         if live:
             previous = freelance_previous_listing(o.order_id, listing_key)
             if previous == o.order_id:
@@ -623,6 +641,13 @@ def _intake(orders, last_id: int,
                 _journal_new(o, jr.DUPLICATE, full=False, dup_of=previous)
                 stats["duplicate"] += 1
                 continue
+        if o.needs_full_description:
+            if o.published_at and o.published_at < cutoff:
+                _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
+                stats["stale"] += 1
+            else:
+                _journal_new(o, jr.DETAILS_PENDING, full=False)
+            continue
         canonical = manual.original(o.url)
         if canonical is not None and canonical != o.order_id:
             manual.complete_from_feed(canonical, o)
@@ -643,7 +668,6 @@ def _intake(orders, last_id: int,
             stats["filtered"] += 1
             continue
         # Проверка возраста относится только к первичному приёму.
-        cutoff = now - timedelta(minutes=FREELANCE_LIVE_MINUTES) if live else threshold
         if o.published_at and not jr.pub_unreliable(o.site, origin) and o.published_at < cutoff:
             _journal_new(o, jr.STALE, full=False, stale_reason=jr.S_OLD_AT_DISCOVERY)
             stats["stale"] += 1
@@ -896,6 +920,8 @@ def collect_live(source: str) -> CycleResult:
                 res.error = f"неполный обход или сбой {sources.TITLES[source]}"
         with manual.intake_lock:
             _, res.intake, _ = _intake(orders, last_id, set(), live=True)
+        if source == sources.FREELANCE_RU:
+            _collect_freelance_details(res.intake)
         if scan is not None:
             _record_alot_scan(scan, last_id)
             freelance_commit_scan(LAST_ID_KEY, max(last_id, scan.max_id), datetime.now(MSK).date().isoformat(),
@@ -915,6 +941,24 @@ def collect_live(source: str) -> CycleResult:
     finally:
         lock.release()
     return res
+
+
+def _collect_freelance_details(stats: dict) -> None:
+    waiting = freelance_details_due(MAX_DETAIL)
+    if not waiting:
+        return
+    with ThreadPoolExecutor(max_workers=len(waiting)) as pool:
+        futures = {pool.submit(fetch_freelance_description, row["url"]): row for row in waiting}
+        for future in as_completed(futures):
+            row = futures[future]
+            body = future.result()
+            if not body:
+                freelance_detail_failed(row["order_id"])
+                continue
+            order = scored_from_row(row).order
+            order.body = body
+            with manual.intake_lock:
+                _intake([order], 0, set(), live=True, stats=stats)
 
 
 def _live_fetch_direct(source: str) -> list[FreelanceOrder]:

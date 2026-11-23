@@ -1,4 +1,5 @@
 """Открытые списки объявлений Freelance.ru и Weblancer, без авторизации."""
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlsplit
@@ -7,10 +8,8 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
-from database import freelance_known
 from freelance import sources
 from freelance.alot_client import FreelanceOrder
-from freelance.filters import reject_reason
 
 
 FREELANCE_URL = "https://freelance.ru/task"
@@ -89,10 +88,11 @@ def parse_freelance_page(page: str) -> list[FreelanceOrder]:
         ident, url = link
         timestamp = next((tag["title"] for tag in card.select(".task-card__foot-item[title]")
                           if tag.select_one(".fa-clock-o")), "")
+        body = _text(card.select_one(".task-card__desc"))
         orders.append(FreelanceOrder(
             sources.FREELANCE_RU_ID_OFFSET + ident, sources.FREELANCE_RU, _text(anchor),
-            _text(card.select_one(".task-card__desc")), _text(card.select_one(".task-card__budget .bold")), 0,
-            [], _timestamp(timestamp), url,
+            body, _text(card.select_one(".task-card__budget .bold")), 0,
+            [], _timestamp(timestamp), url, needs_full_description=not body or body.endswith(("...", "…")),
         ))
     if not orders and not re.search(r"нет открытых заданий|заданий не найдено", _text(soup), re.I):
         raise ValueError("не найдена разметка списка Freelance.ru")
@@ -113,26 +113,19 @@ def _freelance_description(page: str) -> str:
 
 
 def fetch_freelance_ru() -> list[FreelanceOrder]:
-    orders = parse_freelance_page(_get(FREELANCE_URL))
-    now = datetime.now(timezone.utc)
-    known = freelance_known([order.order_id for order in orders])
-    ready, remaining = [], MAX_DETAIL
-    for order in orders:
-        needs_detail = (order.body.endswith(("...", "…")) and reject_reason(order) is None
-                        and (order.published_at is None or now - order.published_at <= timedelta(hours=1)))
-        if needs_detail:
-            if order.order_id in known:
-                continue
-            if remaining:
-                remaining -= 1
-                try:
-                    body = _freelance_description(_get(order.url))
-                except (requests.RequestException, RuntimeError, ValueError):
-                    body = ""
-                if body:
-                    order.body = body
-        ready.append(order)
-    return ready
+    return parse_freelance_page(_get(FREELANCE_URL))
+
+
+def fetch_freelance_description(url: str) -> str:
+    """Пустой результат оставляет заказ ждать следующей попытки."""
+    link = _link(FREELANCE_URL, url, FREELANCE_PATH)
+    if not link:
+        return ""
+    try:
+        return _freelance_description(_get(link[1]))
+    except (requests.RequestException, RuntimeError, ValueError) as error:
+        logging.warning("[FREELANCE] детали Freelance.ru %s недоступны: %s", link[0], type(error).__name__)
+        return ""
 
 
 def _weblancer_card(anchor):

@@ -175,7 +175,8 @@ def reject_reason(order) -> str | None:
     if is_service_offer(title):
         return "service_offer"
     head = f"{title}\n{(order.body or '')[:600]}"
-    if _MARKETPLACE_VISUAL_RE.search(title) and not _VISUAL_AUTOMATION_RE.search(head):
+    visual = _MARKETPLACE_VISUAL_RE.search(title)
+    if visual and not _VISUAL_AUTOMATION_RE.search(f"{title}\n{order.body or ''}"):
         return "marketplace_graphics"
     # «Вёрстка по готовому дизайну» - заказ на разработку: дизайн тут дан, а не заказывается
     stop_text = _DESIGN_GIVEN_RE.sub(" ", title)
@@ -189,7 +190,7 @@ def reject_reason(order) -> str | None:
         return "site_only"
     if DEV_CATEGORIES.intersection(order.categories):
         return None
-    if _INCLUDE_RE.search(head) or _result_signal(title, order.body):
+    if visual or _INCLUDE_RE.search(head) or _result_signal(title, order.body):
         return None
     return "no_include"
 
