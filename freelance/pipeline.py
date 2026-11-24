@@ -81,6 +81,7 @@ from freelance.alot_client import (
 )
 from freelance.fl_client import fetch_fl_orders
 from freelance.kwork_client import fetch_kwork_orders
+from freelance.project_feeds import fetch_contractis, fetch_kadrof
 from freelance.public_boards import MAX_DETAIL, fetch_freelance_description, fetch_freelance_ru, fetch_weblancer
 from freelance.filters import EXCLUDED_SITES, norm_dedup_key, priority, reject_reason
 from freelance.language import UKRAINIAN_REASON, is_ukrainian
@@ -973,7 +974,8 @@ def _collect_freelance_details(stats: dict) -> None:
 
 def _live_fetch_direct(source: str) -> list[FreelanceOrder]:
     fetch = {sources.FLRU: fetch_fl_orders, sources.KWORK: fetch_kwork_orders,
-             sources.FREELANCE_RU: fetch_freelance_ru, sources.WEBLANCER: fetch_weblancer}[source]
+             sources.FREELANCE_RU: fetch_freelance_ru, sources.WEBLANCER: fetch_weblancer,
+             sources.CONTRACTIS: fetch_contractis, sources.KADROF: fetch_kadrof}[source]
     return _fetch_source(source, fetch, f"Источник фриланс-заказов {sources.TITLES[source]}")
 
 

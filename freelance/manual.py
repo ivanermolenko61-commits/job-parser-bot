@@ -11,6 +11,7 @@ from freelance.alot_client import FreelanceOrder
 intake_lock = threading.RLock()
 LINK = re.compile(r"https?://[^\s<>]+", re.I)
 PATTERNS = {
+    "kadrof.ru": ("kadrofru", r"/work/(\d{1,9})/?$"),
     "fl.ru": ("flru", r"/projects/(\d+)(?:/|$)"),
     "kwork.ru": ("kworkru", r"/projects/(\d+)(?:/|$)"),
     "youdo.com": ("youdoru", r"/(?:t|tasks?/)(\d+)(?:/|$)"),
@@ -44,6 +45,8 @@ def listing(url):
         return None
     key = match[1].lower()
     direct = None
+    if site == "kadrofru":
+        direct = sources.KADROF_ID_OFFSET + int(key)
     if site in ("flru", "kworkru") and len(key) <= 9:
         direct = (sources.FL_ID_OFFSET if site == "flru" else sources.KWORK_ID_OFFSET) + int(key)
     elif site in (sources.FREELANCE_RU, sources.WEBLANCER) and len(key) <= 9:

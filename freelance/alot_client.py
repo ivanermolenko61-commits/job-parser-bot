@@ -33,6 +33,7 @@ HEADERS = {
 
 # Красивые имена бирж
 SITE_NAMES = {
+    "contractis": "CONTRACTIS", "kadrof": "Kadrof",
     "youdoru": "YouDo", "kworkru": "Kwork", "flru": "FL.ru",
     "freelanceru": "Freelance.ru", "weblancer": "Weblancer", "workzillaru": "Workzilla",
     "taskpayru": "TaskPay", "advegocom": "Advego", "etxtru": "eTXT",

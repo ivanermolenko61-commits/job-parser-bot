@@ -306,7 +306,8 @@ class BotSourcesUiTest(CycleTestBase):
         rows = self.bot._sources_kb().inline_keyboard
         got = {r[0].callback_data: r[0].text for r in rows}
         self.assertEqual(set(got), {"fl_src_t:alot", "fl_src_t:flru", "fl_src_t:kwork",
-                                    "fl_src_t:freelanceru", "fl_src_noop"})
+                                    "fl_src_t:freelanceru", "fl_src_t:contractis",
+                                    "fl_src_t:kadrof", "fl_src_noop"})
         self.assertIn("🟢 alot.pro", got["fl_src_t:alot"])
         self.assertIn("⚪ Kwork", got["fl_src_t:kwork"])
 

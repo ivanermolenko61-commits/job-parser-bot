@@ -7,7 +7,7 @@ from parsers.filters import _compile
 # Вакансионные биржи — не фриланс
 EXCLUDED_SITES = {
     "hhru", "habrcareer", "geekjobru", "trudvsemru", "superjobru",
-    "getmatchru", "remotejobru", "kadrofru", "joblabru", "workspaceru",
+    "getmatchru", "remotejobru", "joblabru", "workspaceru",
     "hirehiru",
     # Англоязычные доски удалённых вакансий (полная занятость, не заказы). По базе сервера
     # 30.10-01.11.2026: 241 из 554 прошедших префильтр, средний fit 0.1, отправлено 3 -
@@ -178,6 +178,9 @@ def reject_reason(order) -> str | None:
     if is_service_offer(title):
         return "service_offer"
     head = f"{title}\n{(order.body or '')[:600]}"
+    if order.site == "kadrofru" and (_EMPLOYMENT_RE.search(head) or not (
+            _DEV_INTENT_RE.search(title) or _result_signal(title, order.body))):
+        return "excluded_site"
     visual = _MARKETPLACE_VISUAL_RE.search(title)
     if visual and not _VISUAL_AUTOMATION_RE.search(f"{title}\n{order.body or ''}"):
         return "marketplace_graphics"
