@@ -23,6 +23,7 @@ from config import (
     SENT_HISTORY_DAYS,
 )
 from freelance import journal as jr
+from freelance.language import UKRAINIAN_REASON, is_ukrainian
 from parsers.filters import dedup_key
 
 
@@ -50,6 +51,7 @@ def _connect(timeout: float = 30):
     # timeout: джобы вакансий и фриланса пишут параллельно — ждём, а не падаем
     conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
+    conn.create_function("is_ukrainian", 2, is_ukrainian, deterministic=True)
     try:
         yield conn
         conn.commit()
@@ -860,8 +862,10 @@ def freelance_mark_filtered(order_id: int, reason: str) -> bool:
     """Отсеян правилом (например, после смены фильтра ожидающий заказ больше не проходит)."""
     return _update_states(
         order_id, lambda r: r.get("tech") in (jr.QUEUED, jr.ASSESSED)
-        and r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST),
-        tech=jr.FILTERED, reject_reason=reason, queue_reason=None)
+        and r.get("delivery") not in (jr.D_CARD, jr.D_DIGEST)
+        and (reason != UKRAINIAN_REASON or (
+            r.get("origin") != "manual" and is_ukrainian(r.get("title"), r.get("snippet")))),
+        tech=jr.FILTERED, reject_reason=reason, queue_reason=None, delivery=jr.D_NONE)
 
 
 def freelance_mark_card_deleted(order_id: int, duplicate_message_id: int | None = None) -> bool:
@@ -876,20 +880,25 @@ def freelance_mark_card_deleted(order_id: int, duplicate_message_id: int | None 
     return _update_states(order_id, card_deleted_at=_now_sql())
 
 
-def freelance_mark_desc_changed(order_id: int, content_hash: str, snippet: str | None = None) -> bool:
+def freelance_mark_desc_changed(order_id: int, content_hash: str, snippet: str | None = None,
+                               *, title: str | None = None) -> bool:
     """Заказчик поправил описание уже оценённого заказа: оценка не повторяется, пометка остаётся
     (в карточке и отчёте); отпечаток обновлён, чтобы не срабатывать каждый цикл."""
     fields: dict = {"desc_changed": 1, "content_hash": content_hash}
     if snippet is not None:
         fields["snippet"] = snippet
+    if title is not None:
+        fields["title"] = title
     return _update_states(order_id, **fields)
 
 
-def freelance_requeue(order_id: int, content_hash: str, snippet: str, queue_reason: str = jr.Q_WAIT) -> bool:
+def freelance_requeue(order_id: int, content_hash: str, snippet: str, queue_reason: str = jr.Q_WAIT,
+                      *, title: str | None = None) -> bool:
     """Отсеянный заказ получил новое описание: снова в очередь на оценку."""
+    fields = {"title": title} if title is not None else {}
     return _update_states(order_id, lambda r: r.get("tech") == jr.FILTERED,
                           tech=jr.QUEUED, queue_reason=queue_reason, reject_reason=None,
-                          content_hash=content_hash, snippet=snippet, desc_changed=1)
+                          content_hash=content_hash, snippet=snippet, desc_changed=1, **fields)
 
 
 def freelance_set_queue_reason(order_id: int, reason: str, attempts: int | None = None) -> bool:
@@ -1159,7 +1168,7 @@ def freelance_leads_closed(days: int = 7) -> list[dict]:
 
 
 _UNPROCESSED = ("verdict = 'ok' AND delivery IN ('card', 'digest') AND COALESCE(lead, '') = '' "
-                "AND delivered_at >= datetime('now', ?)")
+                "AND delivered_at >= datetime('now', ?) AND NOT is_ukrainian(title, snippet)")
 
 
 def freelance_unprocessed(days: int = 3, limit: int = 30) -> list[dict]:
@@ -1634,6 +1643,13 @@ def freelance_claim_delivery(order_id: int) -> dict | None:
         row = cur.fetchone()
         cur.close()
         if row is not None:
+            # Старый заказ мог пройти оценку до появления языкового фильтра.
+            if row["origin"] != "manual" and is_ukrainian(row["title"], row["snippet"]):
+                status = jr.legacy_status(jr.FILTERED, jr.D_NONE, row["lead"])
+                conn.execute("UPDATE freelance_orders SET tech=?, delivery=?, reject_reason=?, status=?, "
+                             "delivery_token=NULL, delivery_retry_at=NULL, queue_reason=NULL WHERE order_id=?",
+                             (jr.FILTERED, jr.D_NONE, UKRAINIAN_REASON, status, order_id))
+                return None
             conn.execute("INSERT INTO freelance_delivery_attempts(token,order_id,created_at) VALUES (?,?,?)",
                          (token, order_id, now))
         return dict(row) if row is not None else None

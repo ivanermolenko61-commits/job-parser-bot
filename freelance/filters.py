@@ -1,6 +1,7 @@
 """Дешёвый префильтр фриланс-заказов (до обращения к YandexGPT)."""
 import re
 
+from freelance.language import UKRAINIAN_REASON, is_ukrainian
 from parsers.filters import _compile
 
 # Вакансионные биржи — не фриланс
@@ -172,6 +173,8 @@ def reject_reason(order) -> str | None:
     if order.is_suspicious:
         return "reports"
     title = order.title or ""
+    if is_ukrainian(title, order.body):
+        return UKRAINIAN_REASON
     if is_service_offer(title):
         return "service_offer"
     head = f"{title}\n{(order.body or '')[:600]}"

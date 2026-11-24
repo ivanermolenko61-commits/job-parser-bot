@@ -1547,7 +1547,8 @@ async def cb_fl_status(call: CallbackQuery):
     except Exception:
         logging.exception("[FREELANCE] fl_status")
         text = "⚠️ Не удалось собрать статус."
-    await call.message.answer(text, parse_mode="HTML")
+    for chunk in _split_messages(text):
+        await call.message.answer(chunk, parse_mode="HTML")
 
 
 SOURCES_HELP = (

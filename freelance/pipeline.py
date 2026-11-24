@@ -83,6 +83,7 @@ from freelance.fl_client import fetch_fl_orders
 from freelance.kwork_client import fetch_kwork_orders
 from freelance.public_boards import MAX_DETAIL, fetch_freelance_description, fetch_freelance_ru, fetch_weblancer
 from freelance.filters import EXCLUDED_SITES, norm_dedup_key, priority, reject_reason
+from freelance.language import UKRAINIAN_REASON, is_ukrainian
 from health import monitor
 
 DEDUP_DAYS = 3
@@ -546,10 +547,11 @@ def _handle_updated(o: FreelanceOrder, known: dict, stats: dict) -> None:
         return
     snippet = _full_snippet(o)
     stats["updated"] = stats.get("updated", 0) + 1
+    title = ai_scorer.mask_contacts(o.title or "")
     if known.get("tech") == jr.FILTERED and reject_reason(o) is None:
-        freelance_requeue(o.order_id, new_hash, snippet)
+        freelance_requeue(o.order_id, new_hash, snippet, title=title)
     else:
-        freelance_mark_desc_changed(o.order_id, new_hash, snippet)
+        freelance_mark_desc_changed(o.order_id, new_hash, snippet, title=title)
         if known.get("tech") == jr.ASSESSED:
             _queue_reassess(o.order_id, new_hash, known.get("snippet") or "", snippet)
 
@@ -993,6 +995,9 @@ def score_live(row: dict) -> CycleResult:
     origin = sources.source_of(row["order_id"])
     if origin != "manual" and not sources.is_enabled(origin):
         return res
+    if origin != "manual" and is_ukrainian(row.get("title"), row.get("snippet")):
+        freelance_mark_filtered(row["order_id"], UKRAINIAN_REASON)
+        return res
     res.quota_out = ai_scorer.quota_exhausted()
     if not ai_scorer.is_enabled() or res.quota_out:
         freelance_live_score_result(row, fit=None, retry_reason=jr.Q_NO_QUOTA if res.quota_out else jr.Q_NO_PROVIDER)
@@ -1259,6 +1264,10 @@ def _reassess_one(res: CycleResult, row: dict, *, live: bool = False) -> None:
         freelance_reassess_finish(oid, version, "skipped")   # заказ ушёл или текст изменился ещё раз (там своя запись)
         return
     if live and not live_fresh(cur, allow_manual=True):
+        freelance_reassess_finish(oid, version, "skipped")
+        return
+    if cur.get("origin") != "manual" and is_ukrainian(cur.get("title"), cur.get("snippet")):
+        freelance_mark_filtered(oid, UKRAINIAN_REASON)
         freelance_reassess_finish(oid, version, "skipped")
         return
     stored = freelance_assessment_get(oid, version)
