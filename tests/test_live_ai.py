@@ -21,7 +21,10 @@ class PaidBudgetTest(CycleTestBase):
     def reserve(self):
         return paid_budget.reserve(paid_budget.MODEL, self.BODY, self.NOW)
 
-    def test_parallel_reservations_fit_day_limit_and_survive_unknown_usage(self):
+    def test_parallel_reservations_fit_month_limit_and_survive_unknown_usage(self):
+        budget = mock.patch.object(paid_budget, "MONTHLY", 15 * paid_budget.RUB)
+        budget.start()
+        self.addCleanup(budget.stop)
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: self.reserve(), range(8)))
         tokens = [token for token in results if token]
@@ -31,14 +34,12 @@ class PaidBudgetTest(CycleTestBase):
         self.assertAlmostEqual(paid_budget.summary(self.NOW)["held_rub"], 11.3304)
         paid_budget.finish(tokens[0], {"prompt_tokens": 1000, "completion_tokens": 100})
         self.assertIsNotNone(self.reserve())
-        self.assertLessEqual(paid_budget.summary(self.NOW)["day_rub"], 15)
+        self.assertLessEqual(paid_budget.summary(self.NOW)["month_rub"], 15)
 
     def test_disabled_outside_window_wrong_model_and_oversized_body(self):
         with mock.patch.dict(os.environ, {"YANDEX_PAID_PILOT": "0"}):
             self.assertIsNone(self.reserve())
-        for day in (22, 30):
-            expired = self.NOW.replace(day=day)
-            self.assertIsNone(paid_budget.reserve(paid_budget.MODEL, self.BODY, expired))
+        self.assertIsNone(paid_budget.reserve(paid_budget.MODEL, self.BODY, self.NOW.replace(day=22)))
         self.assertIsNone(paid_budget.reserve("other", self.BODY, self.NOW))
         self.assertIsNone(paid_budget.reserve(paid_budget.MODEL, dict(self.BODY, max_tokens=3000), self.NOW))
         self.assertIsNone(paid_budget.reserve(paid_budget.MODEL, dict(self.BODY, messages=["я" * 10_000]), self.NOW))
@@ -52,12 +53,12 @@ class PaidBudgetTest(CycleTestBase):
         self.assertIsNone(self.reserve())
         self.assertFalse(paid_budget.summary(self.NOW)["active"])
 
-    def test_total_and_month_are_admitted_before_sending(self):
-        with mock.patch.object(paid_budget, "TOTAL", 7 * paid_budget.RUB):
+    def test_monthly_limit_resets_at_moscow_midnight(self):
+        with mock.patch.object(paid_budget, "MONTHLY", 7 * paid_budget.RUB):
             self.assertIsNotNone(self.reserve())
             self.assertIsNone(self.reserve())
-        with mock.patch.object(paid_budget, "MONTHLY", 7 * paid_budget.RUB):
-            self.assertIsNone(self.reserve())
+            next_month = self.NOW.replace(day=30, hour=21)
+            self.assertIsNotNone(paid_budget.reserve(paid_budget.MODEL, self.BODY, next_month))
 
 
 class LiveScorerTest(CycleTestBase):

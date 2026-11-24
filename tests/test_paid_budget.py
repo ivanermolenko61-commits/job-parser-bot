@@ -31,7 +31,7 @@ class PaidPilotFileTest(unittest.TestCase):
         self.marker.write_bytes(b"2026-11-24\r\n")
         self.assertTrue(paid_budget.active(self.NOW))
         self.assertFalse(paid_budget.active(self.NOW.replace(day=23)))
-        self.assertFalse(paid_budget.active(self.NOW.replace(month=12, day=1)))
+        self.assertTrue(paid_budget.active(self.NOW.replace(month=12, day=1)))
         with mock.patch.object(database, "DB_PATH", str(self.db.parent.parent / "other.sqlite")):
             self.assertFalse(paid_budget.active(self.NOW))
         with mock.patch.dict(os.environ, {"YANDEX_ENABLED": "0"}):
@@ -67,5 +67,5 @@ class PaidPilotFileTest(unittest.TestCase):
         self.marker.write_bytes(b"2026-11-23\n")
         self.assertIsNotNone(reserve())
         self.assertIsNotNone(reserve())
-        self.assertIsNone(reserve())
-        self.assertAlmostEqual(paid_budget.summary(self.NOW)["held_rub"], 11.3304)
+        self.assertIsNotNone(reserve())
+        self.assertAlmostEqual(paid_budget.summary(self.NOW)["held_rub"], 15.1072)

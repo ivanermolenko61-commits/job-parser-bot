@@ -4,7 +4,7 @@ import logging
 import os
 import stat
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from freelance.yandex_budget import today_msk
@@ -12,10 +12,7 @@ from freelance.yandex_budget import today_msk
 
 MODEL = "aliceai-llm-flash"
 RUB = 1_000_000
-DAILY = 15 * RUB
 MONTHLY = 500 * RUB
-TOTAL = 100 * RUB
-PILOT_DAYS = 7
 # С запасом над длиной системного и пользовательского сообщений в UTF-8.
 INPUT_BOUND = 32_768
 INPUT_BYTE_LIMIT = 16_384
@@ -52,7 +49,7 @@ def start_date() -> date | None:
 
 def active(now: datetime | None = None) -> bool:
     start = start_date()
-    return start is not None and 0 <= (today_msk(now) - start).days < PILOT_DAYS
+    return start is not None and today_msk(now) >= start
 
 
 def worst_micros(model: str, body: dict) -> int | None:
@@ -86,7 +83,7 @@ def reserve(model: str, body: dict, now: datetime | None = None) -> str | None:
 
     start, day = start_date(), today_msk(now)
     worst = worst_micros(model, body)
-    if start is None or not 0 <= (day - start).days < PILOT_DAYS or worst is None:
+    if start is None or day < start or worst is None:
         return None
     token = uuid.uuid4().hex
     try:
@@ -95,7 +92,7 @@ def reserve(model: str, body: dict, now: datetime | None = None) -> str | None:
             usage = _read(conn, day)
             if usage["overrun"] or usage["start"] not in (None, start.isoformat()):
                 return None
-            if min(DAILY - usage["day"], MONTHLY - usage["month"], TOTAL - usage["total"]) < worst:
+            if MONTHLY - usage["month"] < worst:
                 return None
             conn.execute("INSERT INTO yandex_paid_ledger VALUES (?,?,?,?, 'reserved')",
                          (token, start.isoformat(), day.isoformat(), worst))
@@ -154,8 +151,6 @@ def summary(now: datetime | None = None) -> dict:
         state.update(active=False, reason="фактический расход превысил резерв")
     elif start is not None and usage["start"] not in (None, start.isoformat()):
         state.update(active=False, reason="дата пилота уже зафиксирована")
-    elif min(MONTHLY - usage["month"], TOTAL - usage["total"]) < worst:
-        state.update(active=False, reason="лимит пилота или месяца исчерпан")
-    elif DAILY - usage["day"] < worst:
-        state["reason"] = "дневной лимит исчерпан"
+    elif MONTHLY - usage["month"] < worst:
+        state.update(active=False, reason="месячный лимит исчерпан")
     return state

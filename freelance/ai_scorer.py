@@ -542,8 +542,7 @@ def _failure_state(now: datetime | None = None) -> tuple[list[str], list[datetim
     if "yandex" not in active:
         yandex_note = ""
     elif paid_budget.active(now):
-        pilot = paid_budget.summary(now)
-        yandex_note = YANDEX_DAY_SPENT if pilot["active"] and pilot["reason"] else pilot["reason"]
+        yandex_note = paid_budget.summary(now)["reason"]
     else:
         yandex_note = _yandex_budget_note()
     with _lock:

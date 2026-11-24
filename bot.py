@@ -639,12 +639,12 @@ def _ai_state_text(st: dict) -> str:
             if name == "yandex":
                 paid = p.get("paid")
                 if paid and paid.get("known"):
-                    line += (f" · учтено за день {paid['day_rub']:.2f}/15 ₽, за месяц {paid['month_rub']:.2f}/500 ₽, "
-                             f"за пилот {paid['total_rub']:.2f}/100 ₽ (в резерве {paid['held_rub']:.2f} ₽)")
+                    line += (f" · учтено за день {paid['day_rub']:.2f} ₽, за месяц {paid['month_rub']:.2f}/500 ₽ "
+                             f"(в резерве {paid['held_rub']:.2f} ₽)")
                     if paid.get("reason"):
                         line += f" · {html.escape(paid['reason'])}"
                     elif not paid.get("active"):
-                        line += " · пилот вне срока"
+                        line += " · платный режим неактивен"
                 else:
                     line += " · платный пилот выключен" if not paid else " · учёт недоступен"
         lines.append(line)

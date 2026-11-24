@@ -84,7 +84,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="сколько заказов (0 - все 60)")
     ap.add_argument("--max-rub", type=float, default=8.0)
     args = ap.parse_args()
-    if not paid_budget.active() or not 0 < args.max_rub <= paid_budget.TOTAL / paid_budget.RUB:
+    if not paid_budget.active() or not 0 < args.max_rub <= 100:
         raise SystemExit("нужны действующий пилот и положительный лимит прогона до 100 ₽")
 
     orders = load_orders()
