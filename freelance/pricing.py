@@ -24,6 +24,7 @@ from config import (
     FREELANCE_PRICE_SPREAD, FREELANCE_RATE_PER_HOUR,
 )
 from freelance import fx
+from freelance.budget import parse_budget
 
 CLARITY_RISK = {"ясно": Decimal("1.0"), "частично": Decimal("1.15"), "размыто": Decimal("1.3")}
 DEFAULT_RISK = Decimal("1.15")          # ясность не указана
@@ -46,6 +47,79 @@ MIN_POINTS = 5                          # минимум точек для ры�
 RATE_MIN_FACTOR = Decimal("0.3")        # ставка по сделкам: границы от общей ставки
 RATE_MAX_FACTOR = Decimal("5")
 PRICE_VERSION = 4                       # растёт при смене формулы: старые pending-оценки пересчитываются
+
+# Только описание заказчика задаёт объём. Заголовок «автоматизация» часто
+# относится к уже работающей книге, а категория и бюджет этого не различают.
+_SHEET = re.compile(r"\b(?:exc?el|эксел\w*|google\s+sheets?|таблиц\w*|xlsx?)\b", re.I)
+_FORMULA = re.compile(r"\bформул\w*", re.I)
+_REPAIR = re.compile(r"\b(?:(?:под|ис|по)прав\w*|правк\w*|(?:от|с)?корректир\w*|скоррект\w*|заменить|"
+                     r"неверно\s+счит\w*|не\s+(?:счита\w*|работа\w*)|ошибк\w*\s+в\s+формул\w*)\b", re.I)
+_WIDER_SCOPE = re.compile(
+    r"\b(?:с\s+нуля|vba|макрос\w*|apps?\s+script|power\s+query|api|sql|интеграц\w*|сводн\w*\s+(?:отч[её]т|таблиц)\w*|"
+    r"переработ\w*|перепис\w*|перестро\w*|реорганиз\w*|рефактор\w*|"
+    r"(?:созда\w*|разработа\w*)\s+(?:калькулятор|книг|таблиц|отч[её]т|модел|шаблон)\w*|"
+    r"(?:нов\w*\s+(?:расч[её]т|модул|отч[её]т|шаблон|таблиц|систем|раздел|лист)\w*)|"
+    r"(?:вс[еёю]|всех|нескольк\w*|десятк\w*|много|[2-9]|\d{2,})\s+(?:формул|книг|файл|лист|таблиц)\w*)\b", re.I)
+
+FORMULA_QUESTION = "Пришлите файл или фрагмент таблицы и один пример исходных данных с ожидаемым результатом."
+
+
+def apply_formula_quote(ai: dict, title: str | None, body: str | None, price_text: str | None,
+                        *, changed: bool = False, complete: bool = True) -> bool:
+    """Заменяет недоказанную полную смету предложением только на одну правку.
+
+    В UI вызывается на распакованной копии старой оценки. Если текст изменился,
+    не переносим часы и ставку между версиями до повторной оценки.
+    """
+    if not ai or ai.get("triage"):
+        return False
+    scope = ai.get("price_scope")
+    if not changed:
+        if scope == "full":
+            return False
+        if scope == "single_formula" and type(ai.get("price_scope_bid")) is int and ai["price_scope_bid"] > 0:
+            return True
+    text = f"{title or ''} {body or ''}"
+    matches = (complete and _SHEET.search(text) and not _WIDER_SCOPE.search(text)
+               and any(_REPAIR.search(text, max(0, formula.start() - 65), formula.end() + 65)
+                       for formula in _FORMULA.finditer(text)))
+    if not matches and scope != "single_formula":
+        return False
+    for key in list(ai):
+        if key in ("hours", "components") or key.startswith(("price_", "market_", "budget", "hours_", "hourly_")):
+            del ai[key]
+    if changed or not matches:
+        return True
+
+    # Ориентир за 45 мин; даже при верхней оценке в 1 ч соблюдаем личный минимум.
+    bid = max(_round_money(_dec(FREELANCE_RATE_PER_HOUR) * Decimal("0.75")),
+              _ceil_money(_dec(FREELANCE_MIN_RATE_PER_HOUR)))
+    ai.update(price_scope="single_formula", price_scope_bid=bid, price_v=PRICE_VERSION)
+    budget = parse_budget(price_text)
+    if budget["type"] in ("max", "range", "fixed"):
+        ceiling = compare_budget({"price_mid": bid}, budget).get("budget_rub")
+        if ceiling is not None and ceiling < bid:
+            ai["price_scope_over_budget"] = True
+    return True
+
+
+def apply_stored_formula_quote(ai: dict, row: dict) -> None:
+    from freelance import ai_scorer
+
+    snippet = row.get("snippet") or ""
+    apply_formula_quote(ai, row.get("title"), snippet, row.get("price_text"), changed=bool(row.get("desc_changed")),
+                        complete=bool(snippet) and len(snippet) < ai_scorer.BODY_LIMIT)
+
+
+def formula_quote_note(ai: dict) -> str:
+    if ai.get("price_scope") != "single_formula" or type(ai.get("price_scope_bid")) is not int:
+        return ""
+    amount = f"{ai['price_scope_bid']:,}".replace(",", " ")
+    note = (f"Если нужна одна локальная правка формулы с проверкой — около {amount} ₽, 30–60 мин. "
+            "Цена и время по всему файлу — после просмотра.")
+    if ai.get("price_scope_over_budget"):
+        note += " Этот ориентир выше указанного бюджета."
+    return note
 
 CATEGORY_NAMES = {          # для строки «рынок ботов: ...»
     "tg_bot": "ботов", "parser": "парсеров", "landing": "лендингов",

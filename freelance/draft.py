@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 
+from freelance import pricing
 from freelance.profile import relevant_experience
 
 
@@ -51,7 +52,13 @@ def draft_messages(row):
     category = ai.get("category")
     category = category if isinstance(category, str) else None
     title = " ".join(str(row.get("title") or "").split())[:180]
-    approach, question = APPROACH.get(category, DEFAULT)
+    pricing.apply_stored_formula_quote(ai, row)
+    scoped_quote = pricing.formula_quote_note(ai)
+    if scoped_quote:
+        approach = "Посмотрю действующие формулы и сверю исправленный расчёт с вашим примером."
+        question = pricing.FORMULA_QUESTION
+    else:
+        approach, question = APPROACH.get(category, DEFAULT)
     public = [f"Здравствуйте! Готов обсудить задачу «{title}»." if title else "Здравствуйте! Готов обсудить вашу задачу.", approach]
     matches = relevant_experience(category, title + " " + (row.get("snippet") or ""), limit=20)
     experience = next((item["title"] for item in matches if item["client_ok"]), None)
@@ -63,10 +70,13 @@ def draft_messages(row):
     note = ["Только для Ивана", "Актуальность на площадке нужно проверить перед отправкой."]
     if row.get("stale_reason") or row.get("desc_changed"):
         note.append("Объявление устарело или изменилось. Сверь исходный текст.")
-    note.extend((f"Риск: {str(ai.get('risks') or 'не оценён')[:300]}",
-                 f"Трудозатраты: {_estimate(ai, 'hours', 'ч')}",
-                 f"Цена полного объёма: {_estimate(ai, 'price', '₽')}",
-                 f"Допущения: {assumptions or 'уточнить объём и критерий приёмки'}"))
+    note.append(f"Риск: {str(ai.get('risks') or 'не оценён')[:300]}")
+    if scoped_quote:
+        note.append(scoped_quote)
+    else:
+        note.extend((f"Трудозатраты: {_estimate(ai, 'hours', 'ч')}",
+                     f"Цена полного объёма: {_estimate(ai, 'price', '₽')}"))
+    note.append(f"Допущения: {assumptions or 'уточнить объём и критерий приёмки'}")
     questions = ai.get("questions")
     if isinstance(questions, list) and questions and isinstance(questions[0], str):
         note.append("Уточнение из оценки: " + questions[0][:200])

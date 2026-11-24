@@ -235,6 +235,7 @@ class ScoredOrder:
     queue_reason: str | None = None   # почему не оценён (journal.Q_*)
     first_seen: datetime | None = None   # когда бот впервые увидел заказ (очередь и старение)
     stale_note: str = ""     # пометка карточки: оценка относится к прежнему тексту / обновлена после правки
+    from_snippet: bool = False   # сохранённый текст может быть обрезан на BODY_LIMIT
 
     @property
     def fit(self) -> int | None:
@@ -303,6 +304,8 @@ def scored_from_row(row: dict) -> ScoredOrder:
                 ai = loaded
         except ValueError:
             ai = None
+    if ai:
+        pricing.apply_stored_formula_quote(ai, row)
     order = FreelanceOrder(
         order_id=int(row["order_id"]), site=row.get("site") or "", title=row.get("title") or "",
         body="", price_text=row.get("price_text") or "", price_value=0.0, categories=[],
@@ -310,7 +313,7 @@ def scored_from_row(row: dict) -> ScoredOrder:
         url=row.get("url") or "",
     )
     return ScoredOrder(order, ai, row.get("dedup_key") or "", first_seen=_parse_seen(row.get("seen_at")),
-                       stale_note=_stale_note(row, ai))
+                       stale_note=_stale_note(row, ai), from_snippet=True)
 
 
 STALE_PENDING = "описание изменено, оценка относится к прежнему тексту (ждёт повторной оценки)"
@@ -432,6 +435,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
     # ждёт, пока не истечёт срок. Заказы выключенного источника не берём: они тратили бы квоту AI
     # вопреки переключателю
     feed_by_id = {o.order_id: o for o in (feed_orders or [])}
+    stored_feed_ids = set()
     stored = _feed_store_read() if any(sources.is_feed_id(i) and i not in feed_by_id for i in live) else {}
     for oid in live:
         if not sources.is_feed_id(oid) or oid in feed_by_id or str(oid) not in stored:
@@ -439,6 +443,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
         o = _order_from_dict(oid, stored[str(oid)]) if isinstance(stored[str(oid)], dict) else None
         if o is not None:
             feed_by_id[oid] = o
+            stored_feed_ids.add(oid)
     fetched += [o for oid, o in feed_by_id.items() if oid in live]
     fetched += [manual.from_row(row) for row in live.values() if row.get("origin") == "manual"]
     # После исчезновения объявления восстанавливаем сохранённый для оценки текст.
@@ -472,6 +477,7 @@ def _load_pending(threshold: datetime, sent_now: set[int],
             order, ai, row.get("dedup_key") or norm_dedup_key(order),
             attempts=int(row.get("attempts") or 0), queue_reason=row.get("queue_reason"),
             first_seen=_parse_seen(row.get("seen_at")),
+            from_snippet=(order.order_id in restored or order.order_id in stored_feed_ids or row.get("origin") == "manual"),
         )
     # без описания (выпал из ленты FL.ru/Kwork, перезапуск): ждёт, причина видна в журнале
     for oid, row in live.items():
@@ -1298,7 +1304,13 @@ def _reassess_one(res: CycleResult, row: dict, *, live: bool = False) -> None:
     else:
         new_ai = None
     reused = isinstance(new_ai, dict) and "fit" in new_ai
-    if not reused:
+    if reused:
+        # Эта оценка относится именно к восстановленной версии текста.
+        snippet = cur.get("snippet") or ""
+        if not pricing.apply_formula_quote(new_ai, cur.get("title"), snippet, cur.get("price_text"),
+                                           complete=bool(snippet) and len(snippet) < ai_scorer.BODY_LIMIT):
+            new_ai["price_scope"] = "full"
+    else:
         order = FreelanceOrder(
             order_id=oid, site=cur.get("site") or "", title=cur.get("title") or "", body=cur.get("snippet") or "",
             price_text=cur.get("price_text") or "", price_value=0.0, categories=[],
@@ -1316,7 +1328,7 @@ def _reassess_one(res: CycleResult, row: dict, *, live: bool = False) -> None:
         if result is None:
             freelance_reassess_attempt(oid, version)     # и пустой ответ, и исключение - неудачная попытка версии
             return
-        sc = ScoredOrder(order, dict(result), cur.get("dedup_key") or "")
+        sc = ScoredOrder(order, dict(result), cur.get("dedup_key") or "", from_snippet=True)
         _ensure_price(sc)
         sc.ai["reassessed"] = True
         new_ai = sc.ai
@@ -1374,7 +1386,7 @@ def _save_scored_now(sc: ScoredOrder, result: dict) -> None:
     Рестарт посреди цикла иначе заставил бы оценивать те же заказы заново. Работаем с копией:
     sc.ai основной поток выставит сам (по нему считаются счётчики цикла)."""
     try:
-        tmp = ScoredOrder(sc.order, dict(result), sc.dedup, sc.attempts)
+        tmp = ScoredOrder(sc.order, dict(result), sc.dedup, sc.attempts, from_snippet=sc.from_snippet)
         _ensure_price(tmp)
         _save_retry(tmp, "pending")
         if not result.get("triage") and sc.order.body:
@@ -1787,14 +1799,25 @@ def _ensure_price(sc: ScoredOrder) -> None:
     Старые оценки без category (формат с price_rub) не трогаем; цену, посчитанную
     прежней формулой (price_v меньше текущей), пересчитываем."""
     ai = sc.ai
-    if not ai or "category" not in ai or ai.get("price_v") == pricing.PRICE_VERSION:
+    if not ai:
         return
     try:
-        price = pricing.price_order(ai, parse_budget(sc.order.price_text))
-        # старые price_*/market_*/budget_* не должны пережить пересчёт (например, устаревший рынок)
-        for key in [k for k in ai if k.startswith(("price_", "market_", "budget", "hours_", "hourly_"))]:
-            del ai[key]
-        ai.update(price)
+        # Полные объекты из ленты могут быть длиннее BODY_LIMIT.
+        body = sc.order.body or ""
+        complete = bool(body) and not sc.order.needs_full_description and (
+            not sc.from_snippet or len(body) < ai_scorer.BODY_LIMIT)
+        if not pricing.apply_formula_quote(ai, sc.order.title, body, sc.order.price_text, complete=complete):
+            if "category" not in ai or ai.get("triage"):
+                return
+            if ai.get("price_v") == pricing.PRICE_VERSION:
+                ai["price_scope"] = "full"
+                return
+            price = pricing.price_order(ai, parse_budget(sc.order.price_text))
+            # старые price_*/market_*/budget_* не должны пережить пересчёт
+            for key in [k for k in ai if k.startswith(("price_", "market_", "budget", "hours_", "hourly_"))]:
+                del ai[key]
+            ai.update(price)
+            ai["price_scope"] = "full"
         topic = f"{sc.order.title or ''} {sc.order.body or ''}"
         ai["experience"] = [{"id": e["id"], "title": e["title"], "client_ok": e["client_ok"]}
                             for e in profile.relevant_experience(ai.get("category"), topic)]
@@ -1927,7 +1950,8 @@ def save_order(sc: ScoredOrder, status: str, message_id: int | None = None,
         status, sc.attempts, message_id,
         category=ai.get("category"),
         budget=_db_budget(o),
-        hours=ai.get("hours") or None,
+        # Для прежнего pending None сохранил бы часы отменённой полной сметы.
+        hours=0 if ai.get("price_scope") == "single_formula" else ai.get("hours") or None,
         origin=origin, title_key=jr.title_key(o.site, o.title),
         content_hash=jr.content_hash(o.title, o.body) if o.body else None,
         snippet=_full_snippet(o) if o.body else None,
@@ -2260,6 +2284,9 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
             if price_rub:
                 parts.append(f"предложить {e(price_rub[:100])}")
         lines.append(" · ".join([money] + parts))
+        scoped_quote = pricing.formula_quote_note(ai)
+        if scoped_quote:
+            lines.append("💵 " + e(scoped_quote))
         if price_mid > 0:
             if ai.get("price_vague") and _num(ai.get("price_low")) > 0 and _num(ai.get("price_high")) > 0:
                 # размытое ТЗ: ориентир с вилкой и условиями, а не точная цена
@@ -2300,7 +2327,7 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
                 comps = _components_line(ai)
                 if comps:
                     lines.append(f"🧩 {e(comps)}")
-            questions = ai.get("questions")
+            questions = [pricing.FORMULA_QUESTION] if scoped_quote else ai.get("questions")
             if isinstance(questions, list):
                 asked = [str(q).strip()[:200] for q in questions if str(q).strip()]
                 if asked:
