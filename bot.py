@@ -71,6 +71,8 @@ from database import (
 )
 from freelance import ai_scorer, capacity, deal_wait, pricing, report, schedule, sources, yandex_budget
 from freelance import journal as jr
+from freelance import kwork_client
+from database import freelance_mark_stale
 from freelance import lead_view as lv
 from freelance.draft import draft_messages
 from freelance import manual as manual_orders
@@ -542,6 +544,9 @@ async def _deliver_freelance(force: bool = False) -> None:
             oid = row["order_id"]
             origin = sources.source_of(oid)
             if origin != "manual" and not schedule.automatic_open():
+                continue
+            if origin != "manual" and await asyncio.to_thread(kwork_client.redirects_to_exchange, row.get("url")):
+                await asyncio.to_thread(freelance_mark_stale, oid, jr.S_PROJECT_UNAVAILABLE)
                 continue
             row = await asyncio.to_thread(freelance_claim_delivery, oid)
             if row is None:

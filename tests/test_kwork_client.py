@@ -83,6 +83,19 @@ class ParsePageTest(unittest.TestCase):
 
 
 class FetchTest(unittest.TestCase):
+    @mock.patch.object(kwork_client.requests, "get")
+    def test_only_redirect_to_exchange_marks_order_unavailable(self, get):
+        response = get.return_value.__enter__.return_value
+        url = kwork_client.kwork_url(3275335)
+        for redirect, target, expected in (
+            (True, "/projects", True), (True, "/login", False), (False, "", False),
+        ):
+            response.is_redirect = redirect
+            response.headers = {"Location": target}
+            self.assertEqual(kwork_client.redirects_to_exchange(url), expected)
+        get.side_effect = kwork_client.requests.Timeout()
+        self.assertFalse(kwork_client.redirects_to_exchange(url))
+
     def setUp(self):
         p = mock.patch.object(kwork_client.time, "sleep")
         p.start()

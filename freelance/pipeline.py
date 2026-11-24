@@ -2290,14 +2290,19 @@ def format_order(sc: ScoredOrder, compact: bool = False, detailed: bool = False)
         if scoped_quote:
             lines.append("💵 " + e(scoped_quote))
         if price_mid > 0:
-            if ai.get("price_vague") and _num(ai.get("price_low")) > 0 and _num(ai.get("price_high")) > 0:
+            exceeds_budget = ai.get("budget_status") in ("below_min", "below_full")
+            if exceeds_budget:
+                line = "💵 В бюджет заказчика весь объём по оценке бота не укладывается. Уточнить объём перед откликом"
+                if detailed:
+                    line += f". Расчёт полного объёма: {_money(price_mid)} ₽"
+            elif ai.get("price_vague") and _num(ai.get("price_low")) > 0 and _num(ai.get("price_high")) > 0:
                 # размытое ТЗ: ориентир с вилкой и условиями, а не точная цена
                 line = (f"💵 Ориентир: {_money(ai.get('price_low'))}–{_money(ai.get('price_high'))} ₽ "
                         f"(зависит от уточнений)")
             else:
                 line = f"💵 Предложить: {_money(price_mid)} ₽"
             note = _price_note(ai)
-            if note:
+            if note and not exceeds_budget:
                 line += f" · {e(note)}"
             lines.append(line)
         summary = str(ai.get("summary") or "")

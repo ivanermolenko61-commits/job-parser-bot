@@ -332,8 +332,11 @@ class CardTest(unittest.TestCase):
     def test_low_budget_is_a_mismatch_note_not_a_lower_price(self):
         card = pipeline.format_order(self.sc("1000 ₽"), detailed=True)
         full = self.sc("").ai["price_mid"]
-        self.assertIn(f"Предложить: {pipeline._money(full)} ₽", card)
-        self.assertIn("бюджет ниже минимума", card)
+        self.assertIn(f"Расчёт полного объёма: {pipeline._money(full)} ₽", card)
+        brief = pipeline.format_order(self.sc("1000 ₽"))
+        self.assertIn("Уточнить объём перед откликом", brief)
+        self.assertNotIn("Предложить:", brief)
+        self.assertNotIn("Ориентир:", brief)
         self.assertIn("диагностику или меньший объём", card)
         self.assertIn("минимально приемлемая цена", card)
 

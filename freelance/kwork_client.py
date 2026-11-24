@@ -8,6 +8,7 @@ order_id = KWORK_ID_OFFSET + id проекта на Kwork. Время на Kwork
 import html
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -42,6 +43,18 @@ _CODE_CATEGORIES = {"80", "39", "255", "81"}
 
 def kwork_url(project_id: int) -> str:
     return f"https://kwork.ru/projects/{project_id}/view"
+
+
+def redirects_to_exchange(url: str) -> bool:
+    if not re.fullmatch(r"https://kwork\.ru/projects/[0-9]+/view", url or ""):
+        return False
+    try:
+        with requests.get(url, headers=HEADERS, stream=True, allow_redirects=False, timeout=4) as response:
+            return response.is_redirect and response.headers.get("Location", "").rstrip("/") in (
+                "/projects", "https://kwork.ru/projects",
+            )
+    except requests.RequestException:
+        return False
 
 
 def is_kwork_id(order_id: int) -> bool:
