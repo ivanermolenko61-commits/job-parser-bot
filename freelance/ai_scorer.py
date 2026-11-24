@@ -25,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
-from freelance import paid_budget, profile, yandex_budget
+from freelance import paid_budget, profile, schedule, yandex_budget
 
 load_dotenv()
 
@@ -813,6 +813,15 @@ def parse_ai_json(text: str, text_len: int | None = None) -> dict | None:
     }
 
 
+class _AutomaticRequestsPaused(Exception):
+    """Началась ночная пауза, HTTP-запрос ещё не отправлен."""
+
+
+def _require_request_time() -> None:
+    if not schedule.request_allowed():
+        raise _AutomaticRequestsPaused
+
+
 @dataclass
 class _LiveWindow:
     deadline: float
@@ -832,12 +841,13 @@ class _LiveWindow:
         timeout = min(LIVE_POST_SEC, self.time_left())
         if not self.allows_post() or timeout <= 0:
             raise TimeoutError("дедлайн AI")
-        self.attempts += 1
 
         async def request():
             # Общий таймаут включает соединение и чтение ответа. Перенаправления запрещены.
             async with asyncio.timeout(timeout):
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                    _require_request_time()
+                    self.attempts += 1
                     async with session.post(url, headers=headers, json=json, allow_redirects=False) as remote:
                         result = requests.Response()
                         result.status_code = remote.status
@@ -1085,6 +1095,7 @@ def _ask_gemini_model(model: str, order, *, window: _LiveWindow | None = None):
     import requests
     global _config_error, _config_blocked_until, _region_error
     try:
+        _require_request_time()
         url, headers, body = GEMINI_URL.format(model), {"x-goog-api-key": GEMINI_KEY}, _build_body(model, order)
         if window:
             if not _throttle(min(LIVE_SLOT_WAIT_SEC, window.time_left())) or not window.allows_post():
@@ -1093,8 +1104,11 @@ def _ask_gemini_model(model: str, order, *, window: _LiveWindow | None = None):
             resp = window.post(url, headers=headers, json=body)
         else:
             _throttle()
+            _require_request_time()
             resp = requests.post(url, headers=headers, json=body,
                                  timeout=GEMMA_TIMEOUT_SEC if _is_gemma(model) else REQUEST_TIMEOUT_SEC)
+    except _AutomaticRequestsPaused:
+        return "config"
     except Exception as e:
         logging.warning(f"[AI] {model}: сбой запроса: {type(e).__name__}")
         _set_error(f"{model}: {type(e).__name__}", "gemini")
@@ -1459,7 +1473,7 @@ def _refresh_openrouter_prices(p: _Provider) -> None:
     import requests
     with _or_lock:
         now = time.monotonic()
-        if now < _or_next_check:
+        if now < _or_next_check or not schedule.request_allowed():
             return
         try:
             resp = requests.get(OPENROUTER_MODELS_URL, timeout=15)
@@ -1687,7 +1701,7 @@ def _ask_provider_model(p: _Provider, model: str, order, *, window: _LiveWindow 
         use_reasoning = _wants_reasoning(p, model)
     resp = None
     for attempt in (1, 2, 3):
-        if window and not window.allows_post():
+        if not schedule.request_allowed() or (window and not window.allows_post()):
             return "stop"
         wait = (_reserve_slot(p, min(LIVE_SLOT_WAIT_SEC, window.time_left()), live=True)
                 if window else _reserve_slot(p))
@@ -1713,8 +1727,8 @@ def _ask_provider_model(p: _Provider, model: str, order, *, window: _LiveWindow 
                 return state
         body = _provider_body(_provider_model_id(p, model), order, use_json,
                               p.name == "openrouter", use_reasoning)
-        if window and not window.allows_post():
-            _give_back_slot(p, live=True)
+        if not schedule.request_allowed() or (window and not window.allows_post()):
+            _give_back_slot(p, live=window is not None)
             return "stop"
         reserved, paid_token = None, None
         if p.name == "yandex":
@@ -1738,10 +1752,18 @@ def _ask_provider_model(p: _Provider, model: str, order, *, window: _LiveWindow 
         sent_at = time.monotonic()
         try:
             url, headers = f"{p.base_url}/chat/completions", _provider_headers(p)
+            _require_request_time()
             if window:
                 resp = window.post(url, headers=headers, json=body)
             else:
                 resp = requests.post(url, headers=headers, json=body, timeout=PROVIDER_TIMEOUT_SEC)
+        except _AutomaticRequestsPaused:
+            if paid_token is not None:
+                paid_budget.finish(paid_token, definitely_not_sent=True)
+            if reserved is not None:
+                yandex_budget.release(reserved)
+            _give_back_slot(p, live=window is not None)
+            return "stop"
         except Exception as e:
             logging.warning(f"[AI] {label}: сбой запроса: {type(e).__name__}")
             _set_error(f"{label}: {type(e).__name__}", p)
@@ -2008,24 +2030,29 @@ def triage_order(order) -> int | None:
         today = _today()
         if _triage_day != today:
             _triage_day, _triage_count = today, 0
-        if _triage_disabled or now < _triage_paused_until or _triage_count >= TRIAGE_MAX_PER_DAY:
+        if (_triage_disabled or now < _triage_paused_until or _triage_count >= TRIAGE_MAX_PER_DAY
+                or not schedule.request_allowed()):
             return None
         _triage_count += 1
         # запись под тем же lock: старое значение не перезапишет новое
         _triage_save_count(f"{_triage_day}:{_triage_count}")
     try:
-        resp = requests.post(
-            f"{p.base_url}/chat/completions",
-            headers=_provider_headers(p),
-            json={
-                "model": TRIAGE_MODEL,
-                "messages": [{"role": "system", "content": TRIAGE_PROMPT},
-                             {"role": "user", "content": _triage_prompt(order)}],
-                "temperature": 0,
-                "max_tokens": 60,
-            },
-            timeout=TRIAGE_TIMEOUT_SEC,
-        )
+        headers = _provider_headers(p)
+        body = {
+            "model": TRIAGE_MODEL,
+            "messages": [{"role": "system", "content": TRIAGE_PROMPT},
+                         {"role": "user", "content": _triage_prompt(order)}],
+            "temperature": 0,
+            "max_tokens": 60,
+        }
+        if not schedule.request_allowed():
+            with _triage_lock:
+                if _triage_day == today:
+                    _triage_count -= 1
+                    _triage_save_count(f"{today}:{_triage_count}")
+            return None
+        resp = requests.post(f"{p.base_url}/chat/completions", headers=headers, json=body,
+                             timeout=TRIAGE_TIMEOUT_SEC)
     except Exception as e:
         logging.warning(f"[TRIAGE] сбой запроса: {type(e).__name__}")
         return None

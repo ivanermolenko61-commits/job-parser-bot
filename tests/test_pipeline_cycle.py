@@ -35,7 +35,8 @@ class CycleTestBase(unittest.TestCase):
         database.init_db()
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(setattr, database, "DB_PATH", self.old_path)
-        for p in (mock.patch.object(pipeline.monitor, "record"),
+        for p in (mock.patch.object(pipeline.schedule, "automatic_open", return_value=True),
+                  mock.patch.object(pipeline.monitor, "record"),
                   mock.patch.object(pipeline, "_report_ai_health"),
                   mock.patch.object(pipeline, "_fetch_feed_orders", return_value=[]),  # FL.ru и Kwork без сети
                   mock.patch.object(pipeline.ai_scorer, "is_enabled", return_value=True),

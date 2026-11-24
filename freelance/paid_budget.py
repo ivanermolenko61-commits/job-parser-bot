@@ -2,8 +2,10 @@
 import json
 import logging
 import os
+import stat
 import uuid
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from freelance.yandex_budget import today_msk
 
@@ -23,11 +25,28 @@ OUTPUT_MICROS = 200       # 0,20 ₽ за 1000 токенов
 
 
 def start_date() -> date | None:
-    if (os.getenv("YANDEX_PAID_PILOT") or "").strip() != "1":
+    flag = os.getenv("YANDEX_PAID_PILOT")
+    if flag is not None:
+        if flag.strip() != "1":
+            return None
+        try:
+            return date.fromisoformat(os.getenv("YANDEX_PAID_PILOT_START", ""))
+        except ValueError:
+            return None
+    if os.getenv("YANDEX_ENABLED") != "1":
         return None
+
+    from database import DB_PATH
+
     try:
-        return date.fromisoformat(os.getenv("YANDEX_PAID_PILOT_START", ""))
-    except ValueError:
+        path = Path(DB_PATH).with_name("yandex-paid-pilot-start.txt")
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        with path.open("rb") as stream:
+            value = stream.read(13).decode("ascii").removesuffix("\n").removesuffix("\r")
+        start = date.fromisoformat(value)
+        return start if value == start.isoformat() else None
+    except (OSError, ValueError):
         return None
 
 

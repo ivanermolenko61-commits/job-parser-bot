@@ -69,7 +69,7 @@ from database import (
     reset_db,
     stats,
 )
-from freelance import ai_scorer, capacity, deal_wait, pricing, report, sources, yandex_budget
+from freelance import ai_scorer, capacity, deal_wait, pricing, report, schedule, sources, yandex_budget
 from freelance import journal as jr
 from freelance import lead_view as lv
 from freelance.draft import draft_messages
@@ -510,7 +510,7 @@ async def _pump_freelance_ai(force: bool = False) -> None:
         slots = AI_WORKERS - len(_live_ai_tasks)
         if slots <= 0:
             return
-        only_manual = not force and not await _freelance_subscribed()
+        only_manual = not schedule.automatic_open() or (not force and not await _freelance_subscribed())
         rows = await asyncio.to_thread(live_rows, "score", slots, only_manual, tuple(_live_ai_tasks))
         for row in rows:
             _live_ai_tasks[row["order_id"]] = asyncio.create_task(_score_freelance_row(row, force))
@@ -536,10 +536,13 @@ async def _deliver_freelance(force: bool = False) -> None:
             await _confirm_live_card(oid, token, message_id)
         if asyncio.get_running_loop().time() < _live_flood_until:
             return
-        only_manual = not force and not await _freelance_subscribed()
+        only_manual = not schedule.automatic_open() or (not force and not await _freelance_subscribed())
         rows = await asyncio.to_thread(live_rows, "deliver", 8, only_manual, tuple(_live_delivery_acks))
         for row in rows:
             oid = row["order_id"]
+            origin = sources.source_of(oid)
+            if origin != "manual" and not schedule.automatic_open():
+                continue
             row = await asyncio.to_thread(freelance_claim_delivery, oid)
             if row is None:
                 continue
@@ -548,14 +551,14 @@ async def _deliver_freelance(force: bool = False) -> None:
             if sc.fit is None or sc.fit < FREELANCE_MIN_FIT or (sc.ai or {}).get("triage"):
                 await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
                 continue
-            origin = sources.source_of(oid)
             allowed = origin == "manual" or await asyncio.to_thread(sources.is_enabled, origin)
             if not allowed:
                 await asyncio.to_thread(freelance_finish_delivery, oid, token, None)
                 continue
             try:
                 async with asyncio.timeout(25):
-                    message_id = await _send_order(sc, lambda: live_fresh(row, allow_manual=True))
+                    message_id = await _send_order(sc, lambda: (origin == "manual" or schedule.automatic_open())
+                                                   and live_fresh(row, allow_manual=True))
             except TelegramRetryAfter as e:
                 delay = max(1, int(e.retry_after))
                 _live_flood_until = asyncio.get_running_loop().time() + delay
@@ -580,16 +583,20 @@ async def _maintain_freelance() -> None:
                 await bot.send_message(chat_id=MY_CHAT_ID, text=alert, parse_mode="HTML")
         except Exception:
             logging.exception("[BOT] Не удалось отправить health-оповещение")
-    if await _freelance_subscribed() and not _live_ai_tasks:
+    if schedule.automatic_open() and await _freelance_subscribed() and not _live_ai_tasks:
         res = await asyncio.to_thread(reassess_live)
         for message in res.reassess_notes:
+            if not schedule.automatic_open():
+                break
             await bot.send_message(chat_id=MY_CHAT_ID, text=message, parse_mode="HTML",
                                    disable_web_page_preview=True)
     await asyncio.to_thread(memwatch.trim)
 
 
 async def _refresh_freelance_ai_catalog() -> None:
-    await asyncio.to_thread(ai_scorer.refresh_live_catalog)
+    with schedule.automatic_requests():
+        if schedule.request_allowed():
+            await asyncio.to_thread(ai_scorer.refresh_live_catalog)
 
 
 def _ai_state_text(st: dict) -> str:
@@ -672,6 +679,7 @@ def _freelance_status_text() -> str:
     lines = [
         "📊 <b>Фриланс: статус</b>\n",
         f"Подписка: {'включена' if _freelance_subscribed_sync() else 'на паузе'}",
+        f"Автоматическая оценка и уведомления: {schedule.OPEN_HOUR:02}:00–{schedule.CLOSE_HOUR:02}:00 МСК",
         f"last_id: <code>{last_id}</code>",
         f"Заказов просмотрено в последних обходах: {last_raw}",
         f"Увидено в журнале за сутки: {st['seen_24h']}",
@@ -744,6 +752,8 @@ async def cb_fl_check(call: CallbackQuery):
             text = "⏳ Проверка уже идёт."
         else:
             text = f"✅ Сбор завершён. В очередь оценки добавлено: {r['new']}. Подходящие заказы придут после оценки."
+            if not schedule.automatic_open():
+                text += f"\nАвтооценка возобновится в {schedule.OPEN_HOUR:02}:00 МСК для свежих заказов."
             if r["errors"]:
                 text += "\n⚠️ " + html.escape(", ".join(r["errors"]))
     except Exception:
@@ -1357,11 +1367,13 @@ async def send_lead_reminders():
     """Раз в 5 минут: активные лиды с наступившим сроком - напоминание ТОЛЬКО в MY_CHAT_ID. reminded_at
     ставится после успешной отправки: при ошибке Telegram напоминание уйдёт в следующий раз; пропущенное за
     время простоя уходит после рестарта один раз. Закрытые лиды (done/lost) напоминаний не получают."""
-    if _reminder_lock.locked():
+    if _reminder_lock.locked() or not schedule.automatic_open():
         return
     async with _reminder_lock:
         try:
             for row in await asyncio.to_thread(freelance_reminders_due):
+                if not schedule.automatic_open():
+                    break
                 try:
                     await bot.send_message(chat_id=MY_CHAT_ID, text=lv.reminder_text(row), parse_mode="HTML",
                                            reply_markup=_kb(lv.reminder_buttons(row["order_id"])),
@@ -1390,13 +1402,13 @@ async def send_lead_offers():
     async with _offer_lock:
         claimed, rows = None, []
         try:
-            if not await _freelance_subscribed():
+            if not schedule.automatic_open() or not await _freelance_subscribed():
                 return
             today = datetime.now(MSK).date().isoformat()
             if await asyncio.to_thread(kv_get, OFFER_DAY_KEY) == today:
                 return
             claimed, rows = await asyncio.to_thread(freelance_claim_offers, OFFER_LIMIT, fresh_only=True)
-            fresh = [r for r in rows if live_fresh(r)]
+            fresh = [r for r in rows if live_fresh(r)] if schedule.automatic_open() else []
             if fresh:
                 for r in fresh:
                     if r["pub_unreliable"] or not r["published_at"]:
@@ -1487,7 +1499,7 @@ def _ai_usage_line(st: dict) -> str:
 
 async def _send_freelance_daily_summary_locked():
     try:
-        if not await _freelance_subscribed():
+        if not schedule.automatic_open() or not await _freelance_subscribed():
             return  # фриланс на паузе: сводка не нужна
         today = datetime.now(MSK).date().isoformat()
         if await asyncio.to_thread(kv_get, SUMMARY_DAY_KEY) == today:
@@ -1520,6 +1532,8 @@ async def _send_freelance_daily_summary_locked():
         usage = _ai_usage_line(await asyncio.to_thread(ai_scorer.status))
         if usage:
             text += "\n" + usage.replace("AI за сутки:", "Запросы AI с последнего сброса:", 1)
+        if not schedule.automatic_open():
+            return
         await bot.send_message(chat_id=MY_CHAT_ID, text=text, parse_mode="HTML",
                                disable_web_page_preview=True)
         await asyncio.to_thread(kv_set, SUMMARY_DAY_KEY, today)
@@ -2016,7 +2030,7 @@ async def main():
     scheduler.add_job(
         send_lead_offers,
         "cron",
-        hour=f"{OFFER_HOUR_MSK}-23",
+        hour=f"{OFFER_HOUR_MSK}-{schedule.CLOSE_HOUR - 1}",
         minute="*/10",
         timezone=MSK,
         misfire_grace_time=1800,  # после рестарта - catch_up_lead_offers

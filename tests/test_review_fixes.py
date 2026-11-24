@@ -159,7 +159,8 @@ class SummaryTest(DbTestCase):
     def run_summary(self, coro_fn, hour):
         send = mock.AsyncMock()
         with mock.patch.object(bot.bot, "send_message", send), \
-             mock.patch.object(bot, "datetime", self.make_dt(hour)):
+             mock.patch.object(bot, "datetime", self.make_dt(hour)), \
+             mock.patch.object(bot.schedule, "datetime", self.make_dt(hour)):
             asyncio.run(coro_fn())
         return send
 
@@ -168,18 +169,22 @@ class SummaryTest(DbTestCase):
         self.assertEqual(self.run_summary(bot.send_freelance_daily_summary, 21).await_count, 0)
 
     def test_catch_up_after_restart(self):
-        self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 22).await_count, 1)
+        self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 21).await_count, 1)
         # cron в 21:00 в тот же день уже ничего не пришлёт
         self.assertEqual(self.run_summary(bot.send_freelance_daily_summary, 21).await_count, 0)
 
     def test_no_catch_up_before_21(self):
         self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 15).await_count, 0)
 
+    def test_no_catch_up_at_22(self):
+        self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 22).await_count, 0)
+
     def test_failed_send_is_retried_later(self):
         with mock.patch.object(bot.bot, "send_message", mock.AsyncMock(side_effect=RuntimeError("tg"))), \
-             mock.patch.object(bot, "datetime", self.make_dt(21)), self.assertLogs(level="ERROR"):
+             mock.patch.object(bot, "datetime", self.make_dt(21)), \
+             mock.patch.object(bot.schedule, "datetime", self.make_dt(21)), self.assertLogs(level="ERROR"):
             asyncio.run(bot.send_freelance_daily_summary())
-        self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 22).await_count, 1)
+        self.assertEqual(self.run_summary(bot.catch_up_freelance_summary, 21).await_count, 1)
 
     def test_paused_freelance_sends_nothing(self):
         database.kv_set("freelance_subscribed", "0")
@@ -199,7 +204,7 @@ class FreshnessBeforeSendTest(DbTestCase):
             sc.order.site = "flru"
             pipeline.save_order(sc, "pending")
         send = mock.AsyncMock(return_value=10)
-        with mock.patch.object(bot, "_send_order", send):
+        with mock.patch.object(bot, "_send_order", send), mock.patch.object(bot.schedule, "automatic_open", return_value=True):
             asyncio.run(bot._deliver_freelance(force=True))
         self.assertEqual([call.args[0].order.order_id for call in send.await_args_list], [1])
         self.assertEqual(database.freelance_get(1)["message_id"], 10)

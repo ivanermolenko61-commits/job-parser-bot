@@ -26,7 +26,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from config import (
     ALOT_SEED_ID,
@@ -67,7 +66,8 @@ from database import (
     kv_get,
     kv_set,
 )
-from freelance import ai_scorer, manual, pricing, profile, sources, yandex_budget
+from freelance import ai_scorer, manual, pricing, profile, schedule, sources, yandex_budget
+from freelance.schedule import MSK
 from freelance.budget import parse_budget, rub_amount
 from freelance import journal as jr
 from freelance.alot_client import (
@@ -183,7 +183,6 @@ SAVE_RETRIES = 3
 SAVE_RETRY_PAUSE_SEC = 0.5
 # Лимит Telegram - 4096; с запасом
 MAX_MESSAGE_LEN = 4000
-MSK = ZoneInfo("Europe/Moscow")
 
 _cycle_lock = threading.Lock()  # второй поток prepare_cycle не допускаем
 
@@ -998,6 +997,8 @@ def score_live(row: dict) -> CycleResult:
     if origin != "manual" and is_ukrainian(row.get("title"), row.get("snippet")):
         freelance_mark_filtered(row["order_id"], UKRAINIAN_REASON)
         return res
+    if origin != "manual" and not schedule.automatic_open():
+        return res
     res.quota_out = ai_scorer.quota_exhausted()
     if not ai_scorer.is_enabled() or res.quota_out:
         freelance_live_score_result(row, fit=None, retry_reason=jr.Q_NO_QUOTA if res.quota_out else jr.Q_NO_PROVIDER)
@@ -1007,11 +1008,16 @@ def score_live(row: dict) -> CycleResult:
         return res
     sc = scored_from_row(row)
     sc.order.body = row["snippet"]
+    with schedule.automatic_requests(origin != "manual"):
+        if not schedule.request_allowed():
+            return res
+        try:
+            sc.ai = ai_scorer.score_order(sc.order, live=True)
+        except Exception:
+            logging.exception("[FREELANCE] сбой AI заказа %s", sc.order.order_id)
+        if sc.ai is None and not schedule.request_allowed():
+            return res
     res.ai_attempted = 1
-    try:
-        sc.ai = ai_scorer.score_order(sc.order, live=True)
-    except Exception:
-        logging.exception("[FREELANCE] сбой AI заказа %s", sc.order.order_id)
     if sc.fit is None or (sc.ai or {}).get("triage"):
         res.quota_out = ai_scorer.quota_exhausted()
         freelance_live_score_result(row, fit=None, retry_reason=jr.Q_NO_QUOTA if res.quota_out else jr.Q_ERROR)
@@ -1026,7 +1032,7 @@ def score_live(row: dict) -> CycleResult:
 
 def reassess_live() -> CycleResult:
     res = CycleResult()
-    if not live_rows("score", 1):
+    if schedule.automatic_open() and not live_rows("score", 1):
         _reassess_changed(res, live=True)
     return res
 
@@ -1141,6 +1147,12 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
 
     def _score(item):
         idx, sc = item
+        with schedule.automatic_requests(sources.source_of(sc.order.order_id) != "manual"):
+            if not schedule.request_allowed():
+                return _SKIPPED
+            return _score_in_window(idx, sc)
+
+    def _score_in_window(idx, sc):
         if idx >= MAX_AI_PER_CYCLE or time.monotonic() - started >= AI_DEADLINE_SEC:
             return _SKIPPED
         will_score = not res.quota_out and not _quota_reserved(_eff_group(sc, now_ts))
@@ -1154,11 +1166,15 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
                     "summary": "отсеян быстрым фильтром"}
         if not will_score:
             return _RESERVED
+        if not schedule.request_allowed():
+            return _SKIPPED
         try:
             result = ai_scorer.score_order(sc.order)
         except Exception:
             logging.exception("[FREELANCE] сбой оценки заказа")
             return None
+        if result is None and not schedule.request_allowed():
+            return _SKIPPED
         if result is not None:
             _save_scored_now(sc, result)
         if (triage_mode == "shadow" or control) and triage is not None and result is not None:
@@ -1212,6 +1228,8 @@ def _prepare_cycle(only_manual: bool = False) -> CycleResult:
         # отсев быстрым фильтром окончателен при любом FREELANCE_MIN_FIT (порог мог быть <= TRIAGE_REJECT_MAX)
         if (fit is not None and fit < FREELANCE_MIN_FIT) or (sc.ai or {}).get("triage"):
             res.rejected.append(sc)
+        elif sources.source_of(sc.order.order_id) != "manual" and not schedule.automatic_open():
+            res.unscored.append(sc)  # finish_cycle сохранит уже полученную оценку для доставки
         else:
             res.to_send.append(sc)
 
@@ -1242,7 +1260,7 @@ def _reassess_changed(res: CycleResult, *, live: bool = False) -> None:
     Любой сбой не должен ломать цикл."""
     try:
         for row in freelance_reassess_pending(REASSESS_PER_CYCLE, REASSESS_MAX_ATTEMPTS):
-            if not ai_scorer.is_enabled() or ai_scorer.quota_exhausted() or _quota_reserved(3):
+            if not schedule.automatic_open() or not ai_scorer.is_enabled() or ai_scorer.quota_exhausted() or _quota_reserved(3):
                 return      # квота проверяется перед каждым заказом: запись остаётся pending
             try:
                 if live:
@@ -1285,11 +1303,16 @@ def _reassess_one(res: CycleResult, row: dict, *, live: bool = False) -> None:
             order_id=oid, site=cur.get("site") or "", title=cur.get("title") or "", body=cur.get("snippet") or "",
             price_text=cur.get("price_text") or "", price_value=0.0, categories=[],
             published_at=_parse_dt(cur.get("published_at")), url=cur.get("url") or "")
-        try:
-            result = ai_scorer.score_order(order, live=True, allow_paid=False) if live else ai_scorer.score_order(order)
-        except Exception:
-            logging.exception(f"[FREELANCE] повторная оценка заказа {oid}: сбой AI")
-            result = None
+        with schedule.automatic_requests():
+            if not schedule.request_allowed():
+                return
+            try:
+                result = ai_scorer.score_order(order, live=True, allow_paid=False) if live else ai_scorer.score_order(order)
+            except Exception:
+                logging.exception(f"[FREELANCE] повторная оценка заказа {oid}: сбой AI")
+                result = None
+            if result is None and not schedule.request_allowed():
+                return
         if result is None:
             freelance_reassess_attempt(oid, version)     # и пустой ответ, и исключение - неудачная попытка версии
             return
@@ -1365,7 +1388,7 @@ def _save_scored_now(sc: ScoredOrder, result: dict) -> None:
 def _triage(sc: ScoredOrder) -> int | None:
     """Быстрая оценка заказа (результат помним: заказ в резерве квоты не триажим каждый цикл).
     Только для заказов без оценки и без неудачных попыток."""
-    if sc.ai is not None or sc.attempts:
+    if sc.ai is not None or sc.attempts or not schedule.request_allowed():
         return None
     oid = sc.order.order_id
     with _triage_lock:
